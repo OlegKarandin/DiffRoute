@@ -1,0 +1,29 @@
+# channel_spacing_ghz defines the WDM grid used in GNPy
+channel_spacing_ghz: 100
+symbol_rate_gbaud: 87.5
+num_channels_cband: 48  # 4.8 THz / 100 GHz
+cut_channel_index: 24   # center channel under test
+
+formats:
+  - bitrate_gbps: 300
+    snr_threshold_db: 4.8
+  - bitrate_gbps: 350
+    snr_threshold_db: 6.0
+  - bitrate_gbps: 400
+    snr_threshold_db: 7.1
+  - bitrate_gbps: 450
+    snr_threshold_db: 8.2
+  - bitrate_gbps: 500
+    snr_threshold_db: 9.2
+  - bitrate_gbps: 550
+    snr_threshold_db: 10.2
+  - bitrate_gbps: 600
+    snr_threshold_db: 11.2
+  - bitrate_gbps: 650
+    snr_threshold_db: 12.2
+  - bitrate_gbps: 700
+    snr_threshold_db: 13.3
+  - bitrate_gbps: 750
+    snr_threshold_db: 14.1
+  - bitrate_gbps: 800
+    snr_threshold_db: 15.1

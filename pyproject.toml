@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffopt"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "networkx>=3.2",
+    "gnpy>=2.7",
+    "pyyaml>=6.0",
+    "pandas>=2.1",
+    "pyarrow>=14.0",
+    "matplotlib>=3.8",
+    "tqdm>=4.66",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["diffopt*"]
