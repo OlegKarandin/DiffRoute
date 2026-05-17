@@ -30,7 +30,7 @@ def linear_noise_to_db(noise_linear: torch.Tensor) -> torch.Tensor:
     return -10.0 * torch.log10(noise_linear)
 
 
-def soft_max(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+def soft_max(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     """
     Smooth approximation to max(a, b) via log-sum-exp.
 

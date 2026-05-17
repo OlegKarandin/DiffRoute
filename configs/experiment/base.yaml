@@ -32,3 +32,26 @@ val_rmse_target: 0.5
 
 # Data
 dataset_dir: data/datasets
+
+# Phase 1c: end-to-end pipeline
+qot_checkpoint: checkpoints/best_qot.pt
+
+pipeline:
+  lambda_regen: 1.0
+  lambda_infeasible: 10.0
+  lambda_cost: 0.1               # weight on path_cost_loss; enables EdgeWeightNet gradient
+  channel_loading_fraction: 0.5  # fixed during inference
+  freeze_qot: true
+
+training:
+  lr_edge_net: 1.0e-3
+  lr_regen: 1.0e-2
+  epochs_e2e: 500
+  vlastelica_lambda: 10.0
+  vlastelica_lambda_min: 1.0
+  vlastelica_lambda_decay: 0.995
+  regen_tau_start: 1.0
+  regen_tau_end: 0.1
+  regen_tau_anneal_start_epoch: 100
+  regen_tau_anneal_end_epoch: 400
+  checkpoint_interval: 10

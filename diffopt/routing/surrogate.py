@@ -19,7 +19,7 @@ class DijkstraSurrogate(torch.autograd.Function):
     Autograd Function wrapping Dijkstra with Vlastelica surrogate gradients.
 
     Forward: run exact Dijkstra, return binary path indicator.
-    Backward: perturb edge weights by -lambda * grad_output, re-run Dijkstra,
+    Backward: perturb edge weights by +lambda * grad_output, re-run Dijkstra,
               compute finite-difference surrogate gradient.
     """
 
@@ -60,7 +60,7 @@ class DijkstraSurrogate(torch.autograd.Function):
         num_nodes = ctx._num_nodes
         lambda_ = ctx._lambda
 
-        # Perturbed weights: c_target = w - lambda * (∂L/∂path)
+        # Perturbed weights: c_target = w + lambda * grad_output
         w_np = edge_weights.detach().cpu().numpy().astype(np.float64)
         g_np = grad_output.detach().cpu().numpy().astype(np.float64)
         ei_np = edge_index.detach().cpu().numpy()

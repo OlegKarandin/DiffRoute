@@ -1,7 +1,7 @@
 # DiffONet: Implementation Plan — Phase 1c (End-to-End Pipeline)
 
-**Last updated:** 2026-03-31
-**Status:** Planned (Phase 1b complete, 36/36 tests passing)
+**Last updated:** 2026-05-10
+**Status:** Revised pre-implementation (Phase 1b complete, 36/36 tests passing)
 
 ---
 
@@ -10,6 +10,20 @@
 Phase 1b produced the differentiable segment combiner and Vlastelica surrogate routing layer, both unit-tested in isolation. Phase 1c assembles all components into a jointly trainable pipeline: the edge weight network biases routing, the surrogate Dijkstra selects a path, the path is segmented at regenerator candidate nodes, the frozen QoT model predicts GSNR per segment, and the segment combiner merges them using soft regenerator probabilities. Gradient descent then jointly updates routing costs and regenerator placement.
 
 Spec reference: §5 (EdgeWeightNet), §6 (RegenPlacement), §7 (Pipeline), §8 (Loss), §9 (Training loop), Testing Strategy §test_pipeline.
+
+**Corrections applied during plan review (2026-05-10):**
+
+1. **Path cost term required for EdgeWeightNet gradient.** `path_indicator` is consumed only via `.detach()` in `_reconstruct_path`, so `∂L/∂path_indicator = 0`. With zero gradient into the Vlastelica backward, the perturbed weights equal the original weights, the perturbed solve returns the same path, and the surrogate gives zero gradient to `EdgeWeightNet` — `test_gradient_flow_edge_weight_net` would silently fail. Fix: add `path_cost_loss = Σ_demands (path_indicator · edge_weights).sum()` to `compute_loss`. This creates a live autograd path `loss → path_indicator → edge_weights → EdgeWeightNet.params`, making `∂L/∂path_indicator = edge_weights` (always positive via Softplus), so the Vlastelica backward finds a genuinely different perturbed path and produces a nonzero surrogate gradient. Pipeline now returns `path_costs: Dict[int, Tensor]` and `compute_loss` gains `path_costs` + `lambda_cost` parameters.
+
+2. **QoT output shape.** `SpanAttentionQoT.forward` returns `(batch,)`. Called with `batch=1`, the output is shape `(1,)`, not a scalar. `SegmentCombiner` expects a list of scalar tensors. Fix: `gsnr_scalar = qot_model(span_feats, mask)[0]`.
+
+3. **Threshold tensor conversion.** `ModulationConfig.required_snr_threshold` returns a Python `float`. The `relu(threshold - gsnr_pred)` expression requires a tensor. Fix: `threshold_t = torch.tensor(threshold, device=regen_probs.device, dtype=torch.float32)`.
+
+4. **`FIBER_TYPE_INDEX` import.** Span feature extraction uses `fiber_type_idx`, which requires `FIBER_TYPE_INDEX` from `diffopt.topology`. Not in the original plan.
+
+5. **Config access style.** `yaml.safe_load` returns a plain `dict`. The training loop must use `cfg["training"]["lr_edge_net"]` not `cfg.training.lr_edge_net`.
+
+6. **Hub topology concrete definition.** Original plan said "Node 1 has degree 3" without specifying the full graph. Concrete definition added below.
 
 ---
 
@@ -104,7 +118,7 @@ Converts binary `(E,)` path indicator → ordered list of edge IDs from `demand.
 
 ```
 1. active_edge_ids = [e for e if path_indicator.detach() > 0.5]
-   (detach before numpy — path_indicator stays in the autograd graph)
+   (detach before numpy — path_indicator stays live in the autograd graph for path_cost)
 2. Build undirected adjacency dict from active edges
 3. Walk current_node from src to dst, collecting edge IDs in traversal order
 ```
@@ -133,45 +147,68 @@ class DiffONetPipeline(nn.Module):
         demands: List[Demand],
         tau: float = 1.0,
         lambda_: float = 10.0,
-    ) -> Tuple[Dict[int, Tensor], Dict[int, Tensor], Tensor]:
-        # Returns: (paths, gsnr_preds, regen_probs)
+    ) -> Tuple[Dict[int, Tensor], Dict[int, Tensor], Dict[int, Tensor], Tensor]:
+        # Returns: (path_costs, gsnr_preds, path_indicators, regen_probs)
+        # path_costs:     Dict[demand_id → scalar Tensor] — live in autograd graph
+        # gsnr_preds:     Dict[demand_id → scalar Tensor]
+        # path_indicators: Dict[demand_id → (E,) Tensor]  — for diagnostics
+        # regen_probs:    (num_nodes,) Tensor
 ```
 
-**Forward pass per demand:**
+**Forward pass:**
 ```
 1. regen_probs = regen_placement.get_regen_probs(tau)                      # (num_nodes,)
 2. edge_feats = cat([_topo_edge_features,                                   # (E, 7)
                      regen_probs[_edge_src_ids].unsqueeze(1),
                      regen_probs[_edge_dst_ids].unsqueeze(1)], dim=1)
-3. edge_weights = edge_weight_net(edge_feats).squeeze(-1)                   # (E,)
+3. edge_weights = edge_weight_net(edge_feats).squeeze(-1)                   # (E,) via Softplus > 0
 4. per demand:
-   a. path_indicator = surrogate_shortest_path(edge_weights, ..., lambda_=lambda_)
-   b. ordered_edges  = _reconstruct_path(path_indicator, demand.src, demand.dst)
-   c. segments, boundary_nodes = segment_path(ordered_edges, demand.src, ..., demand.dst)
-   d. for each segment: extract span features (see below), call qot_model → scalar GSNR
-   e. boundary_probs = [regen_probs[n] for n in boundary_nodes]
-   f. path_gsnr = segment_combiner(segment_gsnrs, boundary_probs)
+   a. path_indicator = surrogate_shortest_path(edge_weights, _edge_index,
+                                               demand.src, demand.dst,
+                                               num_nodes, lambda_=lambda_)
+   b. path_cost = (path_indicator * edge_weights).sum()          # scalar, live in graph
+   c. ordered_edges = _reconstruct_path(path_indicator, demand.src, demand.dst)
+   d. segments, boundary_nodes = segment_path(ordered_edges, demand.src,
+                                              _regen_candidate_set, topology, demand.dst)
+   e. for each segment:
+        span_feats (1, 60, 5), mask (1, 60) from topology constants (see below)
+        gsnr_scalar = qot_model(span_feats, mask)[0]             # (1,) → scalar
+      segment_gsnrs = list of gsnr_scalar tensors
+   f. boundary_probs = [regen_probs[n] for n in boundary_nodes]
+   g. path_gsnr = segment_combiner(segment_gsnrs, boundary_probs)
+   h. store path_cost, path_gsnr, path_indicator for this demand
 ```
 
 **Span feature extraction for one segment:**
-```
+```python
+# Requires: from diffopt.topology import FIBER_TYPE_INDEX
 accum_dist = 0.0
-for each edge in segment:
-    for each span in edge:
-        row = [span_length_km, fiber_type_idx, amp_nf_db,
-               channel_loading_fraction,   # fixed at 0.5 during inference
-               accum_dist]                 # cumulative km BEFORE this span
-        accum_dist += span_length_km
-pad to max_spans=60 with zeros
-padding_mask[0, :n_spans] = True          # True = real span
+rows = []
+for eid in segment_edge_ids:
+    edge = topology.edges[eid]
+    ftype_idx = float(FIBER_TYPE_INDEX.get(edge.fiber_type, 0))
+    for span_idx in range(edge.num_spans):
+        rows.append([
+            edge.span_lengths_km[span_idx],
+            ftype_idx,
+            edge.amplifier_nf_db[span_idx],   # per-span NF, not mean
+            channel_loading_fraction,
+            accum_dist,
+        ])
+        accum_dist += edge.span_lengths_km[span_idx]
+n_spans = len(rows)
+span_feats = torch.zeros(1, max_spans, 5, device=device)
+span_feats[0, :n_spans] = torch.tensor(rows, dtype=torch.float32, device=device)
+padding_mask = torch.zeros(1, max_spans, dtype=torch.bool, device=device)
+padding_mask[0, :n_spans] = True          # True = real span (opposite of PyTorch convention)
 ```
 
-Device propagation: derive device from `_topo_edge_features` (registered buffer).
+Device: derive from `_topo_edge_features` (registered buffer).
 
 **Gradient flow:**
-- `regen_logits` gradient: flows through `segment_combiner`'s soft interpolation weights (`boundary_probs`)
-- `edge_weight_net` gradient: flows through the Vlastelica surrogate (path selection change)
-- QoT model: `requires_grad_(False)` at construction; its output participates in autograd normally (do NOT use `torch.no_grad()` — that would sever the combiner's gradient path)
+- `regen_logits` gradient: flows via `regen_probs[boundary_nodes]` → `segment_combiner` → loss
+- `edge_weight_net` gradient: flows via `path_cost = (path_indicator * edge_weights).sum()` → `loss` → `∂L/∂path_indicator = edge_weights` (nonzero via Softplus) → Vlastelica backward → `edge_weights` → `edge_weight_net.params`
+- QoT model: frozen via `requires_grad_(False)` at construction. Do NOT use `torch.no_grad()` — that disables autograd engine-wide for everything in scope, risking accidental detachment of `regen_probs` if the scope is too wide.
 
 ---
 
@@ -180,29 +217,49 @@ Device propagation: derive device from `_topo_edge_features` (registered buffer)
 ```python
 def compute_loss(
     gsnr_preds: Dict[int, Tensor],
+    path_costs: Dict[int, Tensor],         # demand_id → scalar, live in autograd
     demands: List[Demand],
-    regen_probs: Tensor,                  # (num_nodes,)
+    regen_probs: Tensor,                   # (num_nodes,)
     modulation_config: ModulationConfig,
     lambda_regen: float = 1.0,
     lambda_infeasible: float = 10.0,
+    lambda_cost: float = 0.1,
 ) -> Tuple[Tensor, dict]:
 ```
 
 **Logic:**
 ```python
-feasibility_loss = torch.zeros(1, device=regen_probs.device)  # tensor, not float 0
+device = regen_probs.device
+
+feasibility_loss = torch.zeros(1, device=device)   # tensor, not float 0
+num_infeasible = 0
 for demand in demands:
     threshold = modulation_config.required_snr_threshold(demand.bitrate_gbps)
-    shortfall = relu(threshold_tensor - gsnr_preds[demand.id])
-    feasibility_loss += shortfall
+    threshold_t = torch.tensor(threshold, device=device, dtype=torch.float32)
+    shortfall = F.relu(threshold_t - gsnr_preds[demand.id])
+    feasibility_loss = feasibility_loss + shortfall
+    if shortfall.item() > 0:
+        num_infeasible += 1
 
 regen_loss = regen_probs.sum()
-total = lambda_infeasible * feasibility_loss + lambda_regen * regen_loss
+path_cost_loss = sum(path_costs.values())          # Σ (path_indicator · edge_weights)
+total = (lambda_infeasible * feasibility_loss
+         + lambda_regen * regen_loss
+         + lambda_cost * path_cost_loss)
 ```
 
-Starting as `torch.zeros(1)` (not Python `0.0`) ensures a proper scalar tensor even when all demands are feasible.
+`torch.zeros(1)` (not Python `0.0`) ensures a proper scalar tensor when all demands are feasible. `path_cost_loss` is what activates the Vlastelica surrogate — without it, `∂L/∂path_indicator = 0` and `EdgeWeightNet` receives zero gradient.
 
-**Returned metrics dict:** `feasibility_loss`, `regen_loss`, `num_regen_soft`, `num_infeasible`
+**Returned metrics dict:**
+```python
+{
+    "feasibility_loss": feasibility_loss.item(),
+    "regen_loss": regen_loss.item(),
+    "path_cost_loss": path_cost_loss.item(),
+    "num_regen_soft": (regen_probs > 0.5).sum().item(),
+    "num_infeasible": num_infeasible,
+}
+```
 
 ---
 
@@ -211,42 +268,90 @@ Starting as `torch.zeros(1)` (not Python `0.0`) ensures a proper scalar tensor e
 Entry point: `python -m diffopt.train --config configs/experiment/base.yaml`
 
 ```python
-def load_qot_model(checkpoint_path, cfg, device) -> SpanAttentionQoT:
-    # Loads checkpoint["model_state"] into SpanAttentionQoT
+def load_qot_model(checkpoint_path: str, cfg: dict, device) -> SpanAttentionQoT:
+    # ckpt = torch.load(checkpoint_path, map_location=device)
+    # model = SpanAttentionQoT(feature_dim=cfg["feature_dim"], ...)
+    # model.load_state_dict(ckpt["model_state"])
 
-def compute_regen_tau(epoch, tau_start, tau_end, anneal_start, anneal_end) -> float:
-    # Linear interpolation between anneal_start and anneal_end epochs
+def compute_regen_tau(epoch: int, tau_start: float, tau_end: float,
+                      anneal_start: int, anneal_end: int) -> float:
+    # Linear interpolation; clamp to [tau_end, tau_start]
 ```
 
 **Training loop:**
-```
-1. Load config, topology, ModulationConfig
-2. Load QoT checkpoint → SpanAttentionQoT; freeze all parameters
-3. Create: SegmentCombiner(0.5), EdgeWeightNet(), RegenPlacement(num_nodes)
-4. Create: DiffONetPipeline(topology, qot_model, ...)
-5. opt_edge  = Adam(edge_weight_net.parameters(), lr=cfg.training.lr_edge_net)
-6. opt_regen = Adam([regen_placement.regen_logits], lr=cfg.training.lr_regen)
-7. for epoch in 1..epochs_e2e:
-   a. tau = compute_regen_tau(epoch, ...)
-   b. demands = generate_demands(topology, num_demands, bitrate_options, seed=epoch)
-   c. zero_grad both optimizers
-   d. paths, gsnr_preds, regen_probs = pipeline(demands, tau=tau, lambda_=vlastelica_lambda)
-   e. loss, metrics = compute_loss(gsnr_preds, demands, regen_probs, ...)
-   f. loss.backward()
-   g. opt_edge.step(); opt_regen.step()
-   h. vlastelica_lambda = max(lambda_min, vlastelica_lambda * lambda_decay)
-   i. log to CSV; print every 10 epochs
-   j. save checkpoint if loss improved
+```python
+cfg = yaml.safe_load(Path(args.config).read_text())
+topology = load_topology(cfg["topology"])
+mod_cfg  = ModulationConfig.from_yaml(cfg["modulation_formats"])
+
+qot_model = load_qot_model(cfg["qot_checkpoint"], cfg, device)
+# freeze already done inside load_qot_model via requires_grad_(False)
+
+segment_combiner = SegmentCombiner(soft_max_temperature=0.5)
+edge_weight_net  = EdgeWeightNet()
+regen_placement  = RegenPlacement(topology.num_nodes)
+pipeline = DiffONetPipeline(topology, qot_model, segment_combiner,
+                             edge_weight_net, regen_placement,
+                             channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"])
+
+opt_edge  = Adam(edge_weight_net.parameters(),    lr=cfg["training"]["lr_edge_net"])
+opt_regen = Adam([regen_placement.regen_logits],  lr=cfg["training"]["lr_regen"])
+
+vlastelica_lambda = cfg["training"]["vlastelica_lambda"]
+lambda_min        = cfg["training"]["vlastelica_lambda_min"]
+lambda_decay      = cfg["training"]["vlastelica_lambda_decay"]
+
+for epoch in range(1, cfg["training"]["epochs_e2e"] + 1):
+    tau = compute_regen_tau(
+        epoch,
+        cfg["training"]["regen_tau_start"],
+        cfg["training"]["regen_tau_end"],
+        cfg["training"]["regen_tau_anneal_start_epoch"],
+        cfg["training"]["regen_tau_anneal_end_epoch"],
+    )
+    demands = generate_demands(
+        topology,
+        cfg["num_demands"],
+        cfg["bitrate_options"],
+        seed=epoch,        # different set each epoch; reproducible
+    )
+
+    opt_edge.zero_grad()
+    opt_regen.zero_grad()
+
+    path_costs, gsnr_preds, _, regen_probs = pipeline(
+        demands, tau=tau, lambda_=vlastelica_lambda
+    )
+    loss, metrics = compute_loss(
+        gsnr_preds, path_costs, demands, regen_probs, mod_cfg,
+        lambda_regen=cfg["pipeline"]["lambda_regen"],
+        lambda_infeasible=cfg["pipeline"]["lambda_infeasible"],
+        lambda_cost=cfg["pipeline"]["lambda_cost"],
+    )
+
+    loss.backward()
+    opt_edge.step()
+    opt_regen.step()
+
+    vlastelica_lambda = max(lambda_min, vlastelica_lambda * lambda_decay)
+    # log to CSV; print every 10 epochs; save checkpoint if loss improved
 ```
 
 `seed=epoch` for demand generation: each epoch sees a different demand set (avoids overfitting) but stays reproducible.
 
-**CSV columns:** `epoch, total_loss, feasibility_loss, regen_loss, num_regen_soft, num_infeasible, tau, vlastelica_lambda`
+**CSV columns:** `epoch, total_loss, feasibility_loss, regen_loss, path_cost_loss, num_regen_soft, num_infeasible, tau, vlastelica_lambda`
 
 **Checkpoint format:**
 ```python
-{"epoch", "edge_weight_net_state", "regen_logits",
- "opt_edge_state", "opt_regen_state", "vlastelica_lambda", "total_loss"}
+{
+    "epoch": epoch,
+    "edge_weight_net_state": edge_weight_net.state_dict(),
+    "regen_logits": regen_placement.regen_logits.detach().cpu(),
+    "opt_edge_state": opt_edge.state_dict(),
+    "opt_regen_state": opt_regen.state_dict(),
+    "vlastelica_lambda": vlastelica_lambda,
+    "total_loss": loss.item(),
+}
 ```
 
 ---
@@ -257,22 +362,44 @@ In-memory topology construction (no JSON files):
 
 ```python
 def make_linear_topology() -> Topology:
-    # Nodes 0-1-2-3-4, 4 edges in a chain, no regen candidates (all degree ≤ 2)
+    # Chain: 0—1—2—3—4 (4 edges, all nodes degree ≤ 2 → no regen candidates)
     # Useful for single-segment identity test
+    def make_edge(src, dst):
+        return Edge(src=src, dst=dst, length_km=80.0, num_spans=1,
+                    span_lengths_km=[80.0], fiber_type="SSMF", amplifier_nf_db=[5.0])
+    edges = [make_edge(i, i + 1) for i in range(4)]
+    return Topology(nodes=[{"id": i} for i in range(5)], edges=edges)
+
 
 def make_hub_topology() -> Topology:
-    # Node 1 has degree 3 → is a regen candidate
-    # Enables routing choice and regen gradient tests
+    # 5 nodes, 5 edges:
+    #   0—1 (eid 0), 0—2 (eid 1), 1—3 (eid 2), 2—3 (eid 3), 3—4 (eid 4)
+    # Degrees: 0→2, 1→2, 2→2, 3→3, 4→1
+    # Node 3 has degree 3 → sole regen candidate
+    # Two paths from 0 to 4: 0→1→3→4 and 0→2→3→4
+    #   → routing choice activates EdgeWeightNet gradient
+    #   → boundary at node 3 activates regen_logits gradient
+    def make_edge(src, dst):
+        return Edge(src=src, dst=dst, length_km=80.0, num_spans=1,
+                    span_lengths_km=[80.0], fiber_type="SSMF", amplifier_nf_db=[5.0])
+    edges = [
+        make_edge(0, 1),   # eid 0
+        make_edge(0, 2),   # eid 1
+        make_edge(1, 3),   # eid 2
+        make_edge(2, 3),   # eid 3
+        make_edge(3, 4),   # eid 4
+    ]
+    return Topology(nodes=[{"id": i} for i in range(5)], edges=edges)
 ```
 
 | Test | Description |
 |------|-------------|
-| `test_forward_pass_shapes` | 3 demands on linear topology; assert GSNR dict size, shapes |
-| `test_gradient_flow_edge_weight_net` | Hub topology, backward; all EdgeWeightNet params have nonzero grad |
-| `test_gradient_flow_regen_logits` | Hub topology, backward; `regen_logits.grad.abs().sum() > 0` |
+| `test_forward_pass_shapes` | 3 demands on linear topology; assert `gsnr_preds` dict size, scalar shapes |
+| `test_gradient_flow_edge_weight_net` | Hub topology, demand 0→4, backward; all EdgeWeightNet params have nonzero grad (requires `path_cost_loss` in loss) |
+| `test_gradient_flow_regen_logits` | Hub topology, demand 0→4, backward; `regen_logits.grad.abs().sum() > 0` (boundary at node 3) |
 | `test_qot_frozen` | All QoT params have `grad is None` after backward |
-| `test_single_segment_identity` | Linear topology (no regen candidates) → one segment; pipeline GSNR == direct QoT call within 1e-4 |
-| `test_loss_backward_no_nan` | `torch.isfinite(p.grad).all()` for all trainable params |
+| `test_single_segment_identity` | Linear topology, demand 0→4 → one segment; pipeline GSNR == direct QoT call within 1e-4 |
+| `test_loss_backward_no_nan` | `torch.isfinite(p.grad).all()` for all trainable params after backward |
 
 ---
 
@@ -287,7 +414,8 @@ qot_checkpoint: checkpoints/best_qot.pt
 pipeline:
   lambda_regen: 1.0
   lambda_infeasible: 10.0
-  channel_loading_fraction: 0.5    # fixed channel loading during inference
+  lambda_cost: 0.1               # weight on path_cost_loss; enables EdgeWeightNet gradient
+  channel_loading_fraction: 0.5  # fixed channel loading during inference
   freeze_qot: true
 
 training:
@@ -309,11 +437,15 @@ training:
 ## Architectural Constraints (Phase 1c additions to CLAUDE.md)
 
 - `tau` and `lambda_` are passed per-call to `pipeline.forward()` — never stored as module attributes (prevents stale annealing state)
-- `_reconstruct_path` must call `.detach()` on `path_indicator` before converting to numpy (path_indicator stays in the autograd graph)
+- `_reconstruct_path` uses `path_indicator.detach()` for path reconstruction, but `path_indicator` must remain live in the autograd graph — it is used in `path_cost = (path_indicator * edge_weights).sum()` which is the sole gradient path into `EdgeWeightNet`
+- `path_cost_loss = Σ (path_indicator · edge_weights)` is not optional regularization — it is mechanically required for `∂L/∂path_indicator` to be nonzero, which in turn is required for the Vlastelica surrogate to produce a nonzero gradient to `EdgeWeightNet`
 - `segment_path` requires `demand_dst` to suppress terminal node splits (avoids empty trailing segment)
 - `accum_dist_km` in span features starts at `0.0` before the first span; increments after each span
-- QoT model frozen via `requires_grad_(False)` in `__init__`, not via `torch.no_grad()` context (which would sever the combiner's gradient path to `regen_logits`)
+- `amp_nf_db` in span features is `edge.amplifier_nf_db[span_idx]` (per-span), not `edge.mean_amp_nf_db`
+- QoT model frozen via `requires_grad_(False)` in `__init__`, not via `torch.no_grad()` (which disables autograd engine-wide for its scope, risking accidental detachment of `regen_probs` if the scope boundary slips)
+- `SpanAttentionQoT.forward` returns `(batch,)` — index `[0]` to extract scalar before passing to `SegmentCombiner`
 - `channel_loading_fraction = 0.5` is fixed during inference; this is a known distribution gap from training data where it was sampled uniformly in [1/48, 1.0]
+- Config files are loaded as plain `dict` via `yaml.safe_load`; use `cfg["training"]["lr_edge_net"]` not `cfg.training.lr_edge_net`
 
 ---
 
