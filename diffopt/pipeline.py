@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from diffopt.demands import Demand
 from diffopt.placement.regenerator import RegenPlacement
+from diffopt.qot.edge_noise import compute_edge_ase_noise
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.routing.edge_weight_net import EdgeWeightNet
@@ -94,6 +95,7 @@ class DiffONetPipeline(nn.Module):
         regen_placement: RegenPlacement,
         channel_loading_fraction: float = 0.5,
         max_spans: int = 60,
+        edge_ase_noise: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
 
@@ -118,6 +120,11 @@ class DiffONetPipeline(nn.Module):
         self.register_buffer("_edge_index", edge_index)
         self.register_buffer("_edge_src_ids", edge_index[0])       # (E,)
         self.register_buffer("_edge_dst_ids", edge_index[1])       # (E,)
+
+        if edge_ase_noise is None:
+            edge_ase_noise = compute_edge_ase_noise(topology)
+        self.register_buffer("_edge_ase_noise", edge_ase_noise)
+        self._proxy_eps = 1e-12
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -269,13 +276,25 @@ class DiffONetPipeline(nn.Module):
                 demand.dst,
             )
 
-            # 4e. QoT evaluation per segment
+            # 4e. QoT evaluation per segment, blended with the STE proxy
             segment_gsnrs: List[torch.Tensor] = []
             for seg_edge_ids in segments:
                 span_feats, padding_mask = self._extract_span_features(seg_edge_ids, device)
-                # QoT returns (batch,); [0] extracts scalar
-                gsnr_scalar = self.qot_model(span_feats, padding_mask)[0]
-                segment_gsnrs.append(gsnr_scalar)
+                # QoT returns (batch,); [0] extracts scalar. Forward value only —
+                # this has zero live gradient w.r.t. path_indicator (span_feats
+                # comes from static topology data, and seg_edge_ids was derived
+                # via path_indicator.detach()).
+                qot_gsnr = self.qot_model(span_feats, padding_mask)[0]
+
+                # Analytical proxy — linear in path_indicator, independent of
+                # edge_weights. Supplies the backward gradient direction.
+                seg_idx = torch.tensor(seg_edge_ids, dtype=torch.long, device=device)
+                proxy_noise = (path_indicator[seg_idx] * self._edge_ase_noise[seg_idx]).sum()
+                proxy_gsnr = -10.0 * torch.log10(proxy_noise + self._proxy_eps)
+
+                # STE blend: forward value = qot_gsnr exactly; gradient = proxy's.
+                segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())
+                segment_gsnrs.append(segment_gsnr)
 
             # 4f. Combine segments with soft boundary probabilities
             boundary_probs = [regen_probs[n] for n in boundary_nodes]

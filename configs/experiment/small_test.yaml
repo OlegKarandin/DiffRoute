@@ -39,7 +39,7 @@ qot_checkpoint: checkpoints/best_qot.pt
 pipeline:
   lambda_regen: 1.0
   lambda_infeasible: 10.0
-  lambda_cost: 0.1               # weight on path_cost_loss; enables EdgeWeightNet gradient
+  lambda_cost: 0.01              # demoted to regularizer; ASE-noise STE now dominates routing signal
   channel_loading_fraction: 0.5  # fixed during inference
   freeze_qot: true
 
