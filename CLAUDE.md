@@ -114,6 +114,8 @@ All 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 tota
 - QoT model frozen via `requires_grad_(False)` at construction, not via `torch.no_grad()` context. `torch.no_grad()` disables the autograd engine for its entire scope; if the boundary slips to include `regen_probs`, all gradients are silently lost.
 - Config files are plain `dict` from `yaml.safe_load` — use `cfg["training"]["lr_edge_net"]`, not `cfg.training.lr_edge_net`.
 - `channel_loading_fraction = 0.5` is fixed during inference; this is a known distribution gap from Phase 1a training data where it was sampled uniformly in [1/48, 1.0].
+- `edge_ase_noise` is a fixed buffer on `DiffONetPipeline`, precomputed from the analytical GN ASE formula and median-normalized (`diffopt/qot/edge_noise.py::compute_edge_ase_noise`). NLI is excluded by design. It defaults to being computed automatically from the topology if not passed explicitly to `DiffONetPipeline.__init__` — `train.py` and `scripts/diagnose_surrogate.py` rely on this default and do not pass it explicitly.
+- The STE expression `qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())` in `pipeline.py`'s per-segment loop must be written on a single line. Splitting it across statements risks inserting a graph break that defeats the gradient redirection.
 
 ## Corrections made during Phase 1b
 
@@ -128,3 +130,4 @@ All 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 tota
 3. **Threshold tensor conversion**: `ModulationConfig.required_snr_threshold` returns a Python `float`. Explicit `torch.tensor(threshold, device=..., dtype=torch.float32)` conversion is needed before the `relu` subtraction.
 4. **`FIBER_TYPE_INDEX` not in original spec**: Span feature extraction requires importing `FIBER_TYPE_INDEX` from `diffopt.topology` to encode fiber type as an integer.
 5. **Hub topology underspecified**: The original plan said "Node 1 has degree 3" without a full graph. Corrected to a 5-node, 5-edge graph with two paths 0→4 via nodes 1 and 2, merging at node 3 (degree 3).
+6. **Zero Vlastelica surrogate gradient (STE correction)**: With only `path_cost_loss` providing `grad_output`, the Vlastelica perturbation `c_target = w·(1+λ·λ_cost)` is a uniform scaling and the surrogate always returns the same path (confirmed via `scripts/diagnose_surrogate.py`: Hamming distance 0, `g/w` ratio std ≈ 0). Fix: a straight-through estimator in `pipeline.py`'s per-segment loop blends the QoT-accurate forward value with an analytical per-edge ASE noise proxy (`diffopt/qot/edge_noise.py`) that supplies the backward gradient direction instead. `EdgeWeightNet` now receives a per-edge, threshold-gated, regen-modulated routing signal independent of its own current output.

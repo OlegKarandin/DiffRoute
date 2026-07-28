@@ -10,6 +10,14 @@ Two in-memory topologies:
           Node 3 is the sole regen candidate.
           Two paths 0→4 enable routing choice (EdgeWeightNet gradient test)
           and a boundary at node 3 (regen_logits gradient test).
+          The two routes are physically asymmetric (different span lengths
+          on eids 0,2 vs eids 1,3; the shared final hop eid 4 is unchanged)
+          so that EdgeWeightNet does not output an identical weight for
+          every edge — a degenerate case where a graph-symmetric,
+          equal-length-route topology can make the aggregate surrogate
+          gradient on EdgeWeightNet's parameters cancel to zero regardless
+          of the routing signal (see test_edge_weight_net_grad_differs_
+          with_and_without_ste_proxy).
 """
 from __future__ import annotations
 
@@ -31,11 +39,11 @@ from diffopt.topology import Edge, Topology
 # Topology factories
 # ---------------------------------------------------------------------------
 
-def _make_edge(src: int, dst: int) -> Edge:
+def _make_edge(src: int, dst: int, length_km: float = 80.0) -> Edge:
     return Edge(
         src=src, dst=dst,
-        length_km=80.0, num_spans=1,
-        span_lengths_km=[80.0],
+        length_km=length_km, num_spans=1,
+        span_lengths_km=[length_km],
         fiber_type="SSMF",
         amplifier_nf_db=[5.0],
     )
@@ -52,13 +60,22 @@ def make_hub_topology() -> Topology:
     Edges: 0-1 (eid 0), 0-2 (eid 1), 1-3 (eid 2), 2-3 (eid 3), 3-4 (eid 4)
     Degrees: 0→2, 1→2, 2→2, 3→3, 4→1  →  node 3 is sole regen candidate.
     Two paths 0→4: via node 1 (eids 0,2,4) and via node 2 (eids 1,3,4).
+
+    The two routes use different (but still ≥20 km, realistic) span
+    lengths on their non-shared edges — 60 km via node 1 (eids 0,2) vs
+    100 km via node 2 (eids 1,3) — so EdgeWeightNet, which is a per-edge
+    function of static span features, does not produce an identical
+    weight for every edge. The shared final hop (eid 4) is left at the
+    original 80 km. This breaks a physical-symmetry degeneracy without
+    changing the graph structure (both routes remain 3 edges; node 3
+    remains the sole degree-3 / regen-candidate node).
     """
     edges = [
-        _make_edge(0, 1),   # eid 0
-        _make_edge(0, 2),   # eid 1
-        _make_edge(1, 3),   # eid 2
-        _make_edge(2, 3),   # eid 3
-        _make_edge(3, 4),   # eid 4
+        _make_edge(0, 1, length_km=60.0),    # eid 0 — route via node 1
+        _make_edge(0, 2, length_km=100.0),   # eid 1 — route via node 2
+        _make_edge(1, 3, length_km=60.0),    # eid 2 — route via node 1
+        _make_edge(2, 3, length_km=100.0),   # eid 3 — route via node 2
+        _make_edge(3, 4, length_km=80.0),    # eid 4 — shared final hop
     ]
     return Topology(nodes=[{"id": i} for i in range(5)], edges=edges)
 
@@ -276,3 +293,163 @@ def test_loss_backward_no_nan():
         if param.grad is not None:
             assert torch.isfinite(param.grad).all(), \
                 f"Non-finite gradient found in param of shape {param.shape}"
+
+
+# ---------------------------------------------------------------------------
+# Test 7: STE preserves the QoT-accurate forward value across a multi-segment path
+# ---------------------------------------------------------------------------
+
+def test_ste_preserves_forward_value():
+    """Segment GSNR from the STE blend numerically equals what a direct,
+    no-STE combination of frozen QoT calls would produce, on a path with
+    a real regen-candidate boundary (hub topology, node 3)."""
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo, temperature=0.01)
+
+    demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
+    _, gsnr_preds, path_indicators, regen_probs = pipeline([demand])
+
+    indicator = path_indicators[0].detach()
+    active_eids = [e for e in range(indicator.shape[0]) if indicator[e].item() > 0.5]
+
+    segments, boundary_nodes = segment_path(
+        active_eids, demand.src, pipeline._regen_candidate_set, topo, demand.dst
+    )
+
+    direct_gsnrs = []
+    for seg in segments:
+        span_feats, padding_mask = pipeline._extract_span_features(seg, torch.device("cpu"))
+        with torch.no_grad():
+            direct_gsnrs.append(pipeline.qot_model(span_feats, padding_mask)[0])
+
+    boundary_probs = [regen_probs[n].detach() for n in boundary_nodes]
+    expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs)
+
+    assert abs(gsnr_preds[0].item() - expected_gsnr.item()) < 1e-4, (
+        f"STE-blended GSNR {gsnr_preds[0].item():.6f} dB != "
+        f"direct QoT+combiner GSNR {expected_gsnr.item():.6f} dB"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: path_indicator gradient is not a uniform multiple of edge_weights
+# ---------------------------------------------------------------------------
+
+def test_path_indicator_gradient_not_proportional_to_edge_weights():
+    """∂feasibility_loss/∂path_indicator must NOT be a scalar multiple of
+    edge_weights on the active path. If it were, the Vlastelica perturbation
+    c_target = w + lambda*grad would be a uniform rescaling of all edge
+    costs, which preserves shortest-path ordering and makes the surrogate
+    return the same path forever (the bug this plan fixes)."""
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    always_infeasible_cfg = ModulationConfig(
+        channel_spacing_ghz=100.0, symbol_rate_gbaud=64.0,
+        num_channels_cband=48, cut_channel_index=24,
+        formats=[{"bitrate_gbps": 400, "snr_threshold_db": 1000.0}],
+    )
+
+    demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
+    path_costs, gsnr_preds, path_indicators, regen_probs = pipeline([demand], lambda_=5.0)
+
+    pi = path_indicators[0]
+    pi.retain_grad()
+
+    edge_feats = torch.cat([
+        pipeline._topo_edge_features,
+        regen_probs[pipeline._edge_src_ids].unsqueeze(1).detach(),
+        regen_probs[pipeline._edge_dst_ids].unsqueeze(1).detach(),
+    ], dim=1)
+    edge_weights = pipeline.edge_weight_net(edge_feats).squeeze(-1).detach()
+
+    loss, _ = compute_loss(
+        gsnr_preds=gsnr_preds, path_costs=path_costs, demands=[demand],
+        regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
+    )
+    loss.backward()
+
+    assert pi.grad is not None
+    assert pi.grad.abs().sum().item() > 0
+
+    active = pi.detach() > 0.5
+    ratio = pi.grad[active] / edge_weights[active]
+    assert ratio.std().item() > 1e-6, (
+        "gradient is a uniform multiple of edge_weights on the active path — "
+        "the Vlastelica perturbation would rescale all costs equally and "
+        "never change the selected path"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: EdgeWeightNet gradient actually depends on the STE proxy term
+# ---------------------------------------------------------------------------
+
+def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
+    """Zeroing the _edge_ase_noise buffer collapses proxy_noise to a constant
+    (independent of path_indicator), reproducing today's pre-fix behavior.
+    EdgeWeightNet's gradient must differ between the two cases, proving the
+    proxy term (not just path_cost_loss) is contributing to the signal."""
+    topo = make_hub_topology()
+    always_infeasible_cfg = ModulationConfig(
+        channel_spacing_ghz=100.0, symbol_rate_gbaud=64.0,
+        num_channels_cband=48, cut_channel_index=24,
+        formats=[{"bitrate_gbps": 400, "snr_threshold_db": 1000.0}],
+    )
+    demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
+
+    def run(pipeline: DiffONetPipeline) -> torch.Tensor:
+        path_costs, gsnr_preds, _, regen_probs = pipeline([demand], lambda_=5.0)
+        loss, _ = compute_loss(
+            gsnr_preds=gsnr_preds, path_costs=path_costs, demands=[demand],
+            regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
+        )
+        loss.backward()
+        return torch.cat([p.grad.flatten() for p in pipeline.edge_weight_net.parameters()])
+
+    torch.manual_seed(0)
+    pipeline_with_ste = make_pipeline(topo)
+    grad_with = run(pipeline_with_ste)
+
+    torch.manual_seed(0)
+    pipeline_without_ste = make_pipeline(topo)
+    pipeline_without_ste._edge_ase_noise.zero_()
+    grad_without = run(pipeline_without_ste)
+
+    assert not torch.allclose(grad_with, grad_without, atol=1e-8), (
+        "EdgeWeightNet gradient identical with and without the STE proxy — "
+        "the proxy term is not contributing to the routing signal"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: feasible demand contributes zero feasibility-loss gradient
+# ---------------------------------------------------------------------------
+
+def test_feasible_demand_zero_feasibility_gradient():
+    """When a demand's path already clears the GSNR threshold, relu's flat
+    zero region means the feasibility term contributes zero gradient to
+    path_indicator — the STE must not bypass this gating."""
+    topo = make_linear_topology()
+    pipeline = make_pipeline(topo)
+    always_feasible_cfg = ModulationConfig(
+        channel_spacing_ghz=100.0, symbol_rate_gbaud=64.0,
+        num_channels_cband=48, cut_channel_index=24,
+        formats=[{"bitrate_gbps": 400, "snr_threshold_db": -1000.0}],
+    )
+
+    demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
+    _, gsnr_preds, path_indicators, _ = pipeline([demand])
+
+    pi = path_indicators[0]
+    pi.retain_grad()
+
+    threshold = torch.tensor(
+        always_feasible_cfg.required_snr_threshold(demand.bitrate_gbps),
+        dtype=torch.float32,
+    )
+    feasibility_loss = torch.relu(threshold - gsnr_preds[demand.id])
+    feasibility_loss.backward()
+
+    assert feasibility_loss.item() == 0.0
+    assert pi.grad is not None
+    assert pi.grad.abs().sum().item() == 0.0
