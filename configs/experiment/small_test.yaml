@@ -44,7 +44,7 @@ pipeline:
   freeze_qot: true
 
 training:
-  lr_edge_net: 1.0e-3
+  lr_edge_net: 1.0e-3  # NOTE: EdgeWeightNet grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
   lr_regen: 1.0e-2
   epochs_e2e: 20
   vlastelica_lambda: 10.0

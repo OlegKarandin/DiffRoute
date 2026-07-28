@@ -18,7 +18,7 @@ def compute_loss(
     modulation_config: ModulationConfig,
     lambda_regen: float = 1.0,
     lambda_infeasible: float = 10.0,
-    lambda_cost: float = 0.1,
+    lambda_cost: float = 0.01,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute combined training loss.
 

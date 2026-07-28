@@ -123,6 +123,11 @@ class DiffONetPipeline(nn.Module):
 
         if edge_ase_noise is None:
             edge_ase_noise = compute_edge_ase_noise(topology)
+        else:
+            assert edge_ase_noise.shape == (topology.num_edges,), (
+                f"edge_ase_noise shape {edge_ase_noise.shape} != "
+                f"expected ({topology.num_edges},)"
+            )
         self.register_buffer("_edge_ase_noise", edge_ase_noise)
         self._proxy_eps = 1e-12
 
@@ -293,6 +298,10 @@ class DiffONetPipeline(nn.Module):
                 proxy_gsnr = -10.0 * torch.log10(proxy_noise + self._proxy_eps)
 
                 # STE blend: forward value = qot_gsnr exactly; gradient = proxy's.
+                # Note: if qot_gsnr falls outside SegmentCombiner's [-5, 35] dB
+                # clamp range, the STE gradient for this segment is zeroed by
+                # that clamp (segment_combiner.py's _safe_noise has zero
+                # gradient outside the clamped band).
                 segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())
                 segment_gsnrs.append(segment_gsnr)
 

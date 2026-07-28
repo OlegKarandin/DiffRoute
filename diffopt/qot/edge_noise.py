@@ -23,6 +23,10 @@ def compute_edge_ase_noise(topology: Topology) -> torch.Tensor:
     for edge in topology.edges:
         edge_noise = 0.0
         for span_km, nf_db in zip(edge.span_lengths_km, edge.amplifier_nf_db):
+            # Uses SSMF_ALPHA_DB_KM regardless of edge.fiber_type (LEAF, TWRS
+            # not handled). Matches the same SSMF-only limitation already
+            # present in gnpy_bridge.analytical_gsnr_db; both shipped
+            # topologies are 100% SSMF today.
             span_loss_lin = 10.0 ** (SSMF_ALPHA_DB_KM * span_km / 10.0)
             nf_lin = 10.0 ** (nf_db / 10.0)
             edge_noise += nf_lin * (span_loss_lin - 1.0)
