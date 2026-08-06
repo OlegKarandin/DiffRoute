@@ -1,6 +1,6 @@
 """GNPy bridge built on ``multilayer_optical_mcp``'s ``compute_qot``.
 
-This module replaces the old ``gnpy_bridge.py``, which wrapped every GNPy call
+This module replaces the pre-migration wrapper module, which wrapped every GNPy call
 in a blanket exception handler and silently returned an analytical GN-model
 approximation instead — for the whole project's history, *every* label came
 from that fallback and GNPy never once executed.

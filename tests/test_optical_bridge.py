@@ -1,7 +1,7 @@
 """Tests for ``diffopt.qot.optical_bridge`` — the first GNPy execution in this
 project's history.
 
-The old ``diffopt/qot/gnpy_bridge.py`` wrapped its GNPy call in
+The pre-migration wrapper module wrapped its GNPy call in
 ``except Exception`` and returned an analytical GN approximation on every
 single call, forever, silently. These tests exist to make that failure mode
 impossible to reintroduce:
@@ -283,7 +283,7 @@ def test_gnpy_fiber_propagation_actually_executes(german17, monkeypatch):
     """Physics-independent proof that gnpy's own ``Fiber.__call__`` ran.
 
     Immune to any future change in the numbers: a fallback approximation (the
-    old ``gnpy_bridge.py``'s behaviour) leaves this counter at zero.
+    pre-migration wrapper module's behaviour) leaves this counter at zero.
     """
     import gnpy.core.elements as gnpy_elements
 
@@ -311,7 +311,7 @@ def test_gnpy_fiber_propagation_actually_executes(german17, monkeypatch):
 def test_gsnr_decreases_monotonically_with_channel_loading(german17):
     """More interferers -> more NLI -> lower GSNR. The old bridge failed this.
 
-    The old ``gnpy_bridge.py`` returned 25.75 dB at *both* 12 and 48 channels —
+    The pre-migration wrapper module returned 25.75 dB at *both* 12 and 48 channels —
     a bit-identical number, because its analytical fallback dominated. Any
     strict inequality here is therefore the regression guard.
 
@@ -487,7 +487,7 @@ def test_build_loading_rejects_out_of_range_channel_counts(n_channels):
 
 
 def test_bridge_source_contains_no_try_except():
-    """No fallback, ever. The whole point of replacing ``gnpy_bridge.py``.
+    """No fallback, ever. The whole point of the new bridge design.
 
     AST-based, so it is immune to formatting (line breaks, comments, a bare
     ``except:``, ``except (A, B)``, ...).
