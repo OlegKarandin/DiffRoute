@@ -21,6 +21,8 @@ Two in-memory topologies:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import pytest
 
@@ -32,27 +34,44 @@ from diffopt.placement.regenerator import RegenPlacement
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.routing.edge_weight_net import EdgeWeightNet
-from diffopt.topology import Edge, Topology
+from diffopt.topology import Topology
+
+from multilayer_optical_mcp.model.optical_topology_import import (
+    SSMF_LOSS_COEF_DB_PER_KM, populate_optical,
+)
+from multilayer_optical_mcp.model.modes import load_modulation_formats
+
+
+MODULATION_FORMATS_PATH = Path(__file__).parent.parent / "configs/modulation_formats.yaml"
 
 
 # ---------------------------------------------------------------------------
 # Topology factories
 # ---------------------------------------------------------------------------
 
-def _make_edge(src: int, dst: int, length_km: float = 80.0) -> Edge:
-    return Edge(
-        src=src, dst=dst,
-        length_km=length_km, num_spans=1,
-        span_lengths_km=[length_km],
-        fiber_type="SSMF",
-        amplifier_nf_db=[5.0],
-    )
+def _modes():
+    return load_modulation_formats(MODULATION_FORMATS_PATH)
+
+
+def _build_topology(num_nodes: int, edges: list[dict]) -> Topology:
+    graph = {"nodes": [{"id": i} for i in range(num_nodes)], "edges": edges}
+    topo = Topology(modes=_modes())
+    populate_optical(topo, graph, SSMF_LOSS_COEF_DB_PER_KM)
+    return topo
+
+
+def _make_edge_dict(src: int, dst: int, length_km: float = 80.0) -> dict:
+    return {
+        "src": src, "dst": dst, "length_km": length_km, "num_spans": 1,
+        "span_lengths_km": [length_km], "fiber_type": "SSMF",
+        "amplifier_nf_db": [5.0],
+    }
 
 
 def make_linear_topology() -> Topology:
     """Chain 0—1—2—3—4. All degrees ≤ 2 → no regen candidates."""
-    edges = [_make_edge(i, i + 1) for i in range(4)]
-    return Topology(nodes=[{"id": i} for i in range(5)], edges=edges)
+    edges = [_make_edge_dict(i, i + 1) for i in range(4)]
+    return _build_topology(5, edges)
 
 
 def make_hub_topology() -> Topology:
@@ -71,13 +90,13 @@ def make_hub_topology() -> Topology:
     remains the sole degree-3 / regen-candidate node).
     """
     edges = [
-        _make_edge(0, 1, length_km=60.0),    # eid 0 — route via node 1
-        _make_edge(0, 2, length_km=100.0),   # eid 1 — route via node 2
-        _make_edge(1, 3, length_km=60.0),    # eid 2 — route via node 1
-        _make_edge(2, 3, length_km=100.0),   # eid 3 — route via node 2
-        _make_edge(3, 4, length_km=80.0),    # eid 4 — shared final hop
+        _make_edge_dict(0, 1, length_km=60.0),    # eid 0 — route via node 1
+        _make_edge_dict(0, 2, length_km=100.0),   # eid 1 — route via node 2
+        _make_edge_dict(1, 3, length_km=60.0),    # eid 2 — route via node 1
+        _make_edge_dict(2, 3, length_km=100.0),   # eid 3 — route via node 2
+        _make_edge_dict(3, 4, length_km=80.0),    # eid 4 — shared final hop
     ]
-    return Topology(nodes=[{"id": i} for i in range(5)], edges=edges)
+    return _build_topology(5, edges)
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +149,7 @@ def test_forward_pass_shapes():
     for did in [0, 1, 2]:
         assert gsnr_preds[did].shape == torch.Size([])   # scalar
         assert path_costs[did].shape == torch.Size([])   # scalar
-        assert path_indicators[did].shape == torch.Size([topo.num_edges])
+        assert path_indicators[did].shape == torch.Size([len(topo.undirected_edges)])
 
     assert regen_probs.shape == torch.Size([topo.num_nodes])
 
@@ -236,7 +255,7 @@ def test_single_segment_identity():
     rows = []
     accum_dist = 0.0
     for eid in active_eids:
-        edge = topo.edges[eid]
+        edge = topo.undirected_edges[eid]
         for span_idx in range(edge.num_spans):
             rows.append([
                 edge.span_lengths_km[span_idx],
@@ -313,7 +332,7 @@ def test_ste_preserves_forward_value():
     active_eids = [e for e in range(indicator.shape[0]) if indicator[e].item() > 0.5]
 
     segments, boundary_nodes = segment_path(
-        active_eids, demand.src, pipeline._regen_candidate_set, topo, demand.dst
+        active_eids, demand.src, pipeline._regen_candidate_set, pipeline._edges, demand.dst
     )
 
     direct_gsnrs = []

@@ -13,7 +13,7 @@ from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.surrogate import surrogate_shortest_path
-from diffopt.topology import FIBER_TYPE_INDEX, Topology
+from diffopt.topology import FIBER_TYPE_INDEX, Edge, Topology
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ def segment_path(
     ordered_edge_ids: List[int],
     start_node: int,
     regen_candidate_set: Set[int],
-    topology: Topology,
+    edges: List[Edge],
     demand_dst: int,
 ) -> Tuple[List[List[int]], List[int]]:
     """Split an ordered edge list into transparent segments at regen candidates.
@@ -33,7 +33,7 @@ def segment_path(
         ordered_edge_ids: Edge IDs in traversal order (src → dst).
         start_node:       First node of the path (demand source).
         regen_candidate_set: Set of node IDs that are regen candidates.
-        topology:         Topology object for edge endpoint lookup.
+        edges:            List of Edge, indexable by edge id, giving endpoint lookup.
         demand_dst:       Demand destination node — prevents a spurious empty
                           trailing segment when the path ends at a regen candidate.
 
@@ -47,8 +47,8 @@ def segment_path(
     current_node = start_node
 
     for eid in ordered_edge_ids:
-        u = topology.edge_src(eid)
-        v = topology.edge_dst(eid)
+        u = edges[eid].src
+        v = edges[eid].dst
         exit_node = v if current_node == u else u
         current_segment.append(eid)
         current_node = exit_node
@@ -110,6 +110,7 @@ class DiffONetPipeline(nn.Module):
         self.channel_loading_fraction = channel_loading_fraction
         self.max_spans = max_spans
         self._topology = topology
+        self._edges: List[Edge] = list(topology.undirected_edges)
         self._num_nodes = topology.num_nodes
         self._regen_candidate_set: Set[int] = set(topology.regen_candidate_nodes)
 
@@ -124,9 +125,9 @@ class DiffONetPipeline(nn.Module):
         if edge_ase_noise is None:
             edge_ase_noise = compute_edge_ase_noise(topology)
         else:
-            assert edge_ase_noise.shape == (topology.num_edges,), (
+            assert edge_ase_noise.shape == (len(self._edges),), (
                 f"edge_ase_noise shape {edge_ase_noise.shape} != "
-                f"expected ({topology.num_edges},)"
+                f"expected ({len(self._edges)},)"
             )
         self.register_buffer("_edge_ase_noise", edge_ase_noise)
         self._proxy_eps = 1e-12
@@ -154,8 +155,8 @@ class DiffONetPipeline(nn.Module):
         # Build undirected adjacency: node → [(neighbour, edge_id)]
         adj: Dict[int, List[Tuple[int, int]]] = {}
         for eid in active:
-            u = self._topology.edge_src(eid)
-            v = self._topology.edge_dst(eid)
+            u = self._edges[eid].src
+            v = self._edges[eid].dst
             adj.setdefault(u, []).append((v, eid))
             adj.setdefault(v, []).append((u, eid))
 
@@ -186,7 +187,7 @@ class DiffONetPipeline(nn.Module):
         accum_dist = 0.0
 
         for eid in segment_edge_ids:
-            edge = self._topology.edges[eid]
+            edge = self._edges[eid]
             ftype_idx = float(FIBER_TYPE_INDEX.get(edge.fiber_type, 0))
             for span_idx in range(edge.num_spans):
                 rows.append([
@@ -277,7 +278,7 @@ class DiffONetPipeline(nn.Module):
                 ordered_edges,
                 demand.src,
                 self._regen_candidate_set,
-                self._topology,
+                self._edges,
                 demand.dst,
             )
 
