@@ -11,7 +11,6 @@ seed: 42
 
 # WDM
 num_channels_cband: 48
-launch_power_dbm: -1.0
 
 # Model
 max_spans_per_segment: 60

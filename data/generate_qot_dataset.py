@@ -1,4 +1,9 @@
-"""Generate segment-level QoT training data using GNPy (or analytical fallback)."""
+"""Generate segment-level QoT training data using real GNPy (diffopt.qot.optical_bridge).
+
+No analytical fallback: `optical_bridge.segment_gsnr_db` raises loudly on any
+physics failure rather than silently substituting an approximation (see
+`diffopt/qot/optical_bridge.py` module docstring).
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,8 +20,8 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from diffopt.topology import load_topology, Topology
-from diffopt.qot.gnpy_bridge import simulate_segment
+from diffopt.topology import load_topology, Topology, FIBER_TYPE_INDEX
+from diffopt.qot.optical_bridge import oms_sequence_for_node_path, segment_gsnr_db
 
 
 def load_config(path: str) -> dict:
@@ -26,9 +31,9 @@ def load_config(path: str) -> dict:
 def build_nx_graph(topology: Topology) -> nx.Graph:
     """Build undirected NetworkX graph with length_km as edge weight."""
     G = nx.Graph()
-    for node in topology.nodes:
-        G.add_node(node["id"])
-    for i, edge in enumerate(topology.edges):
+    for node in range(topology.num_nodes):
+        G.add_node(node)
+    for i, edge in enumerate(topology.undirected_edges):
         G.add_edge(edge.src, edge.dst, weight=edge.length_km, edge_idx=i)
     return G
 
@@ -46,7 +51,7 @@ def path_to_edges(G: nx.Graph, topology: Topology, path: list) -> list:
     """Convert node path to list of Edge objects."""
     edges = []
     edge_lookup = {}
-    for i, edge in enumerate(topology.edges):
+    for edge in topology.undirected_edges:
         edge_lookup[(edge.src, edge.dst)] = edge
         edge_lookup[(edge.dst, edge.src)] = edge
 
@@ -77,7 +82,15 @@ def split_path_into_segments(path: list, regen_nodes: list, rng: random.Random) 
     if n_regen == 0:
         return [path]
 
-    chosen = sorted(rng.sample(candidates, k=n_regen))
+    # Bug C fix: sort chosen regen nodes by their POSITION in `path`, not by
+    # node id. `path` comes from nx.shortest_simple_paths and is always a
+    # simple path (no repeated nodes), so path.index() is unambiguous.
+    # Sorting by node value instead (the original bug) could put a
+    # numerically-smaller-but-later node before a numerically-larger-but-
+    # earlier one, producing breakpoints out of path order — which silently
+    # drops nodes into an empty segment and duplicates others into an
+    # overlapping one (see task-6-brief.md Bug C for the exact trace).
+    chosen = sorted(rng.sample(candidates, k=n_regen), key=lambda node: path.index(node))
 
     # Build segments
     segments = []
@@ -90,6 +103,14 @@ def split_path_into_segments(path: list, regen_nodes: list, rng: random.Random) 
         ei = path.index(end)
         segments.append(path[si:ei + 1])
 
+    # Invariant: segments must tile `path` exactly — no dropped nodes, no
+    # duplicated interior coverage, every boundary connects to the next
+    # segment's start.
+    assert segments[0][0] == path[0] and segments[-1][-1] == path[-1]
+    for i in range(len(segments) - 1):
+        assert segments[i][-1] == segments[i + 1][0]
+        assert len(segments[i]) >= 2  # every segment has at least one edge
+
     return segments
 
 
@@ -100,6 +121,7 @@ def generate_sample(
     cfg: dict,
     rng: random.Random,
     max_spans: int,
+    mode_id: str,
 ) -> list:
     """Generate one or more segment samples from a single demand.
 
@@ -145,25 +167,22 @@ def generate_sample(
         n_channels = rng.randint(1, cfg.get("num_channels_cband", 48))
         channel_loading_fraction = n_channels / cfg.get("num_channels_cband", 48)
 
-        # Simulate GSNR
-        launch_power_dbm = cfg.get("launch_power_dbm", -1.0)
-        seed_val = rng.randint(0, 2**31 - 1)
+        # Simulate GSNR via real GNPy (diffopt.qot.optical_bridge). `mode_id`
+        # is fixed once per run (see main()) — GSNR is mode-invariant given
+        # the shared 87.5GBaud/0.15 roll-off across all formats, see Task 4's
+        # test_optical_bridge.py mode-invariance test.
+        oms_sequence = oms_sequence_for_node_path(topology, seg_path)
+        gsnr_db = segment_gsnr_db(topology, oms_sequence, mode_id, n_channels)
 
-        gsnr_db = simulate_segment(
-            span_lengths_km=span_lengths,
-            amplifier_nf_db=amp_nf_dbs,
-            fiber_type=fiber_types[0] if fiber_types else "SSMF",
-            n_channels=n_channels,
-            launch_power_dbm=launch_power_dbm,
-            seed=seed_val,
-        )
-
-        # Build per-span features
+        # Build per-span features. Bug A fix: append using the pre-increment
+        # accum_dist (distance at span START), then increment — matches
+        # pipeline.py::_extract_span_features's convention exactly.
         accum_dist = 0.0
         span_feature_list = []
         for j, (sl, nf) in enumerate(zip(span_lengths, amp_nf_dbs)):
-            accum_dist += sl
-            ftype_idx = 0.0  # SSMF=0
+            # Bug B fix: look up each span's actual fiber type instead of a
+            # hardcoded SSMF=0.0, matching pipeline.py's per-span lookup.
+            ftype_idx = float(FIBER_TYPE_INDEX.get(fiber_types[j], 0))
             span_feature_list.append([
                 sl,                        # span_length_km
                 ftype_idx,                 # fiber_type_idx
@@ -171,6 +190,7 @@ def generate_sample(
                 channel_loading_fraction,  # channel_loading_fraction
                 accum_dist,               # accum_dist_km
             ])
+            accum_dist += sl
 
         # Pad to max_spans
         padded = span_feature_list + [[0.0] * 5] * (max_spans - n_spans)
@@ -192,9 +212,15 @@ def main():
     cfg = load_config(args.config)
 
     topology_path = cfg["topology"]
-    topology = load_topology(topology_path)
+    topology = load_topology(topology_path, cfg["modulation_formats"])
     G = build_nx_graph(topology)
     regen_candidates = topology.regen_candidate_nodes
+
+    # Fixed once for the whole run: GSNR is mode-invariant given the shared
+    # 87.5GBaud/0.15 roll-off across all formats — see Task 4's
+    # test_optical_bridge.py mode-invariance test. Resampling per segment
+    # would just add noise-free-but-pointless variance to the dataset.
+    mode_id = topology.modes.list()[0].id
 
     max_spans = cfg.get("max_spans_per_segment", 60)
 
@@ -211,7 +237,7 @@ def main():
         with tqdm(total=n_target) as pbar:
             attempts = 0
             while len(rows) < n_target and attempts < n_target * 20:
-                new_samples = generate_sample(topology, G, regen_candidates, cfg, rng, max_spans)
+                new_samples = generate_sample(topology, G, regen_candidates, cfg, rng, max_spans, mode_id)
                 for s in new_samples:
                     if len(rows) < n_target:
                         rows.append(s)
