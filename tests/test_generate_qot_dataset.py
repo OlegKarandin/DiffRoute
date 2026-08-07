@@ -12,11 +12,21 @@ import sys
 from pathlib import Path
 
 import networkx as nx
+import pandas as pd
 import pytest
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "data"))
 
-from generate_qot_dataset import split_path_into_segments, get_k_shortest_paths
+from diffopt.topology import Edge
+from generate_qot_dataset import (
+    build_edge_lookup,
+    compute_duplication_stats,
+    format_duplication_report,
+    get_k_shortest_paths,
+    path_to_edges,
+    split_path_into_segments,
+)
 
 
 def _tiles_exactly(path: list, segments: list) -> bool:
@@ -250,3 +260,129 @@ def test_get_k_shortest_paths_truncates_more_than_k_paths():
         f"Heavier path {detour_path} (weight 2.1) should not be in top-2, "
         f"but it is. This suggests truncation did not occur correctly."
     )
+
+
+# ---------------------------------------------------------------------------
+# build_edge_lookup / path_to_edges
+# ---------------------------------------------------------------------------
+
+class _FakeTopology:
+    """Minimal stand-in exposing only what build_edge_lookup reads —
+    avoids constructing a real Topology (GNPy/populate_optical) for a test
+    of pure dict-building logic."""
+
+    def __init__(self, edges):
+        self.undirected_edges = edges
+
+
+def _make_edge(src: int, dst: int, length_km: float = 80.0) -> Edge:
+    return Edge(
+        src=src, dst=dst, length_km=length_km, num_spans=1,
+        span_lengths_km=[length_km], fiber_type="SSMF", amplifier_nf_db=[5.0],
+    )
+
+
+def test_build_edge_lookup_and_path_to_edges_bidirectional():
+    """edge_lookup must resolve a path in either direction to the same Edge objects
+    (this is what let path_to_edges drop its own per-call rebuild — the lookup is
+    built once via build_edge_lookup and reused for both path directions)."""
+    edges = [_make_edge(0, 1, 80.0), _make_edge(1, 2, 100.0)]
+    lookup = build_edge_lookup(_FakeTopology(edges))
+
+    forward = path_to_edges(lookup, [0, 1, 2])
+    assert [e.length_km for e in forward] == [80.0, 100.0]
+    assert forward[0] is edges[0] and forward[1] is edges[1]
+
+    reverse = path_to_edges(lookup, [2, 1, 0])
+    assert reverse[0] is edges[1] and reverse[1] is edges[0]
+
+
+def test_path_to_edges_raises_on_missing_edge():
+    edges = [_make_edge(0, 1, 80.0)]
+    lookup = build_edge_lookup(_FakeTopology(edges))
+    with pytest.raises(ValueError, match="No edge between"):
+        path_to_edges(lookup, [0, 1, 5])
+
+
+# ---------------------------------------------------------------------------
+# compute_duplication_stats / format_duplication_report
+# ---------------------------------------------------------------------------
+
+def _dup_test_frame(rows: list) -> pd.DataFrame:
+    """rows: list of (span_features_0, span_features_1, n_spans) tuples.
+    Only 2 feature columns — the function matches any `span_features_*`
+    prefix, so this exercises the same logic as production's 300 columns."""
+    return pd.DataFrame(
+        [{"span_features_0": a, "span_features_1": b, "n_spans": n, "gsnr_db": 15.0}
+         for a, b, n in rows]
+    )
+
+
+def test_compute_duplication_stats_known_pattern():
+    """Hand-worked duplication pattern, verified by construction:
+
+    train (5 rows, keys by (f0, f1, n_spans)):
+      (1,2,1) x2  <- internal dup
+      (3,4,1) x1  <- unique
+      (5,6,2) x2  <- internal dup
+    -> 3 unique vectors, 4/5 rows are internal duplicates.
+
+    val (4 rows):
+      (1,2,1) x2  <- matches train AND duplicates within val
+      (7,8,1) x1  <- matches nothing
+      (3,4,1) x1  <- matches train, unique within val
+    -> 3 unique val vectors; 2/4 val rows share a val-internal duplicate;
+       3/4 val rows have a train duplicate; 2/3 unique val vectors seen in train.
+    """
+    train_df = _dup_test_frame([(1, 2, 1), (1, 2, 1), (3, 4, 1), (5, 6, 2), (5, 6, 2)])
+    val_df = _dup_test_frame([(1, 2, 1), (1, 2, 1), (7, 8, 1), (3, 4, 1)])
+
+    stats = compute_duplication_stats(train_df, val_df)
+
+    assert stats["train_rows"] == 5
+    assert stats["train_unique_vectors"] == 3
+    assert stats["train_internal_dup_rows"] == 4
+    assert stats["train_internal_dup_rate"] == pytest.approx(0.8)
+
+    assert stats["val_rows"] == 4
+    assert stats["val_unique_vectors"] == 3
+    assert stats["val_internal_dup_rows"] == 2
+    assert stats["val_internal_dup_rate"] == pytest.approx(0.5)
+
+    assert stats["val_rows_with_train_duplicate"] == 3
+    assert stats["val_in_train_dup_rate"] == pytest.approx(0.75)
+    assert stats["val_unique_vectors_in_train"] == 2
+    assert stats["val_unique_in_train_rate"] == pytest.approx(2 / 3)
+
+
+def test_compute_duplication_stats_no_duplicates():
+    """A dataset with no repeats anywhere reports all-zero duplication."""
+    train_df = _dup_test_frame([(1, 1, 1), (2, 2, 1), (3, 3, 1)])
+    val_df = _dup_test_frame([(4, 4, 1), (5, 5, 1)])
+
+    stats = compute_duplication_stats(train_df, val_df)
+
+    assert stats["train_internal_dup_rows"] == 0
+    assert stats["val_internal_dup_rows"] == 0
+    assert stats["val_rows_with_train_duplicate"] == 0
+    assert stats["val_in_train_dup_rate"] == 0.0
+    assert stats["val_unique_vectors_in_train"] == 0
+
+
+def test_format_duplication_report_warns_above_50_percent():
+    high_dup_stats = compute_duplication_stats(
+        _dup_test_frame([(1, 2, 1), (1, 2, 1), (3, 4, 1), (5, 6, 2), (5, 6, 2)]),
+        _dup_test_frame([(1, 2, 1), (1, 2, 1), (7, 8, 1), (3, 4, 1)]),
+    )
+    report = format_duplication_report(high_dup_stats)
+    assert "WARNING" in report
+    assert "75.0%" in report  # val_in_train_dup_rate
+
+
+def test_format_duplication_report_no_warning_below_50_percent():
+    low_dup_stats = compute_duplication_stats(
+        _dup_test_frame([(1, 1, 1), (2, 2, 1), (3, 3, 1)]),
+        _dup_test_frame([(4, 4, 1), (5, 5, 1)]),
+    )
+    report = format_duplication_report(low_dup_stats)
+    assert "WARNING" not in report
