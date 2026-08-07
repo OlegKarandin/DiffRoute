@@ -70,7 +70,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    topology = load_topology(cfg["topology"])
+    topology = load_topology(cfg["topology"], cfg["modulation_formats"])
     mod_cfg = ModulationConfig.from_yaml(cfg["modulation_formats"])
 
     qot_model = load_qot_model(cfg["qot_checkpoint"], cfg, device)

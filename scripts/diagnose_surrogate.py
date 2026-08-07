@@ -53,7 +53,7 @@ def main() -> None:
     cfg = yaml.safe_load(Path(args.config).read_text())
     device = torch.device("cpu")
 
-    topology = load_topology(cfg["topology"])
+    topology = load_topology(cfg["topology"], cfg["modulation_formats"])
     mod_cfg = ModulationConfig.from_yaml(cfg["modulation_formats"])
 
     # ------------------------------------------------------------------ model
