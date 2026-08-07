@@ -7,6 +7,7 @@ physics failure rather than silently substituting an approximation (see
 from __future__ import annotations
 
 import argparse
+import itertools
 import random
 import sys
 from pathlib import Path
@@ -41,8 +42,8 @@ def build_nx_graph(topology: Topology) -> nx.Graph:
 def get_k_shortest_paths(G: nx.Graph, src: int, dst: int, k: int):
     """Return up to k shortest paths by total edge weight."""
     try:
-        paths = list(nx.shortest_simple_paths(G, src, dst, weight="weight"))
-        return paths[:k]
+        paths = list(itertools.islice(nx.shortest_simple_paths(G, src, dst, weight="weight"), k))
+        return paths
     except nx.NetworkXNoPath:
         return []
 

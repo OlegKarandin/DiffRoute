@@ -11,11 +11,12 @@ import random
 import sys
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "data"))
 
-from generate_qot_dataset import split_path_into_segments
+from generate_qot_dataset import split_path_into_segments, get_k_shortest_paths
 
 
 def _tiles_exactly(path: list, segments: list) -> bool:
@@ -110,3 +111,67 @@ def test_real_rng_many_trials_always_tiles():
         rng = random.Random(seed)
         segments = split_path_into_segments(path, regen_nodes=candidates, rng=rng)
         assert _tiles_exactly(path, segments), (seed, segments)
+
+
+def test_get_k_shortest_paths_returns_top_k_in_order():
+    """Verify get_k_shortest_paths returns k shortest paths in weight order.
+
+    Build a small graph with multiple simple paths between src and dst,
+    enumerate all paths by hand, and verify the first k returned by
+    get_k_shortest_paths match the k paths with smallest total weights.
+
+    Graph: 0 --1-- 1 --1-- 3
+                   |       |
+                   +--1-2--+
+
+    Paths from 0 to 3 (by total weight):
+      1. 0-1-3: weight 1+1 = 2
+      2. 0-1-2-3: weight 1+1+1 = 3
+    """
+    G = nx.Graph()
+    # Add nodes
+    for node in [0, 1, 2, 3]:
+        G.add_node(node)
+
+    # Add edges with weights
+    G.add_edge(0, 1, weight=1.0)
+    G.add_edge(1, 3, weight=1.0)
+    G.add_edge(1, 2, weight=1.0)
+    G.add_edge(2, 3, weight=1.0)
+
+    # Get k=2 shortest paths
+    paths = get_k_shortest_paths(G, src=0, dst=3, k=2)
+
+    assert len(paths) == 2, f"Expected 2 paths, got {len(paths)}"
+    assert paths[0] == [0, 1, 3], f"Expected first path [0, 1, 3], got {paths[0]}"
+    assert paths[1] == [0, 1, 2, 3], f"Expected second path [0, 1, 2, 3], got {paths[1]}"
+
+    # Verify the weights are in order
+    weight_0_1_3 = sum(G[paths[0][i]][paths[0][i+1]]["weight"] for i in range(len(paths[0])-1))
+    weight_0_1_2_3 = sum(G[paths[1][i]][paths[1][i+1]]["weight"] for i in range(len(paths[1])-1))
+    assert weight_0_1_3 <= weight_0_1_2_3, f"Paths not in order: {weight_0_1_3} vs {weight_0_1_2_3}"
+
+
+def test_get_k_shortest_paths_no_path():
+    """Verify get_k_shortest_paths returns empty list when no path exists."""
+    G = nx.Graph()
+    G.add_node(0)
+    G.add_node(1)
+    G.add_node(2)
+    G.add_edge(0, 1, weight=1.0)
+
+    # No path from 0 to 2 (2 is disconnected)
+    paths = get_k_shortest_paths(G, src=0, dst=2, k=5)
+    assert paths == [], f"Expected empty list, got {paths}"
+
+
+def test_get_k_shortest_paths_k_exceeds_available():
+    """Verify get_k_shortest_paths returns fewer than k paths if fewer exist."""
+    G = nx.Graph()
+    G.add_edge(0, 1, weight=1.0)
+    G.add_edge(1, 2, weight=1.0)
+
+    # Only 1 simple path from 0 to 2: [0, 1, 2]
+    paths = get_k_shortest_paths(G, src=0, dst=2, k=5)
+    assert len(paths) == 1, f"Expected 1 path, got {len(paths)}"
+    assert paths[0] == [0, 1, 2], f"Expected [0, 1, 2], got {paths[0]}"
