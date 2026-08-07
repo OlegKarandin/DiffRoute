@@ -84,15 +84,20 @@ def test_bug_c_single_regen_node():
     assert segments == [[0, 1, 2], [2, 3, 4]]
 
 
-def test_bug_c_two_regen_nodes_reverse_numeric_order():
-    """Chosen nodes appear in path in the OPPOSITE order of their numeric value."""
+def test_bug_c_two_regen_nodes_in_path_order():
+    """Chosen nodes {1, 9} are split at their path-position order: 1 (index 2) then 9 (index 3).
+
+    This happens to coincide with numeric order for this path, so it doesn't
+    exercise the reverse-order scenario Bug C was about — that regression
+    coverage lives in `test_bug_c_exact_failure_trace` and
+    `test_real_rng_many_trials_always_tiles` above/below. Kept here as a
+    valid (if redundant) tiling check.
+    """
     path = [0, 8, 1, 9, 2]
     rng = _FixedSampleRng(fixed_sample={1, 9}, fixed_randint=2)
     segments = split_path_into_segments(path, regen_nodes=[1, 9], rng=rng)
 
     assert _tiles_exactly(path, segments)
-    # path order of {1, 9} is 9 (index 3) then 1 (index 2)... wait: path index
-    # of 9 is 3, of 1 is 2, so path order is 1 (idx 2) then 9 (idx 3).
     assert segments == [[0, 8, 1], [1, 9], [9, 2]]
 
 

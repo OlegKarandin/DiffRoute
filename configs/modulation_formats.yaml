@@ -2,7 +2,7 @@
 channel_spacing_ghz: 100
 symbol_rate_gbaud: 87.5
 num_channels_cband: 48  # 4.8 THz / 100 GHz
-cut_channel_index: 24   # center channel under test
+cut_channel_index: 21   # center channel under test
 
 formats:
   - bitrate_gbps: 300
