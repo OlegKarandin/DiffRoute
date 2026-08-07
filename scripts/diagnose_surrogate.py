@@ -68,7 +68,7 @@ def main() -> None:
     pipeline = DiffONetPipeline(
         topology=topology,
         qot_model=qot_model,
-        segment_combiner=SegmentCombiner(0.5),
+        segment_combiner=SegmentCombiner(),
         edge_weight_net=edge_weight_net,
         regen_placement=regen_placement,
         channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
@@ -77,6 +77,9 @@ def main() -> None:
     lambda_ = cfg["training"]["vlastelica_lambda"]
     lambda_cost = cfg["pipeline"]["lambda_cost"]
     tau = cfg["training"]["regen_tau_start"]
+    # Snapshot at the start-of-training value, matching `tau` above using
+    # regen_tau_start rather than an annealed mid-training value.
+    soft_max_temp = cfg.get("segment_combiner", {}).get("soft_max_temperature", 0.5)
 
     demands = generate_demands(
         topology, cfg["num_demands"], cfg["bitrate_options"], seed=args.seed
@@ -91,7 +94,7 @@ def main() -> None:
     # path_indicators before they enter the surrogate backward.
     original_forward = pipeline.forward
 
-    def instrumented_forward(demands, tau=1.0, lambda_=10.0):
+    def instrumented_forward(demands, tau=1.0, lambda_=10.0, soft_max_temperature=0.5):
         regen_probs = pipeline.regen_placement.get_regen_probs(tau)
         edge_feats = torch.cat([
             pipeline._topo_edge_features,
@@ -103,7 +106,7 @@ def main() -> None:
         captured_edge_weights.append(ew.detach().clone())
 
         path_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out = \
-            original_forward(demands, tau=tau, lambda_=lambda_)
+            original_forward(demands, tau=tau, lambda_=lambda_, soft_max_temperature=soft_max_temperature)
 
         for did, pi in path_inds_out.items():
             def make_hook(demand_id):
@@ -118,7 +121,7 @@ def main() -> None:
 
     # --------------------------------------------------------- forward + backward
     path_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
-        demands, tau=tau, lambda_=lambda_
+        demands, tau=tau, lambda_=lambda_, soft_max_temperature=soft_max_temp
     )
     loss, metrics = compute_loss(
         gsnr_preds=gsnr_preds,

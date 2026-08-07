@@ -50,21 +50,28 @@ class SegmentCombiner(nn.Module):
     """
     Combine per-segment GSNR values into an end-to-end GSNR.
 
-    Parameters
-    ----------
-    soft_max_temperature:
-        Controls the sharpness of the soft-max approximation.
-        Lower → closer to hard max. Can be annealed externally.
-    """
+    Stateless: `temperature` is a required `forward()` argument, not a
+    constructor parameter — this class holds no annealing state, matching
+    `DiffONetPipeline.forward()`'s own `tau`/`lambda_` pattern (passed
+    per-call, never stored as a module attribute, to prevent stale
+    annealing state across epochs). See CLAUDE.md's "Pipeline"
+    architectural constraints.
 
-    def __init__(self, soft_max_temperature: float = 0.5) -> None:
-        super().__init__()
-        self.temperature = soft_max_temperature
+    Historical note: an earlier version took `soft_max_temperature` at
+    construction, defaulting to 0.5 and never annealed anywhere — this
+    silently broke the "regenerating helps" physics invariant during real
+    training (at t=0.5 the soft-max approximation's floor, `t*ln(2)`,
+    swamps real per-segment noise values, making every multi-segment path
+    look worse than not regenerating at all). Fixed by making the caller
+    supply a real, annealed temperature every call — see CLAUDE.md's
+    Phase 1c corrections for the measured numbers.
+    """
 
     def forward(
         self,
         segment_gsnrs_db: List[torch.Tensor],
         regen_probs_at_boundaries: List[torch.Tensor],
+        temperature: float,
     ) -> torch.Tensor:
         """
         Parameters
@@ -74,6 +81,13 @@ class SegmentCombiner(nn.Module):
         regen_probs_at_boundaries:
             List of N-1 scalar tensors with regenerator probabilities p ∈ (0,1)
             at each inter-segment boundary.
+        temperature:
+            Soft-max sharpness for this call. Lower → closer to true max
+            (more physically accurate); higher → looser approximation.
+            CLAUDE.md's Phase 1b correction #3 established 0.01 as the
+            value at which the "regen helps" invariant reliably holds —
+            callers doing real training should anneal toward that value,
+            not hold a fixed loose one.
 
         Returns
         -------
@@ -105,7 +119,7 @@ class SegmentCombiner(nn.Module):
             noise_no_regen = accumulated_noise + next_noise
 
             # Regenerator: only the worse (larger noise) segment matters
-            noise_regen = soft_max(accumulated_noise, next_noise, temperature=self.temperature)
+            noise_regen = soft_max(accumulated_noise, next_noise, temperature=temperature)
 
             # Soft interpolation
             accumulated_noise = (1.0 - p) * noise_no_regen + p * noise_regen

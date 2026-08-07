@@ -44,20 +44,29 @@ def load_qot_model(checkpoint_path: str, cfg: dict, device: torch.device) -> Spa
     return model
 
 
-def compute_regen_tau(
+def linear_anneal(
     epoch: int,
-    tau_start: float,
-    tau_end: float,
+    start: float,
+    end: float,
     anneal_start: int,
     anneal_end: int,
 ) -> float:
-    """Linearly anneal temperature from tau_start to tau_end."""
+    """Linearly anneal a scalar from `start` to `end` over [anneal_start, anneal_end].
+
+    Generic — used for both RegenPlacement's `tau` (decision sharpness) and
+    SegmentCombiner's `soft_max_temperature` (noise-combination accuracy).
+    Both represent "how sharp should this continuous relaxation be," and
+    annealing them on the same epoch window is deliberate: as regen
+    decisions sharpen, the physics evaluation backing them sharpens too, at
+    the same pace (see SegmentCombiner's docstring for why an un-annealed
+    soft_max_temperature silently broke the "regen helps" invariant).
+    """
     if epoch <= anneal_start:
-        return tau_start
+        return start
     if epoch >= anneal_end:
-        return tau_end
+        return end
     frac = (epoch - anneal_start) / (anneal_end - anneal_start)
-    return tau_start + frac * (tau_end - tau_start)
+    return start + frac * (end - start)
 
 
 def main() -> None:
@@ -75,7 +84,7 @@ def main() -> None:
 
     qot_model = load_qot_model(cfg["qot_checkpoint"], cfg, device)
 
-    segment_combiner = SegmentCombiner(soft_max_temperature=0.5)
+    segment_combiner = SegmentCombiner()
     edge_weight_net = EdgeWeightNet().to(device)
     regen_placement = RegenPlacement(topology.num_nodes).to(device)
 
@@ -100,6 +109,9 @@ def main() -> None:
 
     t_cfg = cfg["training"]
     p_cfg = cfg["pipeline"]
+    sc_cfg = cfg.get("segment_combiner", {})
+    soft_max_temp_start: float = sc_cfg.get("soft_max_temperature", 0.5)
+    soft_max_temp_end: float = sc_cfg.get("soft_max_temperature_min", 0.01)
 
     vlastelica_lambda: float = t_cfg["vlastelica_lambda"]
     lambda_min: float = t_cfg["vlastelica_lambda_min"]
@@ -120,14 +132,26 @@ def main() -> None:
         writer.writerow([
             "epoch", "total_loss", "feasibility_loss", "regen_loss",
             "path_cost_loss", "num_regen_soft", "num_infeasible",
-            "tau", "vlastelica_lambda",
+            "tau", "soft_max_temperature", "vlastelica_lambda",
         ])
 
         for epoch in range(1, epochs + 1):
-            tau = compute_regen_tau(
+            tau = linear_anneal(
                 epoch,
                 t_cfg["regen_tau_start"],
                 t_cfg["regen_tau_end"],
+                t_cfg["regen_tau_anneal_start_epoch"],
+                t_cfg["regen_tau_anneal_end_epoch"],
+            )
+            # Annealed on the same epoch window as tau — see linear_anneal's
+            # docstring for why. Un-annealed soft_max_temperature (fixed at
+            # 0.5) previously made the "regen helps" invariant backwards;
+            # see SegmentCombiner's docstring and CLAUDE.md's Phase 1c
+            # corrections for the diagnosis.
+            soft_max_temp = linear_anneal(
+                epoch,
+                soft_max_temp_start,
+                soft_max_temp_end,
                 t_cfg["regen_tau_anneal_start_epoch"],
                 t_cfg["regen_tau_anneal_end_epoch"],
             )
@@ -144,7 +168,7 @@ def main() -> None:
             opt_regen.zero_grad()
 
             path_costs, gsnr_preds, _, regen_probs = pipeline(
-                demands, tau=tau, lambda_=vlastelica_lambda
+                demands, tau=tau, lambda_=vlastelica_lambda, soft_max_temperature=soft_max_temp
             )
             loss, metrics = compute_loss(
                 gsnr_preds=gsnr_preds,
@@ -172,6 +196,7 @@ def main() -> None:
                 metrics["num_regen_soft"],
                 metrics["num_infeasible"],
                 f"{tau:.4f}",
+                f"{soft_max_temp:.4f}",
                 f"{vlastelica_lambda:.4f}",
             ])
             f.flush()
@@ -182,7 +207,7 @@ def main() -> None:
                     f"| feasibility={metrics['feasibility_loss']:.4f} "
                     f"| regen={metrics['regen_loss']:.4f} "
                     f"| infeasible={metrics['num_infeasible']} "
-                    f"| tau={tau:.3f} | λ={vlastelica_lambda:.3f}"
+                    f"| tau={tau:.3f} | t_sm={soft_max_temp:.3f} | λ={vlastelica_lambda:.3f}"
                 )
 
             if epoch % checkpoint_interval == 0 and loss.item() < best_loss:

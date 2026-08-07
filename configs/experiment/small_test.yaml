@@ -58,6 +58,13 @@ pipeline:
   channel_loading_fraction: 0.5  # fixed during inference
   freeze_qot: true
 
+# NOTE: see base.yaml's segment_combiner comment for the full story — this
+# was previously hardcoded at a fixed 0.5, never annealed, which silently
+# inverted the "regen helps" invariant. Now annealed alongside regen_tau.
+segment_combiner:
+  soft_max_temperature: 0.5
+  soft_max_temperature_min: 0.01
+
 training:
   lr_edge_net: 1.0e-3  # NOTE: EdgeWeightNet grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
   lr_regen: 1.0e-2

@@ -33,9 +33,9 @@ def t(val: float, requires_grad: bool = False) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def test_single_segment_identity():
-    combiner = SegmentCombiner(soft_max_temperature=0.5)
+    combiner = SegmentCombiner()
     gsnr = t(15.0)
-    result = combiner([gsnr], [])
+    result = combiner([gsnr], [], temperature=0.5)
     assert torch.isclose(result, gsnr, atol=1e-4), (
         f"Expected {gsnr.item():.4f} dB, got {result.item():.4f} dB"
     )
@@ -50,12 +50,12 @@ def test_two_segments_p1_worst_segment():
     With p=1 fully regenerated, accumulated_noise = soft_max(n1, n2) ≈ max(n1, n2).
     Higher noise → lower GSNR → output ≈ min(gsnr_1, gsnr_2).
     """
-    combiner = SegmentCombiner(soft_max_temperature=0.01)  # very sharp → ≈ hard max
+    combiner = SegmentCombiner()
     gsnr_1 = t(10.0)
     gsnr_2 = t(20.0)
     p = t(1.0)
 
-    result = combiner([gsnr_1, gsnr_2], [p])
+    result = combiner([gsnr_1, gsnr_2], [p], temperature=0.01)  # very sharp → ≈ hard max
 
     # Analytical: with p=1 and sharp soft_max, result ≈ min(10, 20) = 10 dB
     expected = min(gsnr_1.item(), gsnr_2.item())
@@ -73,12 +73,12 @@ def test_two_segments_p0_noise_adds():
     With p=0 no regeneration, total noise = n1 + n2.
     GSNR_total: 1/10^(G/10) = 1/10^(G1/10) + 1/10^(G2/10)
     """
-    combiner = SegmentCombiner(soft_max_temperature=0.5)
+    combiner = SegmentCombiner()
     gsnr_1 = t(15.0)
     gsnr_2 = t(18.0)
     p = t(0.0)
 
-    result = combiner([gsnr_1, gsnr_2], [p])
+    result = combiner([gsnr_1, gsnr_2], [p], temperature=0.5)
 
     n1 = 10 ** (-15.0 / 10)
     n2 = 10 ** (-18.0 / 10)
@@ -101,12 +101,12 @@ def test_monotonicity_with_regen():
 
     Uses temperature=0.01 so soft_max ≈ true max and the physics is clear.
     """
-    combiner = SegmentCombiner(soft_max_temperature=0.01)
+    combiner = SegmentCombiner()
     gsnr_1 = t(5.0)   # bad segment
     gsnr_2 = t(25.0)  # good segment
 
     p_values = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
-    results = [combiner([gsnr_1, gsnr_2], [t(p)]).item() for p in p_values]
+    results = [combiner([gsnr_1, gsnr_2], [t(p)], temperature=0.01).item() for p in p_values]
 
     for i in range(1, len(results)):
         assert results[i] >= results[i - 1] - 1e-4, (
@@ -126,12 +126,12 @@ def test_gradient_wrt_regen_prob():
     Uses temperature=0.01 so soft_max ≈ true max: regen gives max(n1,n2) = n1
     while no-regen gives n1+n2 > n1, so regen strictly reduces noise.
     """
-    combiner = SegmentCombiner(soft_max_temperature=0.01)
+    combiner = SegmentCombiner()
     gsnr_1 = t(5.0)   # bad first segment
     gsnr_2 = t(25.0)
     p = t(0.5, requires_grad=True)
 
-    result = combiner([gsnr_1, gsnr_2], [p])
+    result = combiner([gsnr_1, gsnr_2], [p], temperature=0.01)
     result.backward()
 
     assert p.grad is not None, "Gradient not computed for regen_prob"
@@ -153,11 +153,11 @@ def test_three_segments_two_boundaries():
     p_val = 0.3
     temperature = 0.01  # small so soft_max ≈ hard max; brute-force uses hard max
 
-    combiner = SegmentCombiner(soft_max_temperature=temperature)
+    combiner = SegmentCombiner()
     g = [t(v) for v in gsnr_vals]
     p = [t(p_val), t(p_val)]
 
-    result = combiner(g, p).item()
+    result = combiner(g, p, temperature=temperature).item()
 
     # Brute force: enumerate regen decisions (0=passthrough, 1=regen) at each boundary
     # Config (r1, r2): prob = p^(r1+r2) * (1-p)^(2-r1-r2)
@@ -196,7 +196,7 @@ def test_numerical_stability():
     """
     Extreme GSNR values and near-binary probabilities should not produce NaN/Inf.
     """
-    combiner = SegmentCombiner(soft_max_temperature=0.5)
+    combiner = SegmentCombiner()
 
     extreme_cases = [
         ([t(0.0), t(30.0)], [t(1e-6)]),
@@ -208,7 +208,7 @@ def test_numerical_stability():
     ]
 
     for gsnrs, probs in extreme_cases:
-        result = combiner(gsnrs, probs)
+        result = combiner(gsnrs, probs, temperature=0.5)
         assert torch.isfinite(result), (
             f"Got non-finite result {result.item()} for "
             f"gsnrs={[g.item() for g in gsnrs]}, p={[p.item() for p in probs]}"
