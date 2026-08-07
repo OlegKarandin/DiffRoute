@@ -27,7 +27,21 @@ learning_rate: 1.0e-3
 lr_schedule: cosine
 checkpoint_dir: checkpoints
 log_dir: logs
-val_rmse_target: 0.5
+# NOTE: re-baselined post-GNPy-migration (Task 8). Measured best val RMSE over
+# two independent full 50k-train/10k-val/100-epoch runs on real-GNPy-labeled
+# data: 0.0484 dB and 0.0428 dB (reproducible, not a fluke). The old 0.5 dB
+# target was met trivially pre-migration because labels were an analytical
+# closed-form function of the model's own 5 input features. Real GNPy labels
+# are still, per span, a deterministic function of those same 5 features (no
+# extra hidden randomness) — and german_17 is small enough, with
+# channel_loading_fraction quantized to 48 discrete values, that 50k samples
+# oversample a fairly bounded segment space (~77% of train rows share an
+# identical feature vector with another row, same for val, with ~63% of
+# unique val feature vectors also seen in train) — so this low an RMSE is a
+# real property of this (topology, sampling) pair, not a bug, but also not
+# proof of generalization to a larger/continuous input space. Target set at
+# ~2x the better measured run for headroom against sampling noise.
+val_rmse_target: 0.1
 
 # Data
 dataset_dir: data/datasets
