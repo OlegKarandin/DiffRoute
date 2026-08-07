@@ -175,3 +175,73 @@ def test_get_k_shortest_paths_k_exceeds_available():
     paths = get_k_shortest_paths(G, src=0, dst=2, k=5)
     assert len(paths) == 1, f"Expected 1 path, got {len(paths)}"
     assert paths[0] == [0, 1, 2], f"Expected [0, 1, 2], got {paths[0]}"
+
+
+def test_get_k_shortest_paths_truncates_more_than_k_paths():
+    """Verify get_k_shortest_paths truncates when >k simple paths exist.
+
+    This test catches off-by-one mutations like islice(gen, k+1) or
+    islice(gen, k-1). The graph has 6+ distinct simple paths from src to dst;
+    we request k=2 and verify:
+      (a) exactly 2 results are returned (not 1, not 3)
+      (b) they are the 2 cheapest by hand-computed weight
+      (c) a heavier path known to exist is NOT in results (proves truncation)
+
+    Graph structure (src=0, dst=4):
+      0-1: weight 1
+      0-2: weight 1
+      0-3: weight 2
+      1-4: weight 1
+      2-4: weight 1
+      3-4: weight 1
+      1-2: weight 0.1  (creates detours)
+      1-3: weight 1
+
+    All simple paths from 0 to 4 (by weight):
+      1. 0-1-4: weight 1+1 = 2         ← top 1
+      2. 0-2-4: weight 1+1 = 2         ← top 2
+      3. 0-1-2-4: weight 1+0.1+1 = 2.1 ← NOT returned when k=2
+      4. 0-2-1-4: weight 1+0.1+1 = 2.1
+      5. 0-1-3-4: weight 1+1+1 = 3
+      6. 0-3-4: weight 2+1 = 3
+      ... and possibly more via other orderings
+    """
+    G = nx.Graph()
+    # Add all nodes
+    for node in [0, 1, 2, 3, 4]:
+        G.add_node(node)
+
+    # Add edges to create multiple paths
+    G.add_edge(0, 1, weight=1.0)
+    G.add_edge(0, 2, weight=1.0)
+    G.add_edge(0, 3, weight=2.0)
+    G.add_edge(1, 4, weight=1.0)
+    G.add_edge(2, 4, weight=1.0)
+    G.add_edge(3, 4, weight=1.0)
+    G.add_edge(1, 2, weight=0.1)  # Creates detours
+    G.add_edge(1, 3, weight=1.0)  # Creates more paths
+
+    # Request only k=2 shortest paths
+    paths = get_k_shortest_paths(G, src=0, dst=4, k=2)
+
+    # (a) Exactly k results returned
+    assert len(paths) == 2, f"Expected exactly 2 paths, got {len(paths)}: {paths}"
+
+    # Compute weights of returned paths
+    def path_weight(path):
+        return sum(G[path[i]][path[i + 1]]["weight"] for i in range(len(path) - 1))
+
+    weights = [path_weight(p) for p in paths]
+
+    # (b) Both returned paths are the top 2 by weight
+    # The two shortest are 0-1-4 and 0-2-4, both weight 2.0
+    for w in weights:
+        assert w == 2.0, f"Returned path has weight {w}, expected 2.0 (top 2 shortest)"
+
+    # (c) A heavier path known to exist (e.g., 0-1-2-4 with weight 2.1) is NOT returned
+    # If islice(gen, k-1) or islice(gen, k+1) mutation happened, this would fail
+    detour_path = [0, 1, 2, 4]
+    assert detour_path not in paths, (
+        f"Heavier path {detour_path} (weight 2.1) should not be in top-2, "
+        f"but it is. This suggests truncation did not occur correctly."
+    )
