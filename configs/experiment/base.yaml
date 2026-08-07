@@ -49,24 +49,22 @@ learning_rate: 1.0e-3
 lr_schedule: cosine
 checkpoint_dir: checkpoints
 log_dir: logs
-# NOTE (STALE — measured on german_17, topology switched to ind_132 above;
-# needs re-measurement after the next full retrain, do not trust this
-# number or its german_17-specific reasoning below until then):
-# re-baselined post-GNPy-migration (Task 8). Measured best val RMSE over
-# two independent full 50k-train/10k-val/100-epoch runs on real-GNPy-labeled
-# data: 0.0484 dB and 0.0428 dB (reproducible, not a fluke). The old 0.5 dB
-# target was met trivially pre-migration because labels were an analytical
-# closed-form function of the model's own 5 input features. Real GNPy labels
-# are still, per span, a deterministic function of those same 5 features (no
-# extra hidden randomness) — and german_17 is small enough, with
-# channel_loading_fraction quantized to 48 discrete values, that 50k samples
-# oversample a fairly bounded segment space (~77% of train rows share an
-# identical feature vector with another row, same for val, with ~63% of
-# unique val feature vectors also seen in train) — so this low an RMSE is a
-# real property of this (topology, sampling) pair, not a bug, but also not
-# proof of generalization to a larger/continuous input space. Target set at
-# ~2x the better measured run for headroom against sampling noise.
-val_rmse_target: 0.1
+# NOTE: re-measured after switching to ind_132 (see topology note above).
+# Best val RMSE over a full 50k-train/10k-val/100-epoch run on real-GNPy-
+# labeled ind_132 data: 0.1909 dB (epoch 99; epoch 100 was 0.1909 dB too —
+# fully converged, train_mse 0.0335 tracking val closely the whole run, no
+# overfitting). This number is a genuinely honest generalization estimate,
+# unlike german_17's prior 0.0428 dB: ind_132's much larger segment pool
+# (~4.1M vs ~65,904 possible feature vectors) means only ~7.0% of val rows
+# have any train duplicate at all (703/10000; was ~77% on german_17), so
+# this is measured almost entirely against segments the model hasn't seen
+# before, not a lookup-table artifact. Against the dataset's actual GSNR
+# range (~6.5-20.0 dB), 0.19 dB is ~1.4% relative error — solid, credible
+# accuracy for a differentiable QoT surrogate. Target set with ~30%
+# headroom above the measured value (single run, not yet replicated —
+# unlike german_17's two-independent-run check, this hasn't been rerun to
+# confirm reproducibility).
+val_rmse_target: 0.25
 
 # Data
 dataset_dir: data/datasets
