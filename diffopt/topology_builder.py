@@ -110,3 +110,15 @@ if __name__ == "__main__":
         str(base / "configs/topology/eu_19.json"),
     )
     print("Generated configs/topology/eu_19.json")
+
+    build_topology_json(
+        str(base / "JP_70.dat"),
+        str(base / "configs/topology/jp_70.json"),
+    )
+    print("Generated configs/topology/jp_70.json")
+
+    build_topology_json(
+        str(base / "IND_132.dat"),
+        str(base / "configs/topology/ind_132.json"),
+    )
+    print("Generated configs/topology/ind_132.json")

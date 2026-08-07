@@ -1,0 +1,2900 @@
+{
+  "nodes": [
+    {
+      "id": 0
+    },
+    {
+      "id": 1
+    },
+    {
+      "id": 2
+    },
+    {
+      "id": 3
+    },
+    {
+      "id": 4
+    },
+    {
+      "id": 5
+    },
+    {
+      "id": 6
+    },
+    {
+      "id": 7
+    },
+    {
+      "id": 8
+    },
+    {
+      "id": 9
+    },
+    {
+      "id": 10
+    },
+    {
+      "id": 11
+    },
+    {
+      "id": 12
+    },
+    {
+      "id": 13
+    },
+    {
+      "id": 14
+    },
+    {
+      "id": 15
+    },
+    {
+      "id": 16
+    },
+    {
+      "id": 17
+    },
+    {
+      "id": 18
+    },
+    {
+      "id": 19
+    },
+    {
+      "id": 20
+    },
+    {
+      "id": 21
+    },
+    {
+      "id": 22
+    },
+    {
+      "id": 23
+    },
+    {
+      "id": 24
+    },
+    {
+      "id": 25
+    },
+    {
+      "id": 26
+    },
+    {
+      "id": 27
+    },
+    {
+      "id": 28
+    },
+    {
+      "id": 29
+    },
+    {
+      "id": 30
+    },
+    {
+      "id": 31
+    },
+    {
+      "id": 32
+    },
+    {
+      "id": 33
+    },
+    {
+      "id": 34
+    },
+    {
+      "id": 35
+    },
+    {
+      "id": 36
+    },
+    {
+      "id": 37
+    },
+    {
+      "id": 38
+    },
+    {
+      "id": 39
+    },
+    {
+      "id": 40
+    },
+    {
+      "id": 41
+    },
+    {
+      "id": 42
+    },
+    {
+      "id": 43
+    },
+    {
+      "id": 44
+    },
+    {
+      "id": 45
+    },
+    {
+      "id": 46
+    },
+    {
+      "id": 47
+    },
+    {
+      "id": 48
+    },
+    {
+      "id": 49
+    },
+    {
+      "id": 50
+    },
+    {
+      "id": 51
+    },
+    {
+      "id": 52
+    },
+    {
+      "id": 53
+    },
+    {
+      "id": 54
+    },
+    {
+      "id": 55
+    },
+    {
+      "id": 56
+    },
+    {
+      "id": 57
+    },
+    {
+      "id": 58
+    },
+    {
+      "id": 59
+    },
+    {
+      "id": 60
+    },
+    {
+      "id": 61
+    },
+    {
+      "id": 62
+    },
+    {
+      "id": 63
+    },
+    {
+      "id": 64
+    },
+    {
+      "id": 65
+    },
+    {
+      "id": 66
+    },
+    {
+      "id": 67
+    },
+    {
+      "id": 68
+    },
+    {
+      "id": 69
+    },
+    {
+      "id": 70
+    },
+    {
+      "id": 71
+    },
+    {
+      "id": 72
+    },
+    {
+      "id": 73
+    },
+    {
+      "id": 74
+    },
+    {
+      "id": 75
+    },
+    {
+      "id": 76
+    },
+    {
+      "id": 77
+    },
+    {
+      "id": 78
+    },
+    {
+      "id": 79
+    },
+    {
+      "id": 80
+    },
+    {
+      "id": 81
+    },
+    {
+      "id": 82
+    },
+    {
+      "id": 83
+    },
+    {
+      "id": 84
+    },
+    {
+      "id": 85
+    },
+    {
+      "id": 86
+    },
+    {
+      "id": 87
+    },
+    {
+      "id": 88
+    },
+    {
+      "id": 89
+    },
+    {
+      "id": 90
+    },
+    {
+      "id": 91
+    },
+    {
+      "id": 92
+    },
+    {
+      "id": 93
+    },
+    {
+      "id": 94
+    },
+    {
+      "id": 95
+    },
+    {
+      "id": 96
+    },
+    {
+      "id": 97
+    },
+    {
+      "id": 98
+    },
+    {
+      "id": 99
+    },
+    {
+      "id": 100
+    },
+    {
+      "id": 101
+    },
+    {
+      "id": 102
+    },
+    {
+      "id": 103
+    },
+    {
+      "id": 104
+    },
+    {
+      "id": 105
+    },
+    {
+      "id": 106
+    },
+    {
+      "id": 107
+    },
+    {
+      "id": 108
+    },
+    {
+      "id": 109
+    },
+    {
+      "id": 110
+    },
+    {
+      "id": 111
+    },
+    {
+      "id": 112
+    },
+    {
+      "id": 113
+    },
+    {
+      "id": 114
+    },
+    {
+      "id": 115
+    },
+    {
+      "id": 116
+    },
+    {
+      "id": 117
+    },
+    {
+      "id": 118
+    },
+    {
+      "id": 119
+    },
+    {
+      "id": 120
+    },
+    {
+      "id": 121
+    },
+    {
+      "id": 122
+    },
+    {
+      "id": 123
+    },
+    {
+      "id": 124
+    },
+    {
+      "id": 125
+    },
+    {
+      "id": 126
+    },
+    {
+      "id": 127
+    },
+    {
+      "id": 128
+    },
+    {
+      "id": 129
+    },
+    {
+      "id": 130
+    },
+    {
+      "id": 131
+    }
+  ],
+  "edges": [
+    {
+      "src": 0,
+      "dst": 1,
+      "length_km": 74.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        74.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 0,
+      "dst": 13,
+      "length_km": 53.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        53.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 1,
+      "dst": 89,
+      "length_km": 597.0,
+      "num_spans": 7,
+      "span_lengths_km": [
+        85.29,
+        85.29,
+        85.29,
+        85.29,
+        85.29,
+        85.29,
+        85.26
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 1,
+      "dst": 94,
+      "length_km": 111.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        55.5,
+        55.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 1,
+      "dst": 110,
+      "length_km": 255.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        85.0,
+        85.0,
+        85.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 1,
+      "dst": 128,
+      "length_km": 67.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        67.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 2,
+      "dst": 3,
+      "length_km": 420.0,
+      "num_spans": 5,
+      "span_lengths_km": [
+        84.0,
+        84.0,
+        84.0,
+        84.0,
+        84.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 2,
+      "dst": 16,
+      "length_km": 181.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        90.5,
+        90.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 2,
+      "dst": 79,
+      "length_km": 276.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        69.0,
+        69.0,
+        69.0,
+        69.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 2,
+      "dst": 109,
+      "length_km": 91.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        91.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 3,
+      "dst": 101,
+      "length_km": 157.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        78.5,
+        78.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 3,
+      "dst": 105,
+      "length_km": 60.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        60.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 3,
+      "dst": 123,
+      "length_km": 51.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        51.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 3,
+      "dst": 124,
+      "length_km": 218.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        72.67,
+        72.67,
+        72.66
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 4,
+      "dst": 5,
+      "length_km": 140.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        70.0,
+        70.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 4,
+      "dst": 6,
+      "length_km": 80.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        80.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 4,
+      "dst": 59,
+      "length_km": 74.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        74.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 4,
+      "dst": 93,
+      "length_km": 53.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        53.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 5,
+      "dst": 6,
+      "length_km": 62.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        62.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 6,
+      "dst": 39,
+      "length_km": 196.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        65.33,
+        65.33,
+        65.34
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 6,
+      "dst": 45,
+      "length_km": 180.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        90.0,
+        90.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 7,
+      "dst": 8,
+      "length_km": 298.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        74.5,
+        74.5,
+        74.5,
+        74.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 7,
+      "dst": 88,
+      "length_km": 114.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        57.0,
+        57.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 8,
+      "dst": 37,
+      "length_km": 248.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        82.67,
+        82.67,
+        82.66
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 8,
+      "dst": 66,
+      "length_km": 175.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        87.5,
+        87.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 8,
+      "dst": 91,
+      "length_km": 51.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        51.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 9,
+      "dst": 10,
+      "length_km": 86.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        86.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 9,
+      "dst": 42,
+      "length_km": 101.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        50.5,
+        50.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 10,
+      "dst": 100,
+      "length_km": 40.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        40.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 11,
+      "dst": 12,
+      "length_km": 113.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        56.5,
+        56.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 11,
+      "dst": 33,
+      "length_km": 143.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        71.5,
+        71.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 11,
+      "dst": 35,
+      "length_km": 200.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        66.67,
+        66.67,
+        66.66
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 11,
+      "dst": 92,
+      "length_km": 107.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        53.5,
+        53.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 12,
+      "dst": 53,
+      "length_km": 119.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        59.5,
+        59.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 12,
+      "dst": 97,
+      "length_km": 93.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        93.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 13,
+      "dst": 128,
+      "length_km": 81.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        81.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 14,
+      "dst": 15,
+      "length_km": 43.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        43.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 14,
+      "dst": 60,
+      "length_km": 161.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        80.5,
+        80.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 14,
+      "dst": 111,
+      "length_km": 63.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        63.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 15,
+      "dst": 23,
+      "length_km": 45.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        45.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 15,
+      "dst": 47,
+      "length_km": 77.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        77.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 16,
+      "dst": 27,
+      "length_km": 247.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        82.33,
+        82.33,
+        82.34
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 16,
+      "dst": 121,
+      "length_km": 48.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        48.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 17,
+      "dst": 18,
+      "length_km": 94.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        94.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 17,
+      "dst": 87,
+      "length_km": 101.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        50.5,
+        50.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 18,
+      "dst": 58,
+      "length_km": 110.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        55.0,
+        55.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 18,
+      "dst": 117,
+      "length_km": 149.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        74.5,
+        74.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 19,
+      "dst": 20,
+      "length_km": 209.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        69.67,
+        69.67,
+        69.66
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 19,
+      "dst": 89,
+      "length_km": 277.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        69.25,
+        69.25,
+        69.25,
+        69.25
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 19,
+      "dst": 110,
+      "length_km": 228.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        76.0,
+        76.0,
+        76.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 19,
+      "dst": 120,
+      "length_km": 147.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        73.5,
+        73.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 20,
+      "dst": 23,
+      "length_km": 238.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        79.33,
+        79.33,
+        79.34
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 20,
+      "dst": 120,
+      "length_km": 82.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        82.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 21,
+      "dst": 22,
+      "length_km": 358.0,
+      "num_spans": 5,
+      "span_lengths_km": [
+        71.6,
+        71.6,
+        71.6,
+        71.6,
+        71.6
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 21,
+      "dst": 42,
+      "length_km": 382.0,
+      "num_spans": 5,
+      "span_lengths_km": [
+        76.4,
+        76.4,
+        76.4,
+        76.4,
+        76.4
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 22,
+      "dst": 116,
+      "length_km": 163.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        81.5,
+        81.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 23,
+      "dst": 24,
+      "length_km": 21.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        21.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 23,
+      "dst": 111,
+      "length_km": 28.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        28.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 23,
+      "dst": 113,
+      "length_km": 134.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        67.0,
+        67.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 24,
+      "dst": 67,
+      "length_km": 44.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        44.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 25,
+      "dst": 26,
+      "length_km": 54.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        54.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 25,
+      "dst": 77,
+      "length_km": 131.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        65.5,
+        65.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 26,
+      "dst": 59,
+      "length_km": 80.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        80.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 27,
+      "dst": 28,
+      "length_km": 327.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        81.75,
+        81.75,
+        81.75,
+        81.75
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 27,
+      "dst": 51,
+      "length_km": 95.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        95.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 28,
+      "dst": 121,
+      "length_km": 115.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        57.5,
+        57.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 28,
+      "dst": 129,
+      "length_km": 115.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        57.5,
+        57.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 29,
+      "dst": 30,
+      "length_km": 83.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        83.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 29,
+      "dst": 35,
+      "length_km": 251.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        83.67,
+        83.67,
+        83.66
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 29,
+      "dst": 52,
+      "length_km": 68.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        68.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 29,
+      "dst": 57,
+      "length_km": 271.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        90.33,
+        90.33,
+        90.34
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 29,
+      "dst": 112,
+      "length_km": 99.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        99.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 30,
+      "dst": 38,
+      "length_km": 19.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        19.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 31,
+      "dst": 32,
+      "length_km": 222.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        74.0,
+        74.0,
+        74.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 31,
+      "dst": 69,
+      "length_km": 59.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        59.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 32,
+      "dst": 48,
+      "length_km": 100.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        100.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 33,
+      "dst": 34,
+      "length_km": 144.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        72.0,
+        72.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 33,
+      "dst": 53,
+      "length_km": 146.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        73.0,
+        73.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 34,
+      "dst": 61,
+      "length_km": 83.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        83.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 35,
+      "dst": 66,
+      "length_km": 106.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        53.0,
+        53.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 36,
+      "dst": 37,
+      "length_km": 129.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        64.5,
+        64.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 36,
+      "dst": 58,
+      "length_km": 117.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        58.5,
+        58.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 36,
+      "dst": 85,
+      "length_km": 426.0,
+      "num_spans": 5,
+      "span_lengths_km": [
+        85.2,
+        85.2,
+        85.2,
+        85.2,
+        85.2
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 38,
+      "dst": 52,
+      "length_km": 109.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        54.5,
+        54.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 38,
+      "dst": 65,
+      "length_km": 299.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        74.75,
+        74.75,
+        74.75,
+        74.75
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 39,
+      "dst": 45,
+      "length_km": 190.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        95.0,
+        95.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 39,
+      "dst": 75,
+      "length_km": 42.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        42.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 40,
+      "dst": 41,
+      "length_km": 276.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        69.0,
+        69.0,
+        69.0,
+        69.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 40,
+      "dst": 54,
+      "length_km": 111.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        55.5,
+        55.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 41,
+      "dst": 82,
+      "length_km": 50.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        50.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 43,
+      "dst": 44,
+      "length_km": 57.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        57.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 43,
+      "dst": 80,
+      "length_km": 34.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        34.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 44,
+      "dst": 80,
+      "length_km": 88.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        88.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 45,
+      "dst": 46,
+      "length_km": 156.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        78.0,
+        78.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 46,
+      "dst": 86,
+      "length_km": 267.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        89.0,
+        89.0,
+        89.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 47,
+      "dst": 50,
+      "length_km": 75.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        75.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 48,
+      "dst": 81,
+      "length_km": 87.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        87.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 49,
+      "dst": 50,
+      "length_km": 43.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        43.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 49,
+      "dst": 116,
+      "length_km": 91.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        91.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 51,
+      "dst": 99,
+      "length_km": 107.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        53.5,
+        53.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 51,
+      "dst": 101,
+      "length_km": 298.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        74.5,
+        74.5,
+        74.5,
+        74.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 53,
+      "dst": 115,
+      "length_km": 177.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        88.5,
+        88.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 54,
+      "dst": 104,
+      "length_km": 322.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        80.5,
+        80.5,
+        80.5,
+        80.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 55,
+      "dst": 56,
+      "length_km": 51.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        51.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 55,
+      "dst": 72,
+      "length_km": 126.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        63.0,
+        63.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 56,
+      "dst": 69,
+      "length_km": 214.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        71.33,
+        71.33,
+        71.34
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 56,
+      "dst": 70,
+      "length_km": 74.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        74.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 57,
+      "dst": 108,
+      "length_km": 27.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        27.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 59,
+      "dst": 93,
+      "length_km": 78.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        78.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 60,
+      "dst": 116,
+      "length_km": 83.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        83.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 61,
+      "dst": 63,
+      "length_km": 285.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        71.25,
+        71.25,
+        71.25,
+        71.25
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 61,
+      "dst": 92,
+      "length_km": 128.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        64.0,
+        64.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 61,
+      "dst": 96,
+      "length_km": 121.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        60.5,
+        60.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 61,
+      "dst": 130,
+      "length_km": 101.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        50.5,
+        50.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 62,
+      "dst": 63,
+      "length_km": 60.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        60.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 62,
+      "dst": 95,
+      "length_km": 69.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        69.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 63,
+      "dst": 115,
+      "length_km": 66.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        66.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 64,
+      "dst": 65,
+      "length_km": 124.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        62.0,
+        62.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 64,
+      "dst": 122,
+      "length_km": 82.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        82.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 65,
+      "dst": 98,
+      "length_km": 207.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        69.0,
+        69.0,
+        69.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 67,
+      "dst": 68,
+      "length_km": 106.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        53.0,
+        53.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 68,
+      "dst": 71,
+      "length_km": 82.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        82.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 70,
+      "dst": 129,
+      "length_km": 77.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        77.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 71,
+      "dst": 72,
+      "length_km": 152.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        76.0,
+        76.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 73,
+      "dst": 74,
+      "length_km": 58.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        58.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 73,
+      "dst": 79,
+      "length_km": 207.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        69.0,
+        69.0,
+        69.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 74,
+      "dst": 88,
+      "length_km": 68.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        68.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 74,
+      "dst": 114,
+      "length_km": 140.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        70.0,
+        70.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 75,
+      "dst": 76,
+      "length_km": 49.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        49.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 76,
+      "dst": 83,
+      "length_km": 182.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        91.0,
+        91.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 77,
+      "dst": 126,
+      "length_km": 48.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        48.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 78,
+      "dst": 79,
+      "length_km": 353.0,
+      "num_spans": 4,
+      "span_lengths_km": [
+        88.25,
+        88.25,
+        88.25,
+        88.25
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 78,
+      "dst": 119,
+      "length_km": 148.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        74.0,
+        74.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 79,
+      "dst": 82,
+      "length_km": 417.0,
+      "num_spans": 5,
+      "span_lengths_km": [
+        83.4,
+        83.4,
+        83.4,
+        83.4,
+        83.4
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 80,
+      "dst": 81,
+      "length_km": 84.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        84.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 80,
+      "dst": 119,
+      "length_km": 102.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        51.0,
+        51.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 81,
+      "dst": 104,
+      "length_km": 71.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        71.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 82,
+      "dst": 85,
+      "length_km": 406.0,
+      "num_spans": 5,
+      "span_lengths_km": [
+        81.2,
+        81.2,
+        81.2,
+        81.2,
+        81.2
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 83,
+      "dst": 84,
+      "length_km": 127.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        63.5,
+        63.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 83,
+      "dst": 108,
+      "length_km": 252.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        84.0,
+        84.0,
+        84.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 83,
+      "dst": 117,
+      "length_km": 61.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        61.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 83,
+      "dst": 118,
+      "length_km": 159.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        79.5,
+        79.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 84,
+      "dst": 98,
+      "length_km": 151.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        75.5,
+        75.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 86,
+      "dst": 87,
+      "length_km": 61.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        61.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 87,
+      "dst": 118,
+      "length_km": 184.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        92.0,
+        92.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 90,
+      "dst": 91,
+      "length_km": 188.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        94.0,
+        94.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 90,
+      "dst": 92,
+      "length_km": 224.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        74.67,
+        74.67,
+        74.66
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 94,
+      "dst": 95,
+      "length_km": 65.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        65.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 96,
+      "dst": 105,
+      "length_km": 138.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        69.0,
+        69.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 97,
+      "dst": 103,
+      "length_km": 111.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        55.5,
+        55.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 97,
+      "dst": 112,
+      "length_km": 113.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        56.5,
+        56.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 99,
+      "dst": 113,
+      "length_km": 48.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        48.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 100,
+      "dst": 116,
+      "length_km": 52.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        52.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 101,
+      "dst": 102,
+      "length_km": 173.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        86.5,
+        86.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 101,
+      "dst": 125,
+      "length_km": 200.0,
+      "num_spans": 3,
+      "span_lengths_km": [
+        66.67,
+        66.67,
+        66.66
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 101,
+      "dst": 131,
+      "length_km": 96.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        96.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 102,
+      "dst": 120,
+      "length_km": 110.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        55.0,
+        55.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 103,
+      "dst": 112,
+      "length_km": 39.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        39.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 105,
+      "dst": 123,
+      "length_km": 81.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        81.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 106,
+      "dst": 107,
+      "length_km": 55.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        55.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 106,
+      "dst": 127,
+      "length_km": 114.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        57.0,
+        57.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 107,
+      "dst": 122,
+      "length_km": 109.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        54.5,
+        54.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 109,
+      "dst": 125,
+      "length_km": 71.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        71.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 110,
+      "dst": 123,
+      "length_km": 77.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        77.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    },
+    {
+      "src": 114,
+      "dst": 130,
+      "length_km": 145.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        72.5,
+        72.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 123,
+      "dst": 131,
+      "length_km": 167.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        83.5,
+        83.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 124,
+      "dst": 125,
+      "length_km": 101.0,
+      "num_spans": 2,
+      "span_lengths_km": [
+        50.5,
+        50.5
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5,
+        5.5
+      ]
+    },
+    {
+      "src": 126,
+      "dst": 127,
+      "length_km": 24.0,
+      "num_spans": 1,
+      "span_lengths_km": [
+        24.0
+      ],
+      "fiber_type": "SSMF",
+      "amplifier_nf_db": [
+        5.5
+      ]
+    }
+  ]
+}

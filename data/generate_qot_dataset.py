@@ -76,48 +76,65 @@ def path_to_edges(edge_lookup: dict, path: list) -> list:
     return edges
 
 
-def split_path_into_segments(path: list, regen_nodes: list, rng: random.Random) -> list:
-    """Split path into transparent segments by random regen placement.
+def split_path_into_segments(
+    path: list,
+    regen_nodes: list,
+    rng: random.Random,
+    edge_lookup: dict,
+    min_reach_km: float = 250.0,
+    max_reach_km: float = 3700.0,
+) -> list:
+    """Split path into transparent segments targeting a realistic regen reach.
 
-    Picks 0 to min(2, len(intermediate_nodes)) regen points from intermediate nodes
-    that are also regen candidates (degree >= 3).
+    Real coherent regeneration reach is bitrate-dependent, not a fixed node
+    count. Measured directly against this project's own
+    configs/modulation_formats.yaml via real GNPy on a synthetic 80km-span
+    chain (see scratch/reach_experiment.py from the design discussion):
+    reach ranges from ~320km (800 Gbps, 15.1dB threshold) to beyond 3600km
+    (300 Gbps, 4.8dB threshold) at full (48-channel) loading. `min_reach_km`/
+    `max_reach_km` default to that measured range with a small margin
+    (250-3700km), spanning the full set of `bitrate_options` this project
+    actually uses rather than a generic rule of thumb.
+
+    Greedily walks the path, accumulating real per-edge distance from
+    `edge_lookup`. Splits at the first regen-candidate node reached once
+    accumulated distance since the last split is >= a target reach sampled
+    fresh (uniform in [min_reach_km, max_reach_km]) for each segment — so
+    segment lengths vary sample to sample across the whole realistic range,
+    rather than correlating every segment on one path to a single draw. If
+    the path ends before any candidate is reached past the target, the
+    final segment simply runs to the destination (a genuine consequence of
+    topology sparsity when no regen site exists soon enough — not faked
+    around; still bounded by `max_spans_per_segment` downstream).
 
     Returns list of sub-paths (each sub-path is a list of node IDs).
     """
-    intermediate = path[1:-1]
-    candidates = [n for n in intermediate if n in set(regen_nodes)]
+    regen_set = set(regen_nodes)
+    target_reach = rng.uniform(min_reach_km, max_reach_km)
 
-    # Sample 0 to min(2, len(candidates)) regen points
-    max_regen = min(2, len(candidates))
-    n_regen = rng.randint(0, max_regen)
-
-    if n_regen == 0:
-        return [path]
-
-    # Bug C fix: sort chosen regen nodes by their POSITION in `path`, not by
-    # node id. `path` comes from nx.shortest_simple_paths and is always a
-    # simple path (no repeated nodes), so path.index() is unambiguous.
-    # Sorting by node value instead (the original bug) could put a
-    # numerically-smaller-but-later node before a numerically-larger-but-
-    # earlier one, producing breakpoints out of path order — which silently
-    # drops nodes into an empty segment and duplicates others into an
-    # overlapping one (see task-6-brief.md Bug C for the exact trace).
-    chosen = sorted(rng.sample(candidates, k=n_regen), key=lambda node: path.index(node))
-
-    # Build segments
     segments = []
-    breakpoints = [path[0]] + chosen + [path[-1]]
-    for i in range(len(breakpoints) - 1):
-        start = breakpoints[i]
-        end = breakpoints[i + 1]
-        # Find sub-path in original path
-        si = path.index(start)
-        ei = path.index(end)
-        segments.append(path[si:ei + 1])
+    current_segment = [path[0]]
+    accum_km = 0.0
+
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        accum_km += edge_lookup[(u, v)].length_km
+        current_segment.append(v)
+
+        is_last_edge = (i == len(path) - 2)
+        if not is_last_edge and v in regen_set and accum_km >= target_reach:
+            segments.append(current_segment)
+            current_segment = [v]
+            accum_km = 0.0
+            target_reach = rng.uniform(min_reach_km, max_reach_km)
+
+    segments.append(current_segment)
 
     # Invariant: segments must tile `path` exactly — no dropped nodes, no
     # duplicated interior coverage, every boundary connects to the next
-    # segment's start.
+    # segment's start. Holds by construction (each split shares its
+    # boundary node with both segments) but kept as an explicit regression
+    # guard, same as the prior node-count-based implementation.
     assert segments[0][0] == path[0] and segments[-1][-1] == path[-1]
     for i in range(len(segments) - 1):
         assert segments[i][-1] == segments[i + 1][0]
@@ -152,8 +169,12 @@ def generate_sample(
 
     path = rng.choice(paths)
 
-    # Split into segments
-    segments = split_path_into_segments(path, regen_candidates, rng)
+    # Split into segments, targeting a realistic per-segment regen reach
+    segments = split_path_into_segments(
+        path, regen_candidates, rng, edge_lookup,
+        min_reach_km=cfg.get("min_regen_reach_km", 250.0),
+        max_reach_km=cfg.get("max_regen_reach_km", 3700.0),
+    )
 
     samples = []
     for seg_path in segments:

@@ -1,9 +1,13 @@
 """Regression tests for `data/generate_qot_dataset.py`'s pure graph logic.
 
-Covers Bug C (segment splitter emitting overlapping/gapped segments because
-`chosen` regen nodes were sorted by node *value* instead of their *position*
-in `path`). No GNPy / topology loading needed — `split_path_into_segments`
-only touches plain Python lists.
+`split_path_into_segments` targets a realistic per-segment regen reach
+(distance-driven greedy walk, see its docstring) rather than the old policy
+of splitting at 0-2 randomly *counted* regen candidates regardless of the
+resulting distance. That old policy is what Bug C's fix (sorting chosen
+candidates by path position, not node value) applied to — the new algorithm
+is a monotonic forward walk with no selection-then-sort step, so it cannot
+reproduce Bug C's failure mode by construction. The old Bug-C-specific
+tests tested exactly that removed mechanism and have been replaced below.
 """
 from __future__ import annotations
 
@@ -46,86 +50,138 @@ def _tiles_exactly(path: list, segments: list) -> bool:
     return reconstructed == path
 
 
-class _FixedSampleRng(random.Random):
-    """A Random whose .sample() always returns a pre-set value, ignoring input.
+class _FixedUniformRng(random.Random):
+    """A Random whose .uniform() always returns a pre-set value, ignoring input.
 
-    Lets a test force a specific `chosen` set (bypassing the randint/sample
-    calls inside split_path_into_segments) while still exercising the real
-    sort-by-position fix.
+    Lets a test force a specific target reach deterministically.
     """
 
-    def __init__(self, fixed_sample, fixed_randint=None):
+    def __init__(self, fixed_uniform):
         super().__init__()
-        self._fixed_sample = fixed_sample
-        self._fixed_randint = fixed_randint
+        self._fixed_uniform = fixed_uniform
 
-    def sample(self, population, k):
-        return list(self._fixed_sample)
-
-    def randint(self, a, b):
-        if self._fixed_randint is not None:
-            return self._fixed_randint
-        return super().randint(a, b)
+    def uniform(self, a, b):
+        return self._fixed_uniform
 
 
-def test_bug_c_exact_failure_trace():
-    """Reproduce the exact trace from task-6-brief.md Bug C.
-
-    path=[3, 9, 5, 7], candidates chosen={5, 9}. Under the old
-    sorted-by-node-value bug, sorted({5, 9}) == [5, 9] (already numeric
-    order) which is NOT path order (9 comes before 5 in path). The fix sorts
-    by path.index(), giving [9, 5] instead.
-    """
-    path = [3, 9, 5, 7]
-    rng = _FixedSampleRng(fixed_sample={5, 9}, fixed_randint=2)
-    segments = split_path_into_segments(path, regen_nodes=[5, 9], rng=rng)
-
-    assert _tiles_exactly(path, segments)
-    # breakpoints should be [3, 9, 5, 7] (chosen sorted by path position: 9 then 5)
-    assert segments == [[3, 9], [9, 5], [5, 7]]
+def _chain_edge_lookup(path: list, lengths_km: list) -> dict:
+    """Build an edge_lookup for a simple chain path[0]-path[1]-...-path[-1],
+    with lengths_km[i] the length of the edge path[i]-path[i+1]."""
+    assert len(lengths_km) == len(path) - 1
+    lookup = {}
+    for i, length_km in enumerate(lengths_km):
+        u, v = path[i], path[i + 1]
+        edge = Edge(src=u, dst=v, length_km=length_km, num_spans=1,
+                    span_lengths_km=[length_km], fiber_type="SSMF", amplifier_nf_db=[5.0])
+        lookup[(u, v)] = edge
+        lookup[(v, u)] = edge
+    return lookup
 
 
-def test_bug_c_single_regen_node():
+def test_splits_at_first_candidate_reaching_target_reach():
+    """path=[0,1,2,3,4], edges each 100km, regen candidates at 1,2,3, fixed
+    target reach 150km. Accumulated distance reaches 150 only once it hits
+    node 2 (200km >= 150) — node 1 (100km) is a candidate but not yet at
+    reach, so no split there. After splitting at 2, the second segment
+    covers only 2 more edges (200km again reaches the resampled 150km
+    target at node... wait, only one edge left after the split point at
+    node 2 in a 4-edge path would be nodes 2-3-4, so the split target is
+    reached again only at the final edge, which is excluded from splitting
+    (never split at the destination) -> single trailing segment."""
     path = [0, 1, 2, 3, 4]
-    rng = _FixedSampleRng(fixed_sample={2}, fixed_randint=1)
-    segments = split_path_into_segments(path, regen_nodes=[2], rng=rng)
+    lookup = _chain_edge_lookup(path, [100.0, 100.0, 100.0, 100.0])
+    rng = _FixedUniformRng(fixed_uniform=150.0)
+
+    segments = split_path_into_segments(path, regen_nodes=[1, 2, 3], rng=rng, edge_lookup=lookup)
 
     assert _tiles_exactly(path, segments)
     assert segments == [[0, 1, 2], [2, 3, 4]]
 
 
-def test_bug_c_two_regen_nodes_in_path_order():
-    """Chosen nodes {1, 9} are split at their path-position order: 1 (index 2) then 9 (index 3).
+def test_no_split_when_reach_never_met():
+    """A huge target reach relative to the path's total distance means no
+    split ever fires, even though intermediate nodes are regen candidates —
+    the whole path stays one segment."""
+    path = [0, 1, 2]
+    lookup = _chain_edge_lookup(path, [50.0, 50.0])
+    rng = _FixedUniformRng(fixed_uniform=1000.0)
 
-    This happens to coincide with numeric order for this path, so it doesn't
-    exercise the reverse-order scenario Bug C was about — that regression
-    coverage lives in `test_bug_c_exact_failure_trace` and
-    `test_real_rng_many_trials_always_tiles` above/below. Kept here as a
-    valid (if redundant) tiling check.
-    """
-    path = [0, 8, 1, 9, 2]
-    rng = _FixedSampleRng(fixed_sample={1, 9}, fixed_randint=2)
-    segments = split_path_into_segments(path, regen_nodes=[1, 9], rng=rng)
+    segments = split_path_into_segments(path, regen_nodes=[1], rng=rng, edge_lookup=lookup)
 
-    assert _tiles_exactly(path, segments)
-    assert segments == [[0, 8, 1], [1, 9], [9, 2]]
-
-
-def test_n_regen_zero_returns_whole_path():
-    path = [0, 1, 2, 3]
-    rng = _FixedSampleRng(fixed_sample=set(), fixed_randint=0)
-    segments = split_path_into_segments(path, regen_nodes=[1, 2], rng=rng)
     assert segments == [path]
 
 
+def test_no_regen_candidates_returns_whole_path():
+    path = [0, 1, 2, 3]
+    lookup = _chain_edge_lookup(path, [80.0, 80.0, 80.0])
+    rng = _FixedUniformRng(fixed_uniform=50.0)  # would split every hop if any node were a candidate
+
+    segments = split_path_into_segments(path, regen_nodes=[], rng=rng, edge_lookup=lookup)
+
+    assert segments == [path]
+
+
+def test_never_splits_at_destination():
+    """Even if the destination node happens to be in regen_nodes and the
+    target reach is met exactly there, the trailing segment must still run
+    to the destination as one piece — splitting there would produce a
+    spurious empty trailing segment."""
+    path = [0, 1, 2]
+    lookup = _chain_edge_lookup(path, [80.0, 80.0])
+    rng = _FixedUniformRng(fixed_uniform=80.0)  # met exactly at node 1 AND at node 2 (destination)
+
+    segments = split_path_into_segments(path, regen_nodes=[1, 2], rng=rng, edge_lookup=lookup)
+
+    assert _tiles_exactly(path, segments)
+    assert segments == [[0, 1], [1, 2]]  # splits at 1 (not the destination), not again at 2
+
+
 def test_real_rng_many_trials_always_tiles():
-    """Fuzz with the real (unmocked) rng across many seeds/paths."""
-    path = [10, 3, 7, 1, 9, 4, 2]
-    candidates = [3, 7, 1, 9, 4]
+    """Fuzz with the real (unmocked) rng across many seeds, a long chain
+    with many regen candidates, and a realistic reach range."""
+    path = list(range(30))  # 0, 1, 2, ..., 29
+    lengths = [90.0] * (len(path) - 1)
+    lookup = _chain_edge_lookup(path, lengths)
+    candidates = list(range(1, 29))  # every intermediate node is a candidate
     for seed in range(200):
         rng = random.Random(seed)
-        segments = split_path_into_segments(path, regen_nodes=candidates, rng=rng)
+        segments = split_path_into_segments(
+            path, regen_nodes=candidates, rng=rng, edge_lookup=lookup,
+            min_reach_km=250.0, max_reach_km=3700.0,
+        )
         assert _tiles_exactly(path, segments), (seed, segments)
+
+
+def test_segment_distances_cluster_near_target_reach_range():
+    """Statistical sanity check: on a long chain with a candidate at every
+    node, most non-trailing segments' total distance should land reasonably
+    close to [min_reach_km, max_reach_km] — not systematically far below or
+    above it (which would indicate the walk isn't actually respecting the
+    target). The final segment is excluded since it may be short/long purely
+    because the path ran out before the next target was reached."""
+    path = list(range(60))
+    lengths = [90.0] * (len(path) - 1)
+    lookup = _chain_edge_lookup(path, lengths)
+    candidates = list(range(1, 59))
+    min_reach, max_reach = 250.0, 3700.0
+
+    rng = random.Random(0)
+    segments = split_path_into_segments(
+        path, regen_nodes=candidates, rng=rng, edge_lookup=lookup,
+        min_reach_km=min_reach, max_reach_km=max_reach,
+    )
+
+    def _segment_km(seg):
+        return sum(lookup[(seg[i], seg[i + 1])].length_km for i in range(len(seg) - 1))
+
+    non_trailing = segments[:-1]
+    assert non_trailing, "expected at least one full split on a 59-hop, 90km/edge chain"
+    for seg in non_trailing:
+        dist = _segment_km(seg)
+        # Generous tolerance: a segment must reach >= its sampled target
+        # (by construction) but can overshoot by up to one full edge length
+        # (90km) before the walk notices and splits.
+        assert min_reach <= dist <= max_reach + 90.0, (seg, dist)
 
 
 def test_get_k_shortest_paths_returns_top_k_in_order():
