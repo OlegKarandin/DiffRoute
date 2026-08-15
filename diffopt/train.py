@@ -76,6 +76,12 @@ def main() -> None:
 
     cfg = yaml.safe_load(Path(args.config).read_text())
 
+    # Seed before any module construction — EdgeWeightNet's init otherwise
+    # varies run to run and changes routing enough to move num_infeasible by
+    # an order of magnitude (measured 5/100 vs 98/100 at epoch 1 on
+    # ind_132), making runs incomparable.
+    torch.manual_seed(cfg.get("seed", 42))
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -129,10 +135,17 @@ def main() -> None:
 
     with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
+        # regen_logit_* are the RAW learned parameters. regen_loss alone is
+        # misleading: it reports sum(sigmoid(logit/tau)) while tau is being
+        # annealed, so it moves dramatically even when the logits are static
+        # (measured: 87% of the observed 66 -> 18 fall came from tau, not
+        # learning). Log the parameter itself so drift is visible directly.
         writer.writerow([
             "epoch", "total_loss", "feasibility_loss", "regen_loss",
             "path_cost_loss", "num_regen_soft", "num_infeasible",
             "tau", "soft_max_temperature", "vlastelica_lambda",
+            "regen_logit_mean", "regen_logit_min", "regen_logit_max",
+            "regen_prob_max",
         ])
 
         for epoch in range(1, epochs + 1):
@@ -187,6 +200,7 @@ def main() -> None:
 
             vlastelica_lambda = max(lambda_min, vlastelica_lambda * lambda_decay)
 
+            logits = regen_placement.regen_logits.detach()
             writer.writerow([
                 epoch,
                 f"{loss.item():.6f}",
@@ -198,6 +212,10 @@ def main() -> None:
                 f"{tau:.4f}",
                 f"{soft_max_temp:.4f}",
                 f"{vlastelica_lambda:.4f}",
+                f"{logits.mean().item():.6f}",
+                f"{logits.min().item():.6f}",
+                f"{logits.max().item():.6f}",
+                f"{regen_probs.max().item():.6f}",
             ])
             f.flush()
 
@@ -207,6 +225,9 @@ def main() -> None:
                     f"| feasibility={metrics['feasibility_loss']:.4f} "
                     f"| regen={metrics['regen_loss']:.4f} "
                     f"| infeasible={metrics['num_infeasible']} "
+                    f"| regen_soft={metrics['num_regen_soft']} "
+                    f"| logit[{logits.min().item():+.3f},{logits.max().item():+.3f}] "
+                    f"| p_max={regen_probs.max().item():.3f} "
                     f"| tau={tau:.3f} | t_sm={soft_max_temp:.3f} | λ={vlastelica_lambda:.3f}"
                 )
 

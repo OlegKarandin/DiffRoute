@@ -32,14 +32,32 @@ def linear_noise_to_db(noise_linear: torch.Tensor) -> torch.Tensor:
 
 def soft_max(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     """
-    Smooth approximation to max(a, b) via log-sum-exp.
+    Smooth approximation to max(a, b) via log-sum-exp, normalised by scale.
 
-    Returns temperature * logsumexp([a/t, b/t]).
     For noise values, 'max noise' corresponds to 'worst segment'.
+
+    The naive form `t * logsumexp([a/t, b/t])` equals `max(a, b) + t*delta`
+    with `0 < delta <= ln2` — an **absolute** overshoot that does not shrink
+    as the operands do. That is fatal here, because these operands are
+    linear noise powers: real segments run ~180-210 km, hence ~26 dB, hence
+    noise ~0.0025, while even the sharpest scheduled temperature (0.01)
+    overshoots by `0.01 * ln2 = 0.0069`. The error then exceeds the signal,
+    `soft_max(a, b)` climbs above `a + b`, and the combiner reports that
+    regenerating makes a path *worse* — inverting the sign of every gradient
+    reaching `regen_logits`. See
+    docs/investigations/regen_placement_not_concentrating.md.
+
+    Normalising by `m = max(a, b)` (detached, so it only rescales and never
+    contributes gradient) makes the overshoot `m * t * delta` — proportional
+    to the operands instead of absolute. The invariant `soft_max(a,b) < a+b`
+    then holds for any `temperature < 1/ln2 ~= 1.44` at ANY noise magnitude,
+    so the 0.5 -> 0.01 annealing schedule is sign-correct end to end and no
+    longer encodes a hidden assumption about topology-dependent noise scale.
     """
     t = temperature
-    stacked = torch.stack([a / t, b / t], dim=0)
-    return t * torch.logsumexp(stacked, dim=0)
+    m = torch.maximum(a, b).detach().clamp_min(1e-30)
+    stacked = torch.stack([a / m / t, b / m / t], dim=0)
+    return m * t * torch.logsumexp(stacked, dim=0)
 
 
 # ---------------------------------------------------------------------------

@@ -141,6 +141,63 @@ def test_gradient_wrt_regen_prob():
 
 
 # ---------------------------------------------------------------------------
+# Test 5b: same gradient invariant, at the noise scale production actually has
+# ---------------------------------------------------------------------------
+
+def test_gradient_wrt_regen_prob_at_production_noise_scale():
+    """
+    Test 5 uses 5 dB segments (noise 0.316). Real segments are nothing like
+    that: `segment_path` cuts at every degree>=3 node, so segments run
+    ~180-210 km on both german_17 and ind_132, giving ~26 dB and noise
+    ~0.0023-0.0027 — roughly 100x smaller.
+
+    soft_max's overshoot is `temperature * ln2`, which is ABSOLUTE in linear
+    noise units and does not shrink with the operands. At temperature=0.01
+    that overshoot is 0.00693 — larger than the noise itself — so
+    `soft_max(a,b)` exceeds `a + b` and the combiner reports that
+    regenerating makes the path *worse*. See
+    docs/investigations/regen_placement_not_concentrating.md.
+
+    Two 26 dB segments: no-regen noise is 2 * 0.00251 = 0.00501 (23.0 dB),
+    regen noise is 0.00251 (26.0 dB). Regen strictly helps, so
+    d(gsnr)/dp must be positive here exactly as it is in test 5.
+    """
+    combiner = SegmentCombiner()
+    gsnr_1 = t(26.0)
+    gsnr_2 = t(26.0)
+    p = t(0.5, requires_grad=True)
+
+    result = combiner([gsnr_1, gsnr_2], [p], temperature=0.01)
+    result.backward()
+
+    assert p.grad is not None, "Gradient not computed for regen_prob"
+    assert p.grad.item() > 0.0, (
+        f"Expected positive gradient (regen helps at any noise scale), "
+        f"got {p.grad.item():.6f} — soft_max's absolute error floor "
+        f"(temperature*ln2) has swamped the per-segment noise"
+    )
+
+
+def test_regen_never_increases_noise_across_noise_scales():
+    """
+    The 'regen helps' invariant must hold at every operating point, not just
+    the one the other tests happen to sample. Sweeps segment GSNR across the
+    full range the QoT model emits (~6.5-20 dB training range, and the ~26 dB
+    short segments the pipeline actually produces) and asserts a fully
+    regenerated path is never worse than a transparent one.
+    """
+    combiner = SegmentCombiner()
+    for gsnr_db in [5.0, 10.0, 15.0, 20.0, 23.0, 26.0, 30.0]:
+        transparent = combiner([t(gsnr_db), t(gsnr_db)], [t(0.0)], temperature=0.01)
+        regenerated = combiner([t(gsnr_db), t(gsnr_db)], [t(1.0)], temperature=0.01)
+        assert regenerated.item() > transparent.item(), (
+            f"At {gsnr_db} dB per segment (noise {10 ** (-gsnr_db / 10):.5f}): "
+            f"regenerated path {regenerated.item():.4f} dB is not better than "
+            f"transparent {transparent.item():.4f} dB"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Test 6: three segments, two boundaries — brute-force check
 # ---------------------------------------------------------------------------
 

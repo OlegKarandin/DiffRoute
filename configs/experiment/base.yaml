@@ -79,21 +79,38 @@ pipeline:
   channel_loading_fraction: 0.5  # fixed during inference
   freeze_qot: true
 
-# NOTE: previously hardcoded (SegmentCombiner(soft_max_temperature=0.5),
-# never annealed) — at t=0.5 the soft-max approximation's floor (t*ln(2)
-# in linear noise units) swamps real per-segment noise, making every
-# multi-segment (regenerated) path look worse than not regenerating at
-# all, silently inverting the "regen helps" invariant. Now annealed
-# per-epoch alongside regen_tau (same anneal_start/anneal_end_epoch
-# window below) from soft_max_temperature down to soft_max_temperature_min
-# — 0.01 is the value CLAUDE.md's Phase 1b correction #3 established as
-# where the invariant reliably holds.
+# Annealed per-epoch alongside regen_tau (same anneal_start/anneal_end_epoch
+# window below). Two separate bugs lived here; both are fixed, and the
+# history matters because it explains why these values are safe now:
+#
+#  1) The temperature used to be hardcoded at construction and never annealed
+#     at all (CLAUDE.md Phase 1c correction #7).
+#  2) More fundamentally, soft_max's approximation error used to be ABSOLUTE
+#     in linear-noise units (t*ln2), so it did not shrink with its operands.
+#     Real per-segment noise is ~0.0025 (segments run ~180-210 km, ~26 dB),
+#     while even t=0.01 has a floor of 0.0069 — 2.6x larger than the signal.
+#     Every temperature in this range therefore reported that regenerating
+#     makes a path WORSE, inverting the sign of every gradient into
+#     regen_logits (CLAUDE.md Phase 1c correction #8).
+#
+# soft_max is now scale-normalised, so the error is max(a,b)*t*ln2 — a fixed
+# fraction of the operands — and the "regen helps" invariant holds for any
+# temperature < 1/ln2 = 1.443 at ANY noise magnitude. These values are
+# comfortably inside that, and no longer encode a hidden assumption about
+# the topology's noise scale. Verify with:
+#   python scripts/diagnose_segment_noise_scale.py --config <this file>
 segment_combiner:
   soft_max_temperature: 0.5
   soft_max_temperature_min: 0.01
 
 training:
   lr_edge_net: 1.0e-3  # NOTE: EdgeWeightNet grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
+  # Adam's step size is ~lr whenever the gradient sign is steady, independent
+  # of gradient magnitude, so a logit moves at most lr_regen per epoch and the
+  # total excursion available is lr_regen * epochs_e2e. Here that is 5.0 —
+  # ample. (The 20-epoch smoke configs were NOT: 0.2 total excursion cannot
+  # carry a logit across zero, so they placed no regenerators even once the
+  # gradient sign was corrected. See CLAUDE.md Phase 1c correction #8.)
   lr_regen: 1.0e-2
   epochs_e2e: 500
   vlastelica_lambda: 10.0
