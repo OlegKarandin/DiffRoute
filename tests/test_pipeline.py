@@ -475,3 +475,125 @@ def test_feasible_demand_zero_feasibility_gradient():
     assert feasibility_loss.item() == 0.0
     assert pi.grad is not None
     assert pi.grad.abs().sum().item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Test 11: QoT calls are batched across demands/segments within one forward()
+# ---------------------------------------------------------------------------
+
+def test_qot_model_called_once_per_forward(monkeypatch):
+    """pipeline.forward() must invoke the QoT model exactly once per call,
+    regardless of how many demands or segments it processes internally.
+
+    Profiling (docs/investigations/open_followups.md #1) found ~920 QoT
+    calls/epoch at batch size 1 accounting for 59% of pipeline.forward's
+    wall-clock, almost entirely PyTorch per-op dispatch overhead rather than
+    arithmetic. Two demands that each cross the hub topology's regen
+    candidate (node 3) produce 4 segments total (2 per demand); an
+    unbatched implementation calls the QoT model 4 times, a batched one
+    exactly once."""
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+
+    call_count = 0
+    original_forward = SpanAttentionQoT.forward
+
+    def counting_forward(self, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(SpanAttentionQoT, "forward", counting_forward)
+
+    demands = [
+        Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
+        Demand(id=1, src=1, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
+    ]
+    pipeline(demands)
+
+    assert call_count == 1, (
+        f"QoT model forward() called {call_count} times for 2 demands "
+        "producing 4 segments total — expected exactly 1 batched call"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: batched QoT output is scattered back to the correct demand/segment
+# ---------------------------------------------------------------------------
+
+def test_batched_qot_matches_per_segment_direct_calls():
+    """With multiple demands each producing multiple segments, every
+    demand's end-to-end GSNR must match what direct (unbatched, no-STE)
+    per-segment QoT calls + SegmentCombiner would produce for that same
+    demand's segments — i.e. batching must not cross-wire results between
+    demands or segments."""
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    temperature = 0.01  # sharp, so soft_max ~= true max
+
+    demands = [
+        Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
+        Demand(id=1, src=1, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
+    ]
+    _, gsnr_preds, path_indicators, regen_probs = pipeline(
+        demands, soft_max_temperature=temperature
+    )
+
+    for demand in demands:
+        indicator = path_indicators[demand.id].detach()
+        active_eids = [e for e in range(indicator.shape[0]) if indicator[e].item() > 0.5]
+
+        segments, boundary_nodes = segment_path(
+            active_eids, demand.src, pipeline._regen_candidate_set,
+            pipeline._edges, demand.dst,
+        )
+
+        direct_gsnrs = []
+        for seg in segments:
+            span_feats, padding_mask = pipeline._extract_span_features(seg, torch.device("cpu"))
+            with torch.no_grad():
+                direct_gsnrs.append(pipeline.qot_model(span_feats, padding_mask)[0])
+
+        boundary_probs = [regen_probs[n].detach() for n in boundary_nodes]
+        expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs, temperature=temperature)
+
+        assert abs(gsnr_preds[demand.id].item() - expected_gsnr.item()) < 1e-4, (
+            f"demand {demand.id}: batched GSNR {gsnr_preds[demand.id].item():.6f} dB != "
+            f"direct per-segment GSNR {expected_gsnr.item():.6f} dB"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 13: batched QoT padding trims to the batch's true max span count
+# ---------------------------------------------------------------------------
+
+def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
+    """The batched QoT call must pad every segment only up to the widest
+    real segment in the current batch, not the architectural max_spans=60
+    — trimming the wasted padding columns is what eliminates the ~98%
+    masked-out attention compute profiled in
+    docs/investigations/open_followups.md #1 (real segments run <=12 spans,
+    median ~7, vs the 60-wide architectural ceiling). The hub topology's
+    0->4 path crosses regen candidate node 3, splitting into a 2-edge/
+    2-span segment (0-1, 1-3 or 0-2, 2-3) and a 1-edge/1-span segment
+    (3-4) — batch max is 2, both segments share that one batched call."""
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+
+    captured_seq_lens: list[int] = []
+    original_forward = SpanAttentionQoT.forward
+
+    def capturing_forward(self, span_features, padding_mask):
+        captured_seq_lens.append(span_features.shape[1])
+        return original_forward(self, span_features, padding_mask)
+
+    monkeypatch.setattr(SpanAttentionQoT, "forward", capturing_forward)
+
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+    pipeline(demands)
+
+    assert captured_seq_lens == [2], (
+        f"expected the single batched QoT call padded to 2 spans (the "
+        f"batch's true max, from the 2-edge first segment), got "
+        f"seq_len(s) {captured_seq_lens}"
+    )

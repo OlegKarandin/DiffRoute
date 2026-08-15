@@ -177,12 +177,8 @@ class DiffONetPipeline(nn.Module):
                 break  # disconnected (shouldn't happen with valid Dijkstra output)
         return ordered
 
-    def _extract_span_features(
-        self,
-        segment_edge_ids: List[int],
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build (1, max_spans, 5) span feature tensor and (1, max_spans) padding mask."""
+    def _span_feature_rows(self, segment_edge_ids: List[int]) -> List[List[float]]:
+        """Build raw (unpadded) per-span feature rows for one segment."""
         rows: List[List[float]] = []
         accum_dist = 0.0
 
@@ -199,7 +195,24 @@ class DiffONetPipeline(nn.Module):
                 ])
                 accum_dist += edge.span_lengths_km[span_idx]
 
+        return rows
+
+    def _extract_span_features(
+        self,
+        segment_edge_ids: List[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build (1, max_spans, 5) span feature tensor and (1, max_spans) padding mask.
+
+        Pads to the architectural max_spans (not a batch-local width) — used
+        for single-segment direct QoT calls (tests, diagnostics). The
+        batched path in forward() below pads to the batch's true max span
+        count instead, since attention masking and mean-pooling over
+        real spans only make the two paddings numerically equivalent.
+        """
+        rows = self._span_feature_rows(segment_edge_ids)
         n_spans = len(rows)
+
         span_feats = torch.zeros(1, self.max_spans, 5, device=device)
         if n_spans > 0:
             span_feats[0, :n_spans] = torch.tensor(rows, dtype=torch.float32, device=device)
@@ -260,9 +273,16 @@ class DiffONetPipeline(nn.Module):
         # 3. Edge weights via EdgeWeightNet — (E,), strictly positive via Softplus
         edge_weights = self.edge_weight_net(edge_feats).squeeze(-1)
 
-        path_costs: Dict[int, torch.Tensor] = {}
-        gsnr_preds: Dict[int, torch.Tensor] = {}
-        path_indicators: Dict[int, torch.Tensor] = {}
+        # 4. Route and segment every demand first (no QoT calls yet), so all
+        # segments across all demands can be sent through the QoT model in
+        # one batched call instead of one call per segment (~920 calls/epoch
+        # at batch size 1 — see docs/investigations/open_followups.md #1).
+        demand_path_costs: Dict[int, torch.Tensor] = {}
+        demand_path_indicators: Dict[int, torch.Tensor] = {}
+        demand_segments: Dict[int, List[List[int]]] = {}
+        demand_boundary_nodes: Dict[int, List[int]] = {}
+        all_segments: List[List[int]] = []
+        segment_owner_demand_id: List[int] = []
 
         for demand in demands:
             # 4a. Surrogate Dijkstra → (E,) binary path indicator
@@ -290,15 +310,55 @@ class DiffONetPipeline(nn.Module):
                 demand.dst,
             )
 
-            # 4e. QoT evaluation per segment, blended with the STE proxy
-            segment_gsnrs: List[torch.Tensor] = []
+            demand_path_costs[demand.id] = path_cost
+            demand_path_indicators[demand.id] = path_indicator
+            demand_segments[demand.id] = segments
+            demand_boundary_nodes[demand.id] = boundary_nodes
             for seg_edge_ids in segments:
-                span_feats, padding_mask = self._extract_span_features(seg_edge_ids, device)
-                # QoT returns (batch,); [0] extracts scalar. Forward value only —
-                # this has zero live gradient w.r.t. path_indicator (span_feats
-                # comes from static topology data, and seg_edge_ids was derived
-                # via path_indicator.detach()).
-                qot_gsnr = self.qot_model(span_feats, padding_mask)[0]
+                all_segments.append(seg_edge_ids)
+                segment_owner_demand_id.append(demand.id)
+
+        # 5. One batched QoT call over every segment from every demand,
+        # padded only to this batch's true max span count (not the
+        # architectural max_spans=60) — real segments run <=12 spans,
+        # median ~7, so padding to 60 wastes ~98% of attention compute on
+        # masked positions (docs/investigations/open_followups.md #1).
+        # Safe because TransformerEncoder's src_key_padding_mask excludes
+        # padded positions from attention and the mean-pool divides only by
+        # real-span count, so a narrower shared width changes nothing but
+        # the wasted columns.
+        all_segment_rows = [self._span_feature_rows(seg) for seg in all_segments]
+
+        if all_segments:
+            batch_max_spans = max(1, max(len(rows) for rows in all_segment_rows))
+            n_total = len(all_segments)
+            batched_span_feats = torch.zeros(n_total, batch_max_spans, 5, device=device)
+            batched_padding_mask = torch.zeros(n_total, batch_max_spans, dtype=torch.bool, device=device)
+            for i, rows in enumerate(all_segment_rows):
+                n_spans = len(rows)
+                if n_spans > 0:
+                    batched_span_feats[i, :n_spans] = torch.tensor(rows, dtype=torch.float32, device=device)
+                    batched_padding_mask[i, :n_spans] = True
+            # Forward value only — this has zero live gradient w.r.t. any
+            # path_indicator (span_feats comes from static topology data,
+            # and seg_edge_ids was derived via path_indicator.detach()).
+            batched_qot_gsnr = self.qot_model(batched_span_feats, batched_padding_mask)
+        else:
+            batched_qot_gsnr = torch.zeros(0, device=device)
+
+        # 6. Scatter the batched QoT output back per demand, blend with the
+        # STE proxy per segment, and combine each demand's segments.
+        path_costs: Dict[int, torch.Tensor] = {}
+        gsnr_preds: Dict[int, torch.Tensor] = {}
+        path_indicators: Dict[int, torch.Tensor] = {}
+        flat_idx = 0
+
+        for demand in demands:
+            path_indicator = demand_path_indicators[demand.id]
+            segment_gsnrs: List[torch.Tensor] = []
+            for seg_edge_ids in demand_segments[demand.id]:
+                qot_gsnr = batched_qot_gsnr[flat_idx]
+                flat_idx += 1
 
                 # Analytical proxy — linear in path_indicator, independent of
                 # edge_weights. Supplies the backward gradient direction.
@@ -314,11 +374,11 @@ class DiffONetPipeline(nn.Module):
                 segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())
                 segment_gsnrs.append(segment_gsnr)
 
-            # 4f. Combine segments with soft boundary probabilities
-            boundary_probs = [regen_probs[n] for n in boundary_nodes]
+            # Combine segments with soft boundary probabilities
+            boundary_probs = [regen_probs[n] for n in demand_boundary_nodes[demand.id]]
             path_gsnr = self.segment_combiner(segment_gsnrs, boundary_probs, temperature=soft_max_temperature)
 
-            path_costs[demand.id] = path_cost
+            path_costs[demand.id] = demand_path_costs[demand.id]
             gsnr_preds[demand.id] = path_gsnr
             path_indicators[demand.id] = path_indicator
 
