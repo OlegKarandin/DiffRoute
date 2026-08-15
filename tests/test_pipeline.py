@@ -597,3 +597,119 @@ def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
         f"batch's true max, from the 2-edge first segment), got "
         f"seq_len(s) {captured_seq_lens}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 14/15: edge-weight scale degeneracy (docs/investigations/
+# edge_weight_scale_collapse.md). The loss must be homogeneous of degree 0
+# in EdgeWeightNet's raw output, so the scale-direction gradient is exactly
+# zero and "shrink every weight" is not a descent direction.
+# ---------------------------------------------------------------------------
+
+class _ScaledNet(torch.nn.Module):
+    """Wraps EdgeWeightNet and multiplies its output by a constant.
+
+    Used to simulate an arbitrarily collapsed (or inflated) weight scale
+    without retraining, so the scale-invariance property can be asserted at
+    the magnitudes that actually occur in a real run.
+    """
+
+    def __init__(self, inner: torch.nn.Module, scale: float) -> None:
+        super().__init__()
+        self.inner = inner
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.inner(x) * self.scale
+
+
+def test_scale_direction_gradient_is_zero():
+    """Euler check: for a degree-0 homogeneous loss, sum_i u_i * dL/du_i == 0
+    exactly, where u is EdgeWeightNet's raw pre-normalisation output.
+
+    This is the fix stated as an equation. It is also the .detach() guard:
+    detaching the mean in pipeline.forward deletes autograd's correction term
+    and this assertion fails immediately.
+    """
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    mod_cfg = make_mod_config()
+
+    captured = {}
+
+    def hook(_module, _inputs, output):
+        output.retain_grad()
+        captured["raw"] = output
+
+    handle = pipeline.edge_weight_net.register_forward_hook(hook)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+    path_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    handle.remove()
+
+    loss, _ = compute_loss(
+        gsnr_preds=gsnr_preds,
+        path_costs=path_costs,
+        demands=demands,
+        regen_probs=regen_probs,
+        modulation_config=mod_cfg,
+    )
+    loss.backward()
+
+    raw = captured["raw"]
+    assert raw.grad is not None, "raw EdgeWeightNet output received no gradient"
+
+    radial = (raw.detach() * raw.grad).sum().item()
+    # Relative tolerance against the magnitude of the terms being summed —
+    # the identity is exact, so any residual is float error only.
+    term_scale = (raw.detach().abs() * raw.grad.abs()).sum().item()
+    assert abs(radial) <= 1e-5 * max(term_scale, 1.0), (
+        f"scale-direction gradient is {radial:.6e} (term scale {term_scale:.6e}) "
+        "— expected ~0. The loss is not degree-0 in EdgeWeightNet's raw output, "
+        "so 'shrink every weight' is still a free descent direction."
+    )
+
+
+def test_total_loss_invariant_to_edge_weight_scale():
+    """Scaling EdgeWeightNet's output by any positive constant must leave the
+    total loss and every chosen path bit-identical.
+
+    Includes 1e-11 — the magnitude weights actually collapsed to in the
+    ind_132 run — applying CLAUDE.md's lesson from correction #8, where the
+    original soft_max tests passed only because they never covered the
+    production scale.
+    """
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    mod_cfg = make_mod_config()
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    def run(scale: float):
+        inner = pipeline.edge_weight_net
+        pipeline.edge_weight_net = _ScaledNet(inner, scale)
+        try:
+            path_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
+                demands, lambda_=5.0
+            )
+            loss, _ = compute_loss(
+                gsnr_preds=gsnr_preds,
+                path_costs=path_costs,
+                demands=demands,
+                regen_probs=regen_probs,
+                modulation_config=mod_cfg,
+            )
+            return loss.item(), path_indicators[0].detach().clone()
+        finally:
+            pipeline.edge_weight_net = inner
+
+    loss_1, path_1 = run(1.0)
+    loss_big, path_big = run(1000.0)
+    loss_collapsed, path_collapsed = run(1e-11)
+
+    assert abs(loss_1 - loss_big) < 1e-5, (
+        f"loss changed under 1000x weight scaling: {loss_1:.6f} -> {loss_big:.6f}"
+    )
+    assert abs(loss_1 - loss_collapsed) < 1e-5, (
+        f"loss changed under 1e-11 weight scaling: {loss_1:.6f} -> {loss_collapsed:.6f}"
+    )
+    assert torch.equal(path_1, path_big), "routing changed under 1000x scaling"
+    assert torch.equal(path_1, path_collapsed), "routing changed under 1e-11 scaling"

@@ -270,8 +270,29 @@ class DiffONetPipeline(nn.Module):
             regen_probs[self._edge_dst_ids].unsqueeze(1),
         ], dim=1)
 
-        # 3. Edge weights via EdgeWeightNet — (E,), strictly positive via Softplus
-        edge_weights = self.edge_weight_net(edge_feats).squeeze(-1)
+        # 3. Edge weights via EdgeWeightNet — (E,), strictly positive via
+        # Softplus, then renormalised to unit mean.
+        #
+        # The divisor is deliberately NOT detached. With w = u / mean(u), the
+        # loss becomes homogeneous of degree 0 in the raw output u, since
+        # (c*u)/mean(c*u) == u/mean(u) for any c > 0. Euler's theorem then
+        # gives sum_i u_i * dL/du_i == 0 identically: the scale component of
+        # the gradient is annihilated as an algebraic fact, not merely
+        # discouraged. Autograd produces this because differentiating through
+        # mean(u) contributes the term that subtracts the radial component.
+        #
+        # Detaching would delete that subtraction and leave the collapse
+        # degeneracy fully intact, merely rescaled — weights fell ~8.2e7x on
+        # ind_132 while Spearman rank-corr with init stayed at +0.999. See
+        # docs/investigations/edge_weight_scale_collapse.md.
+        #
+        # NOTE: this is the OPPOSITE choice from soft_max's scale
+        # normalisation in qot/segment_combiner.py, which detaches on purpose
+        # (there the goal is to rescale an error term without adding a
+        # gradient path). The two lines look nearly identical and mean
+        # opposite things. Do not "make them consistent".
+        raw_edge_weights = self.edge_weight_net(edge_feats).squeeze(-1)
+        edge_weights = raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)
 
         # 4. Route and segment every demand first (no QoT calls yet), so all
         # segments across all demands can be sent through the QoT model in
