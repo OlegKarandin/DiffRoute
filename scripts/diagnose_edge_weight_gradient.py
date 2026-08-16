@@ -6,10 +6,27 @@ routes 2.1-2.4x longer than shortest-by-km) and proposed a mechanism it
 explicitly flagged as unconfirmed: that `path_cost_loss`'s gradient
 dominates the STE-routed feasibility gradient on the edges that collapse.
 
-This script is that doc's stated "Next step" — the `edge_weights` analogue of
-`diagnose_regen_gradient.py`. It decomposes d(total_loss)/d(edge_weights)
-into its three loss-term components and runs five checks that discriminate
-between the candidate mechanisms:
+This script began as that doc's stated "Next step" — the `edge_weights`
+analogue of `diagnose_regen_gradient.py` — to characterize the collapse.
+The fix has since landed (unit-mean renormalisation with a live divisor,
+redenominating `path_cost_loss` in the fixed `edge_ase_noise` buffer instead
+of learned `edge_weights`, standardised static topology features), so this
+script now doubles as the post-fix verification tool. Expected post-fix
+readings: check C's direct component is exactly 0 (the path-cost term no
+longer reads `edge_weights` at all, so nothing is left to differentiate
+directly); check F's perturbation ratio reads O(1-10), not the pre-fix
+7.9e6 (weights pinned to unit mean can no longer be swamped by a
+fixed-scale Vlastelica perturbation); check G's scale-direction derivative
+reads ~0 for every loss term (the loss is degree-0 in EdgeWeightNet's raw
+output, so "shrink everything" is no longer a free descent direction);
+check D's Spearman rank-corr(init, trained) sits well below +0.999 (training
+is rearranging relative order, not just uniformly rescaling); and
+corr(w, length_km) is positive (weight tracks physical length again,
+instead of the pre-fix -0.17).
+
+It decomposes d(total_loss)/d(edge_weights) into its three loss-term
+components and runs five checks that discriminate between the candidate
+mechanisms:
 
   A. Scale degeneracy       — is "shrink all weights" a free descent direction?
   B. Gradient decomposition — does path_cost dominate feasibility, and does
@@ -145,7 +162,9 @@ def main() -> None:
                 rp[pipeline_obj._edge_src_ids].unsqueeze(1),
                 rp[pipeline_obj._edge_dst_ids].unsqueeze(1),
             ], dim=1)
-            return pipeline_obj.edge_weight_net(feats).squeeze(-1).numpy()
+            raw = pipeline_obj.edge_weight_net(feats).squeeze(-1)
+            # Match pipeline.forward's unit-mean renormalisation exactly.
+            return (raw / raw.mean().clamp_min(1e-12)).numpy()
 
     w_init = edge_weights_of(pipe_init, regen_init)
     w_trained = edge_weights_of(pipe, regen)
@@ -234,12 +253,15 @@ def main() -> None:
         g_cost = grad_of(L_cost, w_t).squeeze(-1)
         g_tot = g_feas + g_regen + g_cost
 
-        # C. direct component of the path_cost gradient: d/dw of (indicator . w)
-        # holding the indicator fixed == lambda_cost * (#demands using edge e)
+        # C. Post-fix, the path-cost term is denominated in edge_ase_noise, so
+        # its analytic direct d/d(edge_weights) is identically zero — every
+        # remaining component must arrive via the Vlastelica surrogate. Before
+        # the fix the split was 14.46 direct vs 2.2e-6 surrogate; a nonzero
+        # direct component here means the term is reading edge_weights again.
         usage = torch.zeros(n_edges)
         for d in dem:
             usage += path_inds[d.id].detach()
-        g_cost_direct = p_cfg["lambda_cost"] * usage
+        g_cost_direct = torch.zeros(n_edges)
         g_cost_surrogate = g_cost - g_cost_direct
 
         print(f"  demands={len(dem)}  infeasible={n_infeas}  tau={tau_x:.3f} "
@@ -280,10 +302,12 @@ def main() -> None:
                            ("regen_count", g_regen, None),
                            ("TOTAL", g_tot, None)]:
             d = float((g * wv_).sum())
-            extra = f"   (L_cost itself = {ref:.6e}; Euler check)" if ref is not None else ""
+            extra = (f"   (L_cost itself = {ref:.6e}; "
+                     f"pre-fix Euler check, expected to disagree now)") if ref is not None else ""
             print(f"     {nm:<14} dL/dc = {d:+.6e}{extra}")
-        print("     -> only path_cost has a nonzero scale-direction gradient, and it")
-        print("        is strictly positive, so descent shrinks w without bound.")
+        print("     -> post-fix ALL terms should read ~0: the loss is degree-0 in")
+        print("        EdgeWeightNet's raw output, so no shrink direction exists.")
+        print("        (pre-fix: path_cost +7.198e-02, feasibility +3.164e-01 at epoch 0)")
 
         # F. Vlastelica perturbation scale vs weight scale
         wv = w_t.detach().squeeze(-1)
@@ -297,7 +321,8 @@ def main() -> None:
               f"max = {pert.max():.4e}")
         ratio = (pert.max() / wv.median()).item() if wv.median() > 0 else float("inf")
         print(f"     max perturbation / median weight = {ratio:.3e}")
-        print(f"     (>>1 means the Vlastelica perturbed solve effectively ignores w)\n")
+        print(f"     (pre-fix this read 7.9e6 at epoch 60; with weights pinned to")
+        print(f"      unit mean it should now read O(1-10), a genuine perturbation)\n")
 
     # =====================================================================
     # E. Barrier routing
