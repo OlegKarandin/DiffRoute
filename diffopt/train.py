@@ -142,7 +142,7 @@ def main() -> None:
         # learning). Log the parameter itself so drift is visible directly.
         writer.writerow([
             "epoch", "total_loss", "feasibility_loss", "regen_loss",
-            "path_cost_loss", "num_regen_soft", "num_infeasible",
+            "path_noise_loss", "num_regen_soft", "num_infeasible",
             "tau", "soft_max_temperature", "vlastelica_lambda",
             "regen_logit_mean", "regen_logit_min", "regen_logit_max",
             "regen_prob_max",
@@ -180,12 +180,12 @@ def main() -> None:
             opt_edge.zero_grad()
             opt_regen.zero_grad()
 
-            path_costs, gsnr_preds, _, regen_probs = pipeline(
+            path_noise_costs, gsnr_preds, _, regen_probs = pipeline(
                 demands, tau=tau, lambda_=vlastelica_lambda, soft_max_temperature=soft_max_temp
             )
             loss, metrics = compute_loss(
                 gsnr_preds=gsnr_preds,
-                path_costs=path_costs,
+                path_noise_costs=path_noise_costs,
                 demands=demands,
                 regen_probs=regen_probs,
                 modulation_config=mod_cfg,
@@ -206,7 +206,7 @@ def main() -> None:
                 f"{loss.item():.6f}",
                 f"{metrics['feasibility_loss']:.6f}",
                 f"{metrics['regen_loss']:.6f}",
-                f"{metrics['path_cost_loss']:.6f}",
+                f"{metrics['path_noise_loss']:.6f}",
                 metrics["num_regen_soft"],
                 metrics["num_infeasible"],
                 f"{tau:.4f}",

@@ -12,7 +12,7 @@ from diffopt.modulation import ModulationConfig
 
 def compute_loss(
     gsnr_preds: Dict[int, torch.Tensor],
-    path_costs: Dict[int, torch.Tensor],
+    path_noise_costs: Dict[int, torch.Tensor],
     demands: List[Demand],
     regen_probs: torch.Tensor,
     modulation_config: ModulationConfig,
@@ -24,15 +24,18 @@ def compute_loss(
 
     Args:
         gsnr_preds:   demand_id → scalar GSNR tensor (dB).
-        path_costs:   demand_id → scalar (path_indicator · edge_weights).sum().
-                      Must be live in the autograd graph — this is the sole
-                      gradient path into EdgeWeightNet via the Vlastelica surrogate.
+        path_noise_costs: demand_id → scalar (path_indicator · edge_ase_noise).sum().
+                      Accumulated ASE noise along the chosen route, in fixed
+                      physical units. Denominating this in learned
+                      edge_weights instead made the loss degree-1 in those
+                      weights and collapsed them to the Softplus floor — see
+                      docs/investigations/edge_weight_scale_collapse.md.
         demands:      List of Demand namedtuples.
         regen_probs:  (num_nodes,) tensor from RegenPlacement.get_regen_probs().
         modulation_config: Bitrate → SNR threshold lookup.
         lambda_regen:     Weight on regenerator count penalty.
         lambda_infeasible: Weight on GSNR feasibility shortfall.
-        lambda_cost:      Weight on path cost; enables EdgeWeightNet gradient.
+        lambda_cost:      Weight on path noise cost; enables EdgeWeightNet gradient.
 
     Returns:
         (total_loss, metrics_dict)
@@ -55,18 +58,18 @@ def compute_loss(
     regen_loss = regen_probs.sum()
 
     # sum() over dict values — each is a scalar tensor live in the autograd graph
-    path_cost_loss = sum(path_costs.values())
+    path_noise_loss = sum(path_noise_costs.values())
 
     total = (
         lambda_infeasible * feasibility_loss
         + lambda_regen * regen_loss
-        + lambda_cost * path_cost_loss
+        + lambda_cost * path_noise_loss
     )
 
     metrics = {
         "feasibility_loss": feasibility_loss.item(),
         "regen_loss": regen_loss.item(),
-        "path_cost_loss": path_cost_loss.item(),
+        "path_noise_loss": path_noise_loss.item(),
         "num_regen_soft": int((regen_probs > 0.5).sum().item()),
         "num_infeasible": num_infeasible,
     }

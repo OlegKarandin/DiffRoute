@@ -75,7 +75,7 @@ class DiffONetPipeline(nn.Module):
       3. Compute edge weights via EdgeWeightNet.
       4. For each demand:
          a. Run surrogate Dijkstra → binary path indicator (differentiable).
-         b. Accumulate path_cost = (path_indicator · edge_weights).sum()
+         b. Accumulate path_noise_cost = (path_indicator · edge_ase_noise).sum()
             — this is the live autograd path into EdgeWeightNet.
          c. Reconstruct ordered edge list (using detached indicator).
          d. Segment path at regen candidate nodes.
@@ -145,7 +145,7 @@ class DiffONetPipeline(nn.Module):
         """Convert binary (E,) path indicator to ordered list of edge IDs.
 
         Uses path_indicator.detach() for the discrete graph walk, leaving
-        path_indicator live in the autograd graph for path_cost computation.
+        path_indicator live in the autograd graph for path_noise_cost computation.
         """
         active = [
             e for e in range(path_indicator.shape[0])
@@ -233,7 +233,7 @@ class DiffONetPipeline(nn.Module):
         lambda_: float = 10.0,
         soft_max_temperature: float = 0.5,
     ) -> Tuple[
-        Dict[int, torch.Tensor],   # path_costs
+        Dict[int, torch.Tensor],   # path_noise_costs
         Dict[int, torch.Tensor],   # gsnr_preds
         Dict[int, torch.Tensor],   # path_indicators (for diagnostics)
         torch.Tensor,              # regen_probs (num_nodes,)
@@ -253,7 +253,7 @@ class DiffONetPipeline(nn.Module):
                 should hold fixed.
 
         Returns:
-            path_costs:      demand_id → scalar tensor, live in autograd graph.
+            path_noise_costs: demand_id → scalar accumulated-ASE-noise tensor, live in autograd graph.
             gsnr_preds:      demand_id → scalar GSNR tensor (dB).
             path_indicators: demand_id → (E,) binary tensor (for logging/debug).
             regen_probs:     (num_nodes,) tensor from RegenPlacement.
@@ -298,7 +298,7 @@ class DiffONetPipeline(nn.Module):
         # segments across all demands can be sent through the QoT model in
         # one batched call instead of one call per segment (~920 calls/epoch
         # at batch size 1 — see docs/investigations/open_followups.md #1).
-        demand_path_costs: Dict[int, torch.Tensor] = {}
+        demand_path_noise_costs: Dict[int, torch.Tensor] = {}
         demand_path_indicators: Dict[int, torch.Tensor] = {}
         demand_segments: Dict[int, List[List[int]]] = {}
         demand_boundary_nodes: Dict[int, List[int]] = {}
@@ -316,8 +316,26 @@ class DiffONetPipeline(nn.Module):
                 lambda_=lambda_,
             )
 
-            # 4b. Path cost — live in autograd graph, activates EdgeWeightNet gradient
-            path_cost = (path_indicator * edge_weights).sum()
+            # 4b. Physical path cost — accumulated ASE noise along the route.
+            #
+            # The coefficients are a fixed topology-derived buffer, so this
+            # term is degree-0 in edge_weights by construction: weights enter
+            # only through Dijkstra's scale-invariant argmin. Using
+            # edge_weights here instead made the term degree-1 and created an
+            # unopposed shrink direction — see
+            # docs/investigations/edge_weight_scale_collapse.md.
+            #
+            # It also restores a routing signal that survives feasibility:
+            # once num_infeasible hits 0 the feasibility term contributes
+            # gradient on 0/168 edges, so before this change shrink pressure
+            # was the ONLY signal reaching EdgeWeightNet for the back half of
+            # training.
+            #
+            # ASE-only, not ASE+NLI: NLI depends on the spectrum position of
+            # the channels, so it is not determined by the route. Charging the
+            # router for a quantity it cannot control would add noise, not
+            # signal. ASE is the routing-controllable part of the physics.
+            path_noise_cost = (path_indicator * self._edge_ase_noise).sum()
 
             # 4c. Ordered edge list via detached indicator
             ordered_edges = self._reconstruct_path(path_indicator, demand.src, demand.dst)
@@ -331,7 +349,7 @@ class DiffONetPipeline(nn.Module):
                 demand.dst,
             )
 
-            demand_path_costs[demand.id] = path_cost
+            demand_path_noise_costs[demand.id] = path_noise_cost
             demand_path_indicators[demand.id] = path_indicator
             demand_segments[demand.id] = segments
             demand_boundary_nodes[demand.id] = boundary_nodes
@@ -369,7 +387,7 @@ class DiffONetPipeline(nn.Module):
 
         # 6. Scatter the batched QoT output back per demand, blend with the
         # STE proxy per segment, and combine each demand's segments.
-        path_costs: Dict[int, torch.Tensor] = {}
+        path_noise_costs: Dict[int, torch.Tensor] = {}
         gsnr_preds: Dict[int, torch.Tensor] = {}
         path_indicators: Dict[int, torch.Tensor] = {}
         flat_idx = 0
@@ -399,8 +417,8 @@ class DiffONetPipeline(nn.Module):
             boundary_probs = [regen_probs[n] for n in demand_boundary_nodes[demand.id]]
             path_gsnr = self.segment_combiner(segment_gsnrs, boundary_probs, temperature=soft_max_temperature)
 
-            path_costs[demand.id] = demand_path_costs[demand.id]
+            path_noise_costs[demand.id] = demand_path_noise_costs[demand.id]
             gsnr_preds[demand.id] = path_gsnr
             path_indicators[demand.id] = path_indicator
 
-        return path_costs, gsnr_preds, path_indicators, regen_probs
+        return path_noise_costs, gsnr_preds, path_indicators, regen_probs

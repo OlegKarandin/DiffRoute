@@ -125,7 +125,7 @@ def main() -> None:
     )
     loss, metrics = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_costs=path_costs,
+        path_noise_costs=path_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,

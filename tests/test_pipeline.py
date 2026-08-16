@@ -155,7 +155,7 @@ def test_forward_pass_shapes():
 
 
 # ---------------------------------------------------------------------------
-# Test 2: EdgeWeightNet gradient flows via path_cost_loss
+# Test 2: EdgeWeightNet gradient flows via path_noise_loss
 # ---------------------------------------------------------------------------
 
 def test_gradient_flow_edge_weight_net():
@@ -168,7 +168,7 @@ def test_gradient_flow_edge_weight_net():
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_costs=path_costs,
+        path_noise_costs=path_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -196,7 +196,7 @@ def test_gradient_flow_regen_logits():
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_costs=path_costs,
+        path_noise_costs=path_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -222,7 +222,7 @@ def test_qot_frozen():
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_costs=path_costs,
+        path_noise_costs=path_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -301,7 +301,7 @@ def test_loss_backward_no_nan():
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_costs=path_costs,
+        path_noise_costs=path_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -385,7 +385,7 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
     edge_weights = pipeline.edge_weight_net(edge_feats).squeeze(-1).detach()
 
     loss, _ = compute_loss(
-        gsnr_preds=gsnr_preds, path_costs=path_costs, demands=[demand],
+        gsnr_preds=gsnr_preds, path_noise_costs=path_costs, demands=[demand],
         regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
     )
     loss.backward()
@@ -410,7 +410,7 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
     """Zeroing the _edge_ase_noise buffer collapses proxy_noise to a constant
     (independent of path_indicator), reproducing today's pre-fix behavior.
     EdgeWeightNet's gradient must differ between the two cases, proving the
-    proxy term (not just path_cost_loss) is contributing to the signal."""
+    proxy term (not just path_noise_loss) is contributing to the signal."""
     topo = make_hub_topology()
     always_infeasible_cfg = ModulationConfig(
         channel_spacing_ghz=100.0, symbol_rate_gbaud=64.0,
@@ -422,7 +422,7 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
     def run(pipeline: DiffONetPipeline) -> torch.Tensor:
         path_costs, gsnr_preds, _, regen_probs = pipeline([demand], lambda_=5.0)
         loss, _ = compute_loss(
-            gsnr_preds=gsnr_preds, path_costs=path_costs, demands=[demand],
+            gsnr_preds=gsnr_preds, path_noise_costs=path_costs, demands=[demand],
             regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
         )
         loss.backward()
@@ -648,7 +648,7 @@ def test_scale_direction_gradient_is_zero():
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_costs=path_costs,
+        path_noise_costs=path_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -692,7 +692,7 @@ def test_total_loss_invariant_to_edge_weight_scale():
             )
             loss, _ = compute_loss(
                 gsnr_preds=gsnr_preds,
-                path_costs=path_costs,
+                path_noise_costs=path_costs,
                 demands=demands,
                 regen_probs=regen_probs,
                 modulation_config=mod_cfg,
@@ -713,3 +713,30 @@ def test_total_loss_invariant_to_edge_weight_scale():
     )
     assert torch.equal(path_1, path_big), "routing changed under 1000x scaling"
     assert torch.equal(path_1, path_collapsed), "routing changed under 1e-11 scaling"
+
+
+# ---------------------------------------------------------------------------
+# Test 16: the path-cost term is denominated in physical ASE noise, not in
+# learned edge weights (docs/investigations/edge_weight_scale_collapse.md).
+# ---------------------------------------------------------------------------
+
+def test_path_noise_cost_equals_ase_noise_along_route():
+    """The path-cost term must be the sum of edge_ase_noise over the chosen
+    route. Fixed coefficients make it degree-0 in edge_weights by
+    construction, so the term cannot be reduced by deflating the weights.
+    """
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    path_noise_costs, _, path_indicators, _ = pipeline(demands, lambda_=5.0)
+
+    indicator = path_indicators[0].detach()
+    expected = (indicator * pipeline._edge_ase_noise).sum()
+
+    assert abs(path_noise_costs[0].item() - expected.item()) < 1e-6, (
+        f"path cost {path_noise_costs[0].item():.6f} != accumulated ASE noise "
+        f"{expected.item():.6f} along the route"
+    )
+    # Sanity: a real route has strictly positive accumulated noise.
+    assert path_noise_costs[0].item() > 0.0

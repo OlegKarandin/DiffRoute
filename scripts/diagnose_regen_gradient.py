@@ -81,7 +81,7 @@ def main() -> None:
         with torch.no_grad():
             regen.regen_logits.zero_()
 
-        path_costs, gsnr_preds, _, regen_probs = pipeline(
+        path_noise_costs, gsnr_preds, _, regen_probs = pipeline(
             demands, tau=tau, lambda_=t_cfg["vlastelica_lambda"], soft_max_temperature=tsm)
 
         feas = torch.zeros(1)
@@ -95,7 +95,7 @@ def main() -> None:
 
         L_feas = p_cfg["lambda_infeasible"] * feas.squeeze()
         L_regen = p_cfg["lambda_regen"] * regen_probs.sum()
-        L_cost = p_cfg["lambda_cost"] * sum(path_costs.values())
+        L_cost = p_cfg["lambda_cost"] * sum(path_noise_costs.values())
 
         g_feas = grad_of(L_feas, regen.regen_logits)
         g_regen = grad_of(L_regen, regen.regen_logits)
