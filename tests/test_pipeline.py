@@ -778,3 +778,61 @@ def test_topology_edge_features_are_standardised():
     # The statistics themselves are exposed for diagnostics.
     assert pipeline._topo_feat_mean.shape == (1, 5)
     assert pipeline._topo_feat_std.shape == (1, 5)
+
+
+# ---------------------------------------------------------------------------
+# Test 18: weights must not collapse over a real (if short) training loop.
+# End-to-end statement of the bug: on ind_132 the median raw weight fell
+# ~8.2e7x over 60 epochs while rank-corr with init stayed at +0.999.
+# ---------------------------------------------------------------------------
+
+def test_edge_weights_do_not_collapse_over_training():
+    torch.manual_seed(0)
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    mod_cfg = make_mod_config()
+    optimizer = torch.optim.Adam(pipeline.edge_weight_net.parameters(), lr=1e-3)
+
+    demands = [
+        Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
+        Demand(id=1, src=1, dst=4, bitrate_gbps=400.0),
+    ]
+
+    def median_raw_weight() -> float:
+        """Median of EdgeWeightNet's RAW output — the quantity that collapsed.
+        Measured pre-normalisation, since the unit-mean division would hide
+        any scale drift by construction."""
+        with torch.no_grad():
+            regen_probs = pipeline.regen_placement.get_regen_probs(1.0)
+            feats = torch.cat([
+                pipeline._topo_edge_features,
+                regen_probs[pipeline._edge_src_ids].unsqueeze(1),
+                regen_probs[pipeline._edge_dst_ids].unsqueeze(1),
+            ], dim=1)
+            return pipeline.edge_weight_net(feats).squeeze(-1).median().item()
+
+    before = median_raw_weight()
+
+    for _ in range(10):
+        optimizer.zero_grad()
+        path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+        loss, _ = compute_loss(
+            gsnr_preds=gsnr_preds,
+            path_noise_costs=path_noise_costs,
+            demands=demands,
+            regen_probs=regen_probs,
+            modulation_config=mod_cfg,
+        )
+        loss.backward()
+        optimizer.step()
+
+    after = median_raw_weight()
+
+    assert before > 0.0, "degenerate fixture: initial median weight is zero"
+    assert after > before / 10.0, (
+        f"median raw edge weight collapsed {before:.6e} -> {after:.6e} "
+        f"({before / max(after, 1e-30):.2e}x) over 10 epochs"
+    )
+    assert after < before * 10.0, (
+        f"median raw edge weight exploded {before:.6e} -> {after:.6e}"
+    )
