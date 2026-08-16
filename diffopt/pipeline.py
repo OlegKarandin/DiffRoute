@@ -115,8 +115,33 @@ class DiffONetPipeline(nn.Module):
         self._regen_candidate_set: Set[int] = set(topology.regen_candidate_nodes)
 
         # Register topology-derived tensors as buffers so they move with the model
-        topo_edge_features = topology.get_edge_features()          # (E, 5)
+        # Standardise the static topology features once, here, rather than
+        # inside EdgeWeightNet — the statistics are topology-derived and the
+        # pipeline owns the topology, so EdgeWeightNet stays a
+        # topology-agnostic MLP on (E, 7) and diagnostics that construct it
+        # standalone keep working.
+        #
+        # Raw features are wildly unscaled: on ind_132 total_length_km spans
+        # 19-597 while the two regen_prob columns appended in forward() live
+        # in [0, 1], so first-layer pre-activations were dominated by raw
+        # kilometres and the random init priced longer edges CHEAPER
+        # (corr(w, length_km) = -0.463). See
+        # docs/investigations/edge_weight_scale_collapse.md.
+        #
+        # unbiased=False so a single-edge topology gives std 0 rather than
+        # NaN; clamp_min then maps any constant column (e.g. fiber_type_idx
+        # and mean_amp_nf_db on a single-fiber-type topology) to exactly 0
+        # instead of dividing by ~0. Constant columns are deliberately NOT
+        # dropped — they are constant on ind_132, not in general, and
+        # dropping them would break mixed-fiber-type topologies.
+        raw_topo_edge_features = topology.get_edge_features()       # (E, 5)
+        feat_mean = raw_topo_edge_features.mean(dim=0, keepdim=True)             # (1, 5)
+        feat_std = raw_topo_edge_features.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-8)
+        topo_edge_features = (raw_topo_edge_features - feat_mean) / feat_std
+
         edge_index = topology.edge_index                           # (2, E)
+        self.register_buffer("_topo_feat_mean", feat_mean)
+        self.register_buffer("_topo_feat_std", feat_std)
         self.register_buffer("_topo_edge_features", topo_edge_features)
         self.register_buffer("_edge_index", edge_index)
         self.register_buffer("_edge_src_ids", edge_index[0])       # (E,)

@@ -740,3 +740,41 @@ def test_path_noise_cost_equals_ase_noise_along_route():
     )
     # Sanity: a real route has strictly positive accumulated noise.
     assert path_noise_costs[0].item() > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Test 17: EdgeWeightNet's static topology inputs are standardised.
+# Unnormalised inputs (length spanning 19-597 km against regen_prob features
+# in [0,1]) gave the random init a backwards prior — corr(w, length_km) =
+# -0.463 on ind_132, i.e. longer edges priced cheaper.
+# ---------------------------------------------------------------------------
+
+def test_topology_edge_features_are_standardised():
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    feats = pipeline._topo_edge_features
+
+    assert feats.shape == (len(topo.undirected_edges), 5)
+    assert torch.isfinite(feats).all(), "standardisation produced NaN or inf"
+
+    # On the hub topology, columns 1 (fiber_type_idx), 2 (mean_amp_nf_db) and
+    # 3 (num_spans) are constant across edges. A clamped std must map them to
+    # exactly 0 rather than dividing by ~0.
+    for col in (1, 2, 3):
+        assert torch.allclose(feats[:, col], torch.zeros_like(feats[:, col]), atol=1e-6), (
+            f"constant column {col} did not map to zero: {feats[:, col]}"
+        )
+
+    # Columns 0 (mean_span_length_km) and 4 (total_length_km) vary across the
+    # hub topology's 60/100/80 km edges, so they must come out standardised.
+    for col in (0, 4):
+        assert abs(feats[:, col].mean().item()) < 1e-5, (
+            f"column {col} mean is {feats[:, col].mean().item():.6e}, expected ~0"
+        )
+        assert abs(feats[:, col].std(unbiased=False).item() - 1.0) < 1e-5, (
+            f"column {col} std is {feats[:, col].std(unbiased=False).item():.6f}, expected ~1"
+        )
+
+    # The statistics themselves are exposed for diagnostics.
+    assert pipeline._topo_feat_mean.shape == (1, 5)
+    assert pipeline._topo_feat_std.shape == (1, 5)
