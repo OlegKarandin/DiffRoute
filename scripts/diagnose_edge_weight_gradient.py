@@ -72,6 +72,16 @@ def grad_of(term: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
 
 
 def describe(name: str, w: np.ndarray, lens: np.ndarray) -> None:
+    # frac<1e-6 / frac<1e-3 were calibrated against pre-fix RAW EdgeWeightNet
+    # output, which could (and did) collapse toward the Softplus floor with
+    # no lower bound. Post-fix, `w` here is the unit-mean-normalised weight
+    # (see edge_weights_of below) — Task 1's fix pins its mean to exactly 1,
+    # so a "pure GLOBAL SCALE collapse" reading (every edge tiny) is
+    # structurally unreachable: the normalisation itself prevents the whole
+    # population from drifting toward 0. These two fractions reading ~0% post-
+    # fix is therefore expected/uninformative, not evidence collapse was fixed
+    # — Check A/G (scale-direction gradient) are the checks that actually test
+    # the fix.
     corr = float(np.corrcoef(w, lens)[0, 1]) if w.std() > 0 else float("nan")
     print(f"  {name:<22} median={np.median(w):.3e}  mean={w.mean():.3e}  "
           f"max={w.max():.3e}  min={w.min():.3e}")
@@ -79,14 +89,8 @@ def describe(name: str, w: np.ndarray, lens: np.ndarray) -> None:
           f"  corr(w, length_km)={corr:+.3f}")
 
 
-def build_pipeline(cfg, topo, qot, dev, seed_init: bool):
-    """Construct a pipeline. If seed_init, reproduce train.py's exact RNG order
-    so EdgeWeightNet's initial weights match what training actually started from."""
-    if seed_init:
-        torch.manual_seed(cfg.get("seed", 42))
-        # train.py's construction order consumes RNG in this sequence:
-        # load_qot_model (already done by caller under the same seed), then
-        # SegmentCombiner(), EdgeWeightNet(), RegenPlacement().
+def build_pipeline(cfg, topo, qot, dev):
+    """Construct a pipeline."""
     sc = SegmentCombiner()
     ewn = EdgeWeightNet().to(dev)
     regen = RegenPlacement(topo.num_nodes).to(dev)
@@ -124,10 +128,10 @@ def main() -> None:
     n_edges = len(edges)
 
     # ---- untrained pipeline (training's actual starting point) -------------
-    pipe_init, ewn_init, regen_init = build_pipeline(cfg, topo, qot, dev, seed_init=False)
+    pipe_init, ewn_init, regen_init = build_pipeline(cfg, topo, qot, dev)
 
     # ---- trained pipeline --------------------------------------------------
-    pipe, ewn, regen = build_pipeline(cfg, topo, qot, dev, seed_init=False)
+    pipe, ewn, regen = build_pipeline(cfg, topo, qot, dev)
     ckpt_path = Path(args.checkpoint or f"{cfg['checkpoint_dir']}/best_e2e.pt")
     ckpt = torch.load(ckpt_path, map_location=dev)
     ewn.load_state_dict(ckpt["edge_weight_net_state"])
@@ -194,10 +198,17 @@ def main() -> None:
         if p1 is not None and p2 is not None and np.array_equal(p1, p2):
             identical += 1
     print(f"  routes identical under w vs 0.5*w: {identical}/{len(demands)} demands")
-    print(f"  => feasibility_loss and regen_loss are UNCHANGED by the rescale,")
-    print(f"     while path_cost_loss scales by exactly 0.5.")
-    print(f"  => 'shrink all weights' is a FREE descent direction with no")
-    print(f"     counter-pressure anywhere in the loss.\n")
+    print(f"  => feasibility_loss and regen_loss are UNCHANGED by the rescale (Dijkstra's")
+    print(f"     argmin is scale-invariant). Post-fix, path_noise_loss no longer reads")
+    print(f"     edge_weights at all -- it reads the fixed edge_ase_noise buffer -- so it")
+    print(f"     is UNCHANGED by this rescale too, not merely 'scales by exactly 0.5' as")
+    print(f"     pre-fix path_cost_loss did.")
+    print(f"  => Pre-fix this made 'shrink all weights' a FREE descent direction with no")
+    print(f"     counter-pressure anywhere in the loss. Post-fix, pipeline.forward")
+    print(f"     renormalises edge_weights to unit mean with a live divisor before")
+    print(f"     routing, removing the scale degree of freedom from the loss entirely --")
+    print(f"     this check now just confirms Dijkstra's pre-existing scale-invariance,")
+    print(f"     it is not evidence of a collapse-enabling free direction anymore.\n")
 
     # =====================================================================
     # B/C/F. Gradient decomposition at both operating points
@@ -205,11 +216,22 @@ def main() -> None:
     for label, pl, rg in [("UNTRAINED (epoch 0)", pipe_init, regen_init),
                           ("TRAINED (epoch %d)" % ckpt["epoch"], pipe, regen)]:
         print("=" * 78)
-        print(f"B/C/F. GRADIENT DECOMPOSITION ON edge_weights - {label}")
+        print(f"B/C/F. GRADIENT DECOMPOSITION ON EdgeWeightNet's RAW output "
+              f"(pre-normalisation, NOT the normalised routing weight) - {label}")
         print("=" * 78)
 
         captured = {}
 
+        # Hooked here on purpose: g_feas/g_regen/g_cost below are gradients
+        # w.r.t. this RAW hook output (`w_t`), not w.r.t. the unit-mean-
+        # normalised `edge_weights` pipeline.forward actually routes on. That
+        # normalised tensor is already detached by the time it would reach a
+        # hook site outside forward(), so only the raw, still-autograd-
+        # connected output can be differentiated through here. The math is
+        # unaffected (raw and normalised differ by a constant factor per
+        # forward call, and Check G's zero-crossing identity holds for
+        # either), but readers should not mistake this section's numbers for
+        # gradients w.r.t. the actual routing weight.
         def hook(_mod, _inp, out):
             out.retain_grad()
             captured["w"] = out

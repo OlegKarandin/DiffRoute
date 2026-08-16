@@ -101,11 +101,17 @@ def main() -> None:
             regen_probs[pipeline._edge_src_ids].unsqueeze(1),
             regen_probs[pipeline._edge_dst_ids].unsqueeze(1),
         ], dim=1)
-        ew = pipeline.edge_weight_net(edge_feats).squeeze(-1)
+        raw_ew = pipeline.edge_weight_net(edge_feats).squeeze(-1)
+        # Match pipeline.forward's unit-mean renormalisation exactly (Task 1's
+        # fix): the pipeline never routes on EdgeWeightNet's raw output, it
+        # routes on raw / raw.mean().clamp_min(1e-12). Capturing the raw value
+        # here would reconstruct the Vlastelica perturbed solve against
+        # weights the real pipeline never used, off by ~mean(raw).
+        ew = raw_ew / raw_ew.mean().clamp_min(1e-12)
         captured_edge_weights.clear()
         captured_edge_weights.append(ew.detach().clone())
 
-        path_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out = \
+        path_noise_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out = \
             original_forward(demands, tau=tau, lambda_=lambda_, soft_max_temperature=soft_max_temperature)
 
         for did, pi in path_inds_out.items():
@@ -115,17 +121,17 @@ def main() -> None:
                 return hook
             pi.register_hook(make_hook(did))
 
-        return path_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out
+        return path_noise_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out
 
     pipeline.forward = instrumented_forward
 
     # --------------------------------------------------------- forward + backward
-    path_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
+    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
         demands, tau=tau, lambda_=lambda_, soft_max_temperature=soft_max_temp
     )
     loss, metrics = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_noise_costs=path_costs,
+        path_noise_costs=path_noise_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,

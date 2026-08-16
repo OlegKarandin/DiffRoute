@@ -601,9 +601,17 @@ def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Test 14/15: edge-weight scale degeneracy (docs/investigations/
-# edge_weight_scale_collapse.md). The loss must be homogeneous of degree 0
-# in EdgeWeightNet's raw output, so the scale-direction gradient is exactly
-# zero and "shrink every weight" is not a descent direction.
+# edge_weight_scale_collapse.md). These tests verify Task 1's renormalisation
+# specifically: once EdgeWeightNet's raw output is renormalised to unit mean
+# with a live (non-detached) divisor, the loss is homogeneous of degree 0 in
+# that raw output for ANY downstream loss, so the scale-direction gradient is
+# exactly zero and "shrink every weight" is not a descent direction. This
+# property holds regardless of what the path-cost term happens to be
+# denominated in — it would still pass even under a regression back to
+# Task 2's bug (path_cost_loss reading edge_weights instead of
+# edge_ase_noise). These tests therefore CANNOT detect that regression;
+# test_path_noise_cost_equals_ase_noise_along_route is the dedicated guard
+# for Task 2's property.
 # ---------------------------------------------------------------------------
 
 class _ScaledNet(torch.nn.Module):
@@ -703,6 +711,11 @@ def test_total_loss_invariant_to_edge_weight_scale():
 
     loss_1, path_1 = run(1.0)
     loss_big, path_big = run(1000.0)
+    # 1e-11 is close to where pipeline.forward's `clamp_min(1e-12)` on the
+    # unit-mean divisor engages — one more order of magnitude down and the
+    # clamp would trigger, silently breaking scale-invariance with no warning
+    # path. Not hypothetical: the pre-fix production run had median raw
+    # weights collapse to ~5.7e-11, i.e. within a decade of this floor.
     loss_collapsed, path_collapsed = run(1e-11)
 
     assert abs(loss_1 - loss_big) < 1e-5, (

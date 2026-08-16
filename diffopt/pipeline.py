@@ -115,6 +115,7 @@ class DiffONetPipeline(nn.Module):
         self._regen_candidate_set: Set[int] = set(topology.regen_candidate_nodes)
 
         # Register topology-derived tensors as buffers so they move with the model
+
         # Standardise the static topology features once, here, rather than
         # inside EdgeWeightNet — the statistics are topology-derived and the
         # pipeline owns the topology, so EdgeWeightNet stays a
