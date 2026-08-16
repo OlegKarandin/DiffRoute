@@ -234,6 +234,11 @@ def main() -> None:
             dem, tau=tau_x, lambda_=vl_x, soft_max_temperature=t_sm_x)
         h.remove()
         w_t = captured["w"]
+        # Mirror edge_weights_of's unit-mean renormalisation: the raw hook
+        # output is EdgeWeightNet's pre-normalisation Softplus output, not
+        # what pipeline.forward actually routes with, and Task 1's fix makes
+        # the loss degree-0 in that raw scale, so it can drift freely.
+        w_t_norm = w_t.detach().squeeze(-1) / w_t.detach().squeeze(-1).mean().clamp_min(1e-12)
 
         feas = torch.zeros(1)
         n_infeas = 0
@@ -295,7 +300,7 @@ def main() -> None:
         # collapse. For a degree-1 homogeneous term (path_cost) Euler's theorem
         # gives dL/dc == L itself; for a scale-invariant term (feasibility,
         # regen) it is 0 exactly, since Dijkstra's argmin ignores global scale.
-        wv_ = w_t.detach().squeeze(-1)
+        wv_ = w_t_norm
         print("\n  G. scale-direction derivative  dL(c*w)/dc |_(c=1) = sum_e g_e*w_e:")
         for nm, g, ref in [("path_cost", g_cost, L_cost.item()),
                            ("feasibility", g_feas, None),
@@ -310,7 +315,7 @@ def main() -> None:
         print("        (pre-fix: path_cost +7.198e-02, feasibility +3.164e-01 at epoch 0)")
 
         # F. Vlastelica perturbation scale vs weight scale
-        wv = w_t.detach().squeeze(-1)
+        wv = w_t_norm
         # grad_output flowing into the surrogate == d(total)/d(path_indicator).
         # Reconstruct its scale from the two contributing terms for one demand.
         gpi = grad_of(L_feas + L_cost, path_inds[dem[0].id])
