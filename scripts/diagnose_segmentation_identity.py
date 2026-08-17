@@ -16,9 +16,10 @@ from diffopt.demands import generate_demands
 from diffopt.pipeline import DiffONetPipeline, segment_path
 from diffopt.placement.regenerator import RegenPlacement
 from diffopt.qot.segment_combiner import SegmentCombiner
+from diffopt.qot.span_features import SPAN_FEATURE_DIM, span_feature_rows
 from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.surrogate import surrogate_shortest_path
-from diffopt.topology import FIBER_TYPE_INDEX, load_topology
+from diffopt.topology import load_topology
 from diffopt.train import load_qot_model
 
 cfg = yaml.safe_load(Path("configs/experiment/small_test_ind132.yaml").read_text())
@@ -39,22 +40,23 @@ MAXS = cfg.get("max_spans_per_segment", 60)
 
 
 def feats(edge_ids, accum_start=0.0):
-    """Span features for an edge list, optionally continuing accumulated distance."""
-    rows, accum = [], accum_start
-    for eid in edge_ids:
-        e = edges[eid]
-        fi = float(FIBER_TYPE_INDEX.get(e.fiber_type, 0))
-        for k in range(e.num_spans):
-            rows.append([e.span_lengths_km[k], fi, e.amplifier_nf_db[k],
-                         pipe.channel_loading_fraction, accum])
-            accum += e.span_lengths_km[k]
+    """Padded span features + mask for an edge list, optionally continuing
+    accumulated distance -- via the shared span_feature_rows (this used to
+    be a private copy of the feature-ordering logic; accum_start is exactly
+    the parameter that let it be dropped in favour of the shared function)."""
+    rows = span_feature_rows(
+        topology, edge_ids,
+        channel_loading_fraction=pipe.channel_loading_fraction,
+        accum_start=accum_start,
+    )
     n = len(rows)
-    sf = torch.zeros(1, MAXS, 5)
+    accum = accum_start + sum(row[0] for row in rows)  # running total after all spans
+    sf = torch.zeros(1, MAXS, SPAN_FEATURE_DIM)
     if n:
         sf[0, :n] = torch.tensor(rows, dtype=torch.float32)
     pm = torch.zeros(1, MAXS, dtype=torch.bool)
     pm[0, :n] = True
-    return sf, pm, n, accum
+    return sf, pm, accum
 
 
 def nspans(edge_ids):
@@ -84,7 +86,7 @@ with torch.no_grad():
         if len(segs) < 2 or nspans(ordered) > MAXS:
             continue                      # need whole path in ONE QoT call
 
-        sf, pm, _, _ = feats(ordered)
+        sf, pm, _ = feats(ordered)
         truth = qot(sf, pm)[0]            # ground truth: uncut
 
         # (ii) pipeline behaviour: accum_dist resets each segment
@@ -94,7 +96,7 @@ with torch.no_grad():
         # (iii) same, but accum_dist carried across boundaries
         gs2, acc = [], 0.0
         for s in segs:
-            sf2, pm2, _, acc = feats(s, acc)
+            sf2, pm2, acc = feats(s, acc)
             gs2.append(qot(sf2, pm2)[0])
         got_carry = comb(gs2, [zero] * (len(segs) - 1), temperature=0.01)
 

@@ -11,9 +11,10 @@ from diffopt.placement.regenerator import RegenPlacement
 from diffopt.qot.edge_noise import compute_edge_ase_noise
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
+from diffopt.qot.span_features import SPAN_FEATURE_DIM, span_feature_rows
 from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.surrogate import surrogate_shortest_path
-from diffopt.topology import FIBER_TYPE_INDEX, Edge, Topology
+from diffopt.topology import Edge, Topology
 
 
 # ---------------------------------------------------------------------------
@@ -203,43 +204,32 @@ class DiffONetPipeline(nn.Module):
                 break  # disconnected (shouldn't happen with valid Dijkstra output)
         return ordered
 
-    def _span_feature_rows(self, segment_edge_ids: List[int]) -> List[List[float]]:
-        """Build raw (unpadded) per-span feature rows for one segment."""
-        rows: List[List[float]] = []
-        accum_dist = 0.0
-
-        for eid in segment_edge_ids:
-            edge = self._edges[eid]
-            ftype_idx = float(FIBER_TYPE_INDEX.get(edge.fiber_type, 0))
-            for span_idx in range(edge.num_spans):
-                rows.append([
-                    edge.span_lengths_km[span_idx],
-                    ftype_idx,
-                    edge.amplifier_nf_db[span_idx],
-                    self.channel_loading_fraction,
-                    accum_dist,
-                ])
-                accum_dist += edge.span_lengths_km[span_idx]
-
-        return rows
-
     def _extract_span_features(
         self,
         segment_edge_ids: List[int],
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build (1, max_spans, 5) span feature tensor and (1, max_spans) padding mask.
+        """Build (1, max_spans, SPAN_FEATURE_DIM) span feature tensor and (1, max_spans) padding mask.
 
         Pads to the architectural max_spans (not a batch-local width) — used
         for single-segment direct QoT calls (tests, diagnostics). The
         batched path in forward() below pads to the batch's true max span
         count instead, since attention masking and mean-pooling over
         real spans only make the two paddings numerically equivalent.
+
+        forward() itself never calls this (see step 5 of forward() below,
+        which needs batch-local padding, not the architectural max_spans) —
+        it exists for single-segment callers: scripts/diagnose_*.py and
+        tests/test_pipeline.py. Thin wrapper over the shared
+        diffopt.qot.span_features.span_feature_rows.
         """
-        rows = self._span_feature_rows(segment_edge_ids)
+        rows = span_feature_rows(
+            self._topology, segment_edge_ids,
+            channel_loading_fraction=self.channel_loading_fraction,
+        )
         n_spans = len(rows)
 
-        span_feats = torch.zeros(1, self.max_spans, 5, device=device)
+        span_feats = torch.zeros(1, self.max_spans, SPAN_FEATURE_DIM, device=device)
         if n_spans > 0:
             span_feats[0, :n_spans] = torch.tensor(rows, dtype=torch.float32, device=device)
 
@@ -392,7 +382,10 @@ class DiffONetPipeline(nn.Module):
         # padded positions from attention and the mean-pool divides only by
         # real-span count, so a narrower shared width changes nothing but
         # the wasted columns.
-        all_segment_rows = [self._span_feature_rows(seg) for seg in all_segments]
+        all_segment_rows = [
+            span_feature_rows(self._topology, seg, channel_loading_fraction=self.channel_loading_fraction)
+            for seg in all_segments
+        ]
 
         if all_segments:
             batch_max_spans = max(1, max(len(rows) for rows in all_segment_rows))
@@ -405,7 +398,7 @@ class DiffONetPipeline(nn.Module):
                     f"with a larger max_spans."
                 )
             n_total = len(all_segments)
-            batched_span_feats = torch.zeros(n_total, batch_max_spans, 5, device=device)
+            batched_span_feats = torch.zeros(n_total, batch_max_spans, SPAN_FEATURE_DIM, device=device)
             batched_padding_mask = torch.zeros(n_total, batch_max_spans, dtype=torch.bool, device=device)
             for i, rows in enumerate(all_segment_rows):
                 n_spans = len(rows)

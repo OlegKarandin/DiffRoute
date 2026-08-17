@@ -21,8 +21,9 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from diffopt.topology import load_topology, Topology, FIBER_TYPE_INDEX
+from diffopt.topology import load_topology, Topology
 from diffopt.qot.optical_bridge import oms_sequence_for_node_path, segment_gsnr_db
+from diffopt.qot.span_features import SPAN_FEATURE_DIM, span_feature_rows
 
 
 def load_config(path: str) -> dict:
@@ -74,6 +75,34 @@ def path_to_edges(edge_lookup: dict, path: list) -> list:
             raise ValueError(f"No edge between {u} and {v}")
         edges.append(edge)
     return edges
+
+
+def build_edge_id_lookup(topology: Topology) -> dict:
+    """(src, dst) and (dst, src) -> index into topology.undirected_edges.
+
+    Parallel to build_edge_lookup's Edge-keyed dict, built once per topology
+    load and reused for every sample -- needed because
+    diffopt.qot.span_features.span_feature_rows takes edge IDs (indices into
+    topology.undirected_edges), the same convention diffopt.pipeline uses,
+    rather than Edge objects directly.
+    """
+    edge_id_lookup = {}
+    for i, edge in enumerate(topology.undirected_edges):
+        edge_id_lookup[(edge.src, edge.dst)] = i
+        edge_id_lookup[(edge.dst, edge.src)] = i
+    return edge_id_lookup
+
+
+def path_to_edge_ids(edge_id_lookup: dict, path: list) -> list:
+    """Convert node path to list of edge IDs into topology.undirected_edges."""
+    ids = []
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        eid = edge_id_lookup.get((u, v))
+        if eid is None:
+            raise ValueError(f"No edge between {u} and {v}")
+        ids.append(eid)
+    return ids
 
 
 def split_path_into_segments(
@@ -147,6 +176,7 @@ def generate_sample(
     topology: Topology,
     G: nx.Graph,
     edge_lookup: dict,
+    edge_id_lookup: dict,
     regen_candidates: list,
     cfg: dict,
     rng: random.Random,
@@ -181,19 +211,11 @@ def generate_sample(
         # Get edges for this segment
         try:
             seg_edges = path_to_edges(edge_lookup, seg_path)
+            seg_edge_ids = path_to_edge_ids(edge_id_lookup, seg_path)
         except ValueError:
             continue
 
-        # Build span lists for this segment
-        span_lengths = []
-        amp_nf_dbs = []
-        fiber_types = []
-        for edge in seg_edges:
-            span_lengths.extend(edge.span_lengths_km)
-            amp_nf_dbs.extend(edge.amplifier_nf_db)
-            fiber_types.extend([edge.fiber_type] * edge.num_spans)
-
-        n_spans = len(span_lengths)
+        n_spans = sum(edge.num_spans for edge in seg_edges)
         if n_spans == 0 or n_spans > max_spans:
             continue
 
@@ -208,29 +230,21 @@ def generate_sample(
         oms_sequence = oms_sequence_for_node_path(topology, seg_path)
         gsnr_db = segment_gsnr_db(topology, oms_sequence, mode_id, n_channels)
 
-        # Build per-span features. Bug A fix: append using the pre-increment
-        # accum_dist (distance at span START), then increment — matches
-        # pipeline.py::_extract_span_features's convention exactly.
-        accum_dist = 0.0
-        span_feature_list = []
-        for j, (sl, nf) in enumerate(zip(span_lengths, amp_nf_dbs)):
-            # Bug B fix: look up each span's actual fiber type instead of a
-            # hardcoded SSMF=0.0, matching pipeline.py's per-span lookup.
-            ftype_idx = float(FIBER_TYPE_INDEX.get(fiber_types[j], 0))
-            span_feature_list.append([
-                sl,                        # span_length_km
-                ftype_idx,                 # fiber_type_idx
-                nf,                        # amp_nf_db
-                channel_loading_fraction,  # channel_loading_fraction
-                accum_dist,               # accum_dist_km
-            ])
-            accum_dist += sl
+        # Build per-span features via the shared span_feature_rows — the
+        # canonical [span_length_km, fiber_type_idx, amp_nf_db,
+        # channel_loading_fraction, accum_dist_km] ordering CLAUDE.md
+        # declares a fixed invariant, now defined once in
+        # diffopt.qot.span_features instead of duplicated here.
+        span_feature_list = span_feature_rows(
+            topology, seg_edge_ids,
+            channel_loading_fraction=channel_loading_fraction,
+        )
 
         # Pad to max_spans
-        padded = span_feature_list + [[0.0] * 5] * (max_spans - n_spans)
+        padded = span_feature_list + [[0.0] * SPAN_FEATURE_DIM] * (max_spans - n_spans)
         flat = [v for span in padded for v in span]
 
-        row = {f"span_features_{i}": flat[i] for i in range(max_spans * 5)}
+        row = {f"span_features_{i}": flat[i] for i in range(max_spans * SPAN_FEATURE_DIM)}
         row["n_spans"] = n_spans
         row["gsnr_db"] = gsnr_db
         samples.append(row)
@@ -334,6 +348,7 @@ def main():
     topology = load_topology(topology_path, cfg["modulation_formats"])
     G = build_nx_graph(topology)
     edge_lookup = build_edge_lookup(topology)
+    edge_id_lookup = build_edge_id_lookup(topology)
     regen_candidates = topology.regen_candidate_nodes
 
     # Fixed once for the whole run: GSNR is mode-invariant given the shared
@@ -358,7 +373,9 @@ def main():
         with tqdm(total=n_target) as pbar:
             attempts = 0
             while len(rows) < n_target and attempts < n_target * 20:
-                new_samples = generate_sample(topology, G, edge_lookup, regen_candidates, cfg, rng, max_spans, mode_id)
+                new_samples = generate_sample(
+                    topology, G, edge_lookup, edge_id_lookup, regen_candidates, cfg, rng, max_spans, mode_id
+                )
                 for s in new_samples:
                     if len(rows) < n_target:
                         rows.append(s)

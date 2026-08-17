@@ -8,6 +8,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from diffopt.qot.span_features import SPAN_FEATURE_DIM
+
 
 class SegmentQoTDataset(Dataset):
     """Dataset of transparent segments with per-span features and GSNR labels.
@@ -21,7 +23,11 @@ class SegmentQoTDataset(Dataset):
         gsnr_db: scalar FloatTensor
     """
 
-    FEATURE_DIM = 5
+    # Same number as diffopt.qot.span_features.SPAN_FEATURE_DIM, for the same
+    # reason: this is the per-span feature count the parquet schema's
+    # span_features_0 .. span_features_{max_spans*5-1} columns are laid out
+    # against. Re-exported (not redefined) so the two can't drift apart.
+    FEATURE_DIM = SPAN_FEATURE_DIM
 
     def __init__(self, parquet_path: str, max_spans: int = 60):
         self.max_spans = max_spans

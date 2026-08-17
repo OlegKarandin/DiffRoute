@@ -19,10 +19,12 @@ import pytest
 
 from diffopt.topology import Edge
 from generate_qot_dataset import (
+    build_edge_id_lookup,
     build_edge_lookup,
     compute_duplication_stats,
     format_duplication_report,
     get_k_shortest_paths,
+    path_to_edge_ids,
     path_to_edges,
     split_path_into_segments,
 )
@@ -350,6 +352,28 @@ def test_path_to_edges_raises_on_missing_edge():
     lookup = build_edge_lookup(_FakeTopology(edges))
     with pytest.raises(ValueError, match="No edge between"):
         path_to_edges(lookup, [0, 1, 5])
+
+
+def test_build_edge_id_lookup_and_path_to_edge_ids_bidirectional():
+    """edge_id_lookup must resolve a path in either direction to the same
+    indices into topology.undirected_edges -- these ids feed
+    diffopt.qot.span_features.span_feature_rows, which indexes
+    topology.undirected_edges directly."""
+    edges = [_make_edge(0, 1, 80.0), _make_edge(1, 2, 100.0)]
+    lookup = build_edge_id_lookup(_FakeTopology(edges))
+
+    forward = path_to_edge_ids(lookup, [0, 1, 2])
+    assert forward == [0, 1]
+
+    reverse = path_to_edge_ids(lookup, [2, 1, 0])
+    assert reverse == [1, 0]
+
+
+def test_path_to_edge_ids_raises_on_missing_edge():
+    edges = [_make_edge(0, 1, 80.0)]
+    lookup = build_edge_id_lookup(_FakeTopology(edges))
+    with pytest.raises(ValueError, match="No edge between"):
+        path_to_edge_ids(lookup, [0, 1, 5])
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import List, Union
 
@@ -76,13 +77,29 @@ class Topology(OpticalNetworkModel):
             )
         return n
 
-    @property
+    @cached_property
     def undirected_edges(self) -> List[Edge]:
         """One Edge per undirected pair (src < dst), derived from the OMS pairs.
 
         ``populate_optical`` creates two directed OMS objects per undirected
         edge (``oms_{src}_{dst}`` and ``oms_{dst}_{src}``); only the forward
         one (``int(src) < int(dst)``) becomes the canonical Edge.
+
+        Cached (computed once, on first access) rather than a plain
+        ``@property``: this list is rebuilt from the OMS/fiber/amplifier
+        tables on every access (measured ~0.56ms/call on ``ind_132``'s 168
+        edges), and several call sites now resolve individual edges by id
+        once per transparent segment (``diffopt.qot.span_features.
+        span_feature_rows``, used from both ``pipeline.py``'s per-training-
+        step forward pass and ``generate_qot_dataset.py``'s per-sample
+        generation loop) -- recomputing the whole list on every one of those
+        calls would silently reintroduce the exact O(edges)
+        per-segment cost ``generate_qot_dataset.py::build_edge_lookup``'s
+        docstring already documents having fixed once. Safe to cache: a
+        ``Topology`` is fully populated by ``populate_optical`` before any
+        caller ever touches it (constructor -> populate -> use, never
+        interleaved), so there is no code path that mutates the
+        OMS/fiber/amplifier tables after this property's first read.
         """
         forward_oms = [
             oms for oms in self.list_oms()
