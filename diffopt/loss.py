@@ -44,7 +44,7 @@ def compute_loss(
 
     # Start as a zero tensor (not float 0) so the graph is valid even when
     # all demands are feasible and no shortfall terms are added.
-    feasibility_loss = torch.zeros(1, device=device)
+    feasibility_loss = torch.zeros((), device=device)
     num_infeasible = 0
 
     for demand in demands:
@@ -57,8 +57,10 @@ def compute_loss(
 
     regen_loss = regen_probs.sum()
 
-    # sum() over dict values — each is a scalar tensor live in the autograd graph
-    path_noise_loss = sum(path_noise_costs.values())
+    # sum() over dict values — each is a scalar tensor live in the autograd graph.
+    # Seed with a zero tensor so an empty demand list still yields a tensor
+    # (bare sum() returns int 0, and .item() below would then raise).
+    path_noise_loss = sum(path_noise_costs.values(), torch.zeros((), device=device))
 
     total = (
         lambda_infeasible * feasibility_loss
