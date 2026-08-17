@@ -56,14 +56,27 @@ def main() -> None:
     topology = load_topology(cfg["topology"], cfg["modulation_formats"])
     mod_cfg = ModulationConfig.from_yaml(cfg["modulation_formats"])
 
-    # ------------------------------------------------------------------ model
-    qot_ckpt_path = args.checkpoint or cfg.get("qot_checkpoint", "checkpoints/best_qot.pt")
+    # Seed before constructing any net so the random-init path (no
+    # --checkpoint given) reproduces train.py's epoch-0 state bit-exactly —
+    # same ordering as scripts/diagnose_edge_weight_gradient.py.
+    torch.manual_seed(cfg.get("seed", 42))
 
+    # ------------------------------------------------------------------ model
     from diffopt.train import load_qot_model
-    qot_model = load_qot_model(qot_ckpt_path, cfg, device)
+    qot_model = load_qot_model(cfg.get("qot_checkpoint", "checkpoints/best_qot.pt"), cfg, device)
 
     edge_weight_net = EdgeWeightNet().to(device)
     regen_placement = RegenPlacement(topology.num_nodes).to(device)
+
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        edge_weight_net.load_state_dict(ckpt["edge_weight_net_state"])
+        with torch.no_grad():
+            regen_placement.regen_logits.copy_(ckpt["regen_logits"].to(device))
+        print(f"Loaded e2e checkpoint: epoch {ckpt['epoch']}, loss {ckpt['total_loss']:.4f}")
+    else:
+        print("No --checkpoint given: reporting on randomly-initialised routing "
+              "heads (seeded, matches train.py's epoch-0 state).")
 
     pipeline = DiffONetPipeline(
         topology=topology,
