@@ -78,5 +78,10 @@ training:
   vlastelica_lambda_decay: 0.995
   regen_tau_start: 1.0
   regen_tau_end: 0.1
-  regen_tau_anneal_start_epoch: 5
-  regen_tau_anneal_end_epoch: 18
+  # Window is proportional to epochs_e2e above (60) — mirrors the validated
+  # small_test_ind132.yaml window (10/40, anneal ends at 67% of training).
+  # soft_max_temperature (segment_combiner, above) is annealed over this same
+  # window per CLAUDE.md Phase 1c correction #7: if epochs_e2e changes again,
+  # update both together rather than leaving this pair stale relative to it.
+  regen_tau_anneal_start_epoch: 10
+  regen_tau_anneal_end_epoch: 40
