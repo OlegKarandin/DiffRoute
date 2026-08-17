@@ -6,6 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "diffopt"
 version = "0.1.0"
 requires-python = ">=3.11"
+description = "Differentiable joint routing and regenerator placement for WDM optical networks, using surrogate gradients through Dijkstra."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Oleg Karandin" }]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Science/Research",
+]
 dependencies = [
     "torch>=2.2",
     "numpy>=1.26",
@@ -25,6 +35,13 @@ dev = [
     "ruff>=0.1",
 ]
 
+[project.urls]
+Repository = "https://github.com/OlegKarandin/diffRouting"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["diffopt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"

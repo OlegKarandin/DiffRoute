@@ -37,3 +37,12 @@ Thumbs.db
 
 # Topology sources — third-party, not redistributed (see configs/topology/README.md)
 *.dat
+
+# ML artifacts, belt-and-braces (the path rules above miss custom --output dirs)
+*.pt
+*.pth
+*.parquet
+
+# Agent tooling scaffolding, not project content
+.claude/
+docs/superpowers/
