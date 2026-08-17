@@ -36,10 +36,10 @@ from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.topology import Topology
 
-from multilayer_optical_mcp.model.optical_topology_import import (
+from multilayer_optical_network.model.optical_topology_import import (
     SSMF_LOSS_COEF_DB_PER_KM, populate_optical,
 )
-from multilayer_optical_mcp.model.modes import load_modulation_formats
+from multilayer_optical_network.model.modes import load_modulation_formats
 
 
 MODULATION_FORMATS_PATH = Path(__file__).parent.parent / "configs/modulation_formats.yaml"

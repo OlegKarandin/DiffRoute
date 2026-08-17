@@ -10,7 +10,7 @@ dependencies = [
     "torch>=2.2",
     "numpy>=1.26",
     "networkx>=3.2",
-    "multilayer-optical-mcp @ git+https://github.com/OlegKarandin/multilayer-optical-mcp.git@2b64361",
+    "multilayer-optical-network @ git+https://github.com/OlegKarandin/multilayer-optical-network.git@v0.1.1",
     "pyyaml>=6.0",
     "pandas>=2.1",
     "pyarrow>=14.0",

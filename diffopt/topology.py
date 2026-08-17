@@ -1,4 +1,4 @@
-"""Topology built on top of the upstream ``multilayer_optical_mcp`` optical model.
+"""Topology built on top of the upstream ``multilayer_optical_network`` optical model.
 
 ``Topology`` subclasses ``OpticalNetworkModel`` and adds the PyTorch-friendly
 views (``edge_index``, ``get_edge_features``, ``regen_candidate_nodes``, ...)
@@ -15,12 +15,12 @@ from typing import List, Union
 
 import torch
 
-from multilayer_optical_mcp.model.optical_network import OpticalNetworkModel
-from multilayer_optical_mcp.model.optical_topology_import import (
+from multilayer_optical_network.model.optical_network import OpticalNetworkModel
+from multilayer_optical_network.model.optical_topology_import import (
     SSMF_LOSS_COEF_DB_PER_KM,
     populate_optical,
 )
-from multilayer_optical_mcp.model.modes import load_modulation_formats
+from multilayer_optical_network.model.modes import load_modulation_formats
 
 
 FIBER_TYPE_INDEX = {"SSMF": 0, "LEAF": 1, "TWRS": 2}

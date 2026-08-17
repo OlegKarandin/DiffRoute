@@ -17,7 +17,7 @@ impossible to reintroduce:
 * one test proves the module contains no ``try``/``except`` at all.
 
 Every numeric expectation below was measured by running this code (gnpy
-2.14.0, multilayer-optical-mcp @ 2b64361) or copied from upstream's own test
+2.14.0, multilayer-optical-network @ v0.1.1) or copied from upstream's own test
 source — none were typed from memory.
 """
 from __future__ import annotations
@@ -30,9 +30,9 @@ from pathlib import Path
 
 import pytest
 
-from multilayer_optical_mcp.gnpy_adapter.adapter import compute_qot
-from multilayer_optical_mcp.gnpy_adapter.loading import Channel, LoadingState
-from multilayer_optical_mcp.model.assets import (
+from multilayer_optical_network.gnpy_adapter.adapter import compute_qot
+from multilayer_optical_network.gnpy_adapter.loading import Channel, LoadingState
+from multilayer_optical_network.model.assets import (
     Amplifier,
     Direction,
     Fiber,
@@ -42,8 +42,8 @@ from multilayer_optical_mcp.model.assets import (
     Transceiver,
     TransceiverMode,
 )
-from multilayer_optical_mcp.model.modes import ModeRegistry
-from multilayer_optical_mcp.model.qot_results import QoTResultStore
+from multilayer_optical_network.model.modes import ModeRegistry
+from multilayer_optical_network.model.qot_results import QoTResultStore
 
 from diffopt.qot import optical_bridge as ob
 from diffopt.topology import Topology
@@ -74,7 +74,7 @@ def german17() -> Topology:
 
 def _toy_modes() -> ModeRegistry:
     """Byte-for-byte the ``_modes()`` helper of upstream's
-    ``tests/model/test_optical_network_model.py`` at commit 2b64361."""
+    ``tests/model/test_optical_network_model.py`` at tag v0.1.1."""
     return ModeRegistry([
         TransceiverMode(
             id="400G@7.1dB",

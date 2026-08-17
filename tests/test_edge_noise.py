@@ -9,7 +9,7 @@ import torch
 from diffopt.qot.edge_noise import compute_edge_ase_noise
 from diffopt.topology import Topology
 
-from multilayer_optical_mcp.model.assets import FiberType
+from multilayer_optical_network.model.assets import FiberType
 
 BASE = Path(__file__).parent.parent
 MODULATION_FORMATS_PATH = BASE / "configs/modulation_formats.yaml"

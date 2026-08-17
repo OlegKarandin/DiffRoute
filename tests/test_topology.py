@@ -10,9 +10,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from diffopt.topology_builder import split_link_into_spans, parse_dat_file, build_topology_json
 from diffopt.topology import Topology, Edge, load_topology, FIBER_TYPE_INDEX
 
-from multilayer_optical_mcp.model.optical_network import OpticalNetworkModel
-from multilayer_optical_mcp.model.optical_topology_import import populate_optical
-from multilayer_optical_mcp.model.modes import load_modulation_formats
+from multilayer_optical_network.model.optical_network import OpticalNetworkModel
+from multilayer_optical_network.model.optical_topology_import import populate_optical
+from multilayer_optical_network.model.modes import load_modulation_formats
 
 
 BASE = Path(__file__).parent.parent

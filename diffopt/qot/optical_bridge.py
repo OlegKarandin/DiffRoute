@@ -1,4 +1,4 @@
-"""GNPy bridge built on ``multilayer_optical_mcp``'s ``compute_qot``.
+"""GNPy bridge built on ``multilayer_optical_network``'s ``compute_qot``.
 
 This module replaces the pre-migration wrapper module, which wrapped every GNPy call
 in a blanket exception handler and silently returned an analytical GN-model
@@ -28,11 +28,11 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Sequence, Tuple
 
-from multilayer_optical_mcp.gnpy_adapter.adapter import compute_qot
-from multilayer_optical_mcp.gnpy_adapter.loading import Channel, LoadingState
-from multilayer_optical_mcp.model.assets import Direction
-from multilayer_optical_mcp.model.qot_results import QoTCache, QoTResultStore
-from multilayer_optical_mcp.model.spectrum import SpectrumGrid
+from multilayer_optical_network.gnpy_adapter.adapter import compute_qot
+from multilayer_optical_network.gnpy_adapter.loading import Channel, LoadingState
+from multilayer_optical_network.model.assets import Direction
+from multilayer_optical_network.model.qot_results import QoTCache, QoTResultStore
+from multilayer_optical_network.model.spectrum import SpectrumGrid
 
 # Fixed C-band grid shared with upstream: anchor 191.4 THz, 100 GHz spacing,
 # 48 slots (191.4-196.1 THz).

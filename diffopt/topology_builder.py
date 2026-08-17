@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import List, Tuple
 
-from multilayer_optical_mcp.model.optical_topology_import import split_link_into_spans
+from multilayer_optical_network.model.optical_topology_import import split_link_into_spans
 
 
 def parse_dat_file(path: str) -> Tuple[int, List[Tuple[int, int, float]]]:
