@@ -32,9 +32,8 @@ ff_dim: 128
 epochs: 20
 batch_size: 32
 learning_rate: 1.0e-3
-lr_schedule: cosine
-checkpoint_dir: checkpoints
-log_dir: logs
+checkpoint_dir: checkpoints/german_17
+log_dir: logs/german_17
 # NOTE: re-baselined post-GNPy-migration (Task 8). Measured best val RMSE on
 # this config's own real-GNPy-labeled data (500 train / 100 val, 20 epochs):
 # 0.6319 dB — did NOT hit the old 0.5 dB target, unlike base.yaml's much
@@ -46,7 +45,7 @@ log_dir: logs
 val_rmse_target: 0.75
 
 # Data
-dataset_dir: data/datasets
+dataset_dir: data/datasets/german_17
 
 # Phase 1c: end-to-end pipeline
 qot_checkpoint: checkpoints/best_qot.pt
@@ -56,7 +55,6 @@ pipeline:
   lambda_infeasible: 10.0
   lambda_cost: 0.01              # demoted to regularizer; ASE-noise STE now dominates routing signal
   channel_loading_fraction: 0.5  # fixed during inference
-  freeze_qot: true
 
 # NOTE: see base.yaml's segment_combiner comment for the full story — this
 # was previously hardcoded at a fixed 0.5, never annealed, which silently
@@ -67,8 +65,14 @@ segment_combiner:
 
 training:
   lr_edge_net: 1.0e-3  # NOTE: EdgeWeightNet grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
-  lr_regen: 1.0e-2
-  epochs_e2e: 20
+  # Adam's step is ~lr regardless of gradient magnitude, so a logit moves at
+  # most lr_regen per epoch. Crossing p>0.5 from a drifted-down logit needs
+  # tens of consecutive correct-sign steps; the old 20 epochs x 1e-2 gave a
+  # total excursion of 0.2 and could not place a regenerator even with a
+  # correctly-signed gradient. See
+  # docs/investigations/regen_placement_not_concentrating.md.
+  lr_regen: 2.0e-2
+  epochs_e2e: 60
   vlastelica_lambda: 10.0
   vlastelica_lambda_min: 1.0
   vlastelica_lambda_decay: 0.995
@@ -76,4 +80,3 @@ training:
   regen_tau_end: 0.1
   regen_tau_anneal_start_epoch: 5
   regen_tau_anneal_end_epoch: 18
-  checkpoint_interval: 5

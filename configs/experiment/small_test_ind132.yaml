@@ -32,13 +32,12 @@ ff_dim: 128
 epochs: 20
 batch_size: 32
 learning_rate: 1.0e-3
-lr_schedule: cosine
 checkpoint_dir: checkpoints/e2e_ind132
 log_dir: logs/e2e_ind132
 val_rmse_target: 0.75
 
 # Data
-dataset_dir: data/datasets
+dataset_dir: data/datasets/ind_132
 
 # Phase 1c: end-to-end pipeline
 qot_checkpoint: checkpoints/best_qot.pt
@@ -48,7 +47,6 @@ pipeline:
   lambda_infeasible: 10.0
   lambda_cost: 0.01
   channel_loading_fraction: 0.5
-  freeze_qot: true
 
 segment_combiner:
   soft_max_temperature: 0.5
@@ -71,4 +69,3 @@ training:
   regen_tau_end: 0.1
   regen_tau_anneal_start_epoch: 10
   regen_tau_anneal_end_epoch: 40
-  checkpoint_interval: 10

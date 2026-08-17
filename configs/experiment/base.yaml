@@ -46,7 +46,6 @@ ff_dim: 128
 epochs: 100
 batch_size: 256
 learning_rate: 1.0e-3
-lr_schedule: cosine
 checkpoint_dir: checkpoints
 log_dir: logs
 # NOTE: re-measured after switching to ind_132 (see topology note above).
@@ -77,7 +76,6 @@ pipeline:
   lambda_infeasible: 10.0
   lambda_cost: 0.01              # demoted to regularizer; ASE-noise STE now dominates routing signal
   channel_loading_fraction: 0.5  # fixed during inference
-  freeze_qot: true
 
 # Annealed per-epoch alongside regen_tau (same anneal_start/anneal_end_epoch
 # window below). Two separate bugs lived here; both are fixed, and the
@@ -120,4 +118,3 @@ training:
   regen_tau_end: 0.1
   regen_tau_anneal_start_epoch: 100
   regen_tau_anneal_end_epoch: 400
-  checkpoint_interval: 10
