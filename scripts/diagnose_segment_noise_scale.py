@@ -25,56 +25,38 @@ from __future__ import annotations
 
 import argparse
 import math
-from pathlib import Path
 
 import torch
 import yaml
 
-from diffopt.demands import generate_demands
-from diffopt.pipeline import DiffONetPipeline, segment_path
-from diffopt.placement.regenerator import RegenPlacement
-from diffopt.qot.segment_combiner import SegmentCombiner, soft_max
-from diffopt.routing.edge_weight_net import EdgeWeightNet
-from diffopt.topology import load_topology
-from diffopt.train import linear_anneal, load_qot_model
+from diffopt.qot.segment_combiner import SegmentCombiner
+from diffopt.pipeline import segment_path
+from diffopt.routing.surrogate import surrogate_shortest_path
+from _common import add_common_args, build_context, demands_for, edge_weights_of, schedule_at
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--config", default="configs/experiment/small_test_ind132.yaml")
+add_common_args(ap, with_checkpoint=False, with_demands=False)
 args = ap.parse_args()
 
-cfg = yaml.safe_load(Path(args.config).read_text())
-device = torch.device("cpu")
-torch.manual_seed(0)
+cfg = yaml.safe_load(open(args.config))
+ctx = build_context(cfg, load_e2e_checkpoint=False)
+pipe = ctx.pipeline
 
-topology = load_topology(cfg["topology"], cfg["modulation_formats"])
-qot_model = load_qot_model(cfg["qot_checkpoint"], cfg, device)
-regen = RegenPlacement(topology.num_nodes)
-pipe = DiffONetPipeline(
-    topology=topology, qot_model=qot_model, segment_combiner=SegmentCombiner(),
-    edge_weight_net=EdgeWeightNet(), regen_placement=regen,
-    channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
-    max_spans=cfg.get("max_spans_per_segment", 60),
-)
-
-demands = generate_demands(topology, cfg["num_demands"], cfg["bitrate_options"], seed=1)
+demands = demands_for(ctx, seed=1)
 
 seg_gsnrs, nsegs = [], []
 with torch.no_grad():
-    regen_probs = regen.get_regen_probs(1.0)
-    edge_feats = torch.cat([pipe._topo_edge_features,
-                            regen_probs[pipe._edge_src_ids].unsqueeze(1),
-                            regen_probs[pipe._edge_dst_ids].unsqueeze(1)], dim=1)
-    ew = pipe.edge_weight_net(edge_feats).squeeze(-1)
-    from diffopt.routing.surrogate import surrogate_shortest_path
+    ew = edge_weights_of(ctx, tau=1.0)
+    vlastelica_lambda = cfg["training"]["vlastelica_lambda"]
     for d in demands:
         pi = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
-                                     pipe._num_nodes, lambda_=10.0)
+                                     pipe._num_nodes, lambda_=vlastelica_lambda)
         ordered = pipe._reconstruct_path(pi, d.src, d.dst)
         segs, _ = segment_path(ordered, d.src, pipe._regen_candidate_set,
                                pipe._edges, d.dst)
         nsegs.append(len(segs))
         for s in segs:
-            sf, pm = pipe._extract_span_features(s, device)
+            sf, pm = pipe._extract_span_features(s, ctx.device)
             seg_gsnrs.append(pipe.qot_model(sf, pm)[0].item())
 
 g = torch.tensor(seg_gsnrs)
@@ -96,9 +78,7 @@ t_cfg, sc = cfg["training"], cfg["segment_combiner"]
 n_epochs = t_cfg["epochs_e2e"]
 step = max(1, n_epochs // 20)
 for ep in range(1, n_epochs + 1, step):
-    t = linear_anneal(ep, sc["soft_max_temperature"], sc["soft_max_temperature_min"],
-                      t_cfg["regen_tau_anneal_start_epoch"],
-                      t_cfg["regen_tau_anneal_end_epoch"])
+    _, t, _ = schedule_at(cfg, epoch=ep)
     floor = t * math.log(2.0)
     frac = (noise < floor).float().mean().item()
     gsnr_at_floor = -10.0 * math.log10(floor)

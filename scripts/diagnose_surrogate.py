@@ -23,107 +23,61 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import torch
 import yaml
 
-from diffopt.demands import generate_demands
 from diffopt.loss import compute_loss
-from diffopt.modulation import ModulationConfig
-from diffopt.pipeline import DiffONetPipeline
-from diffopt.placement.regenerator import RegenPlacement
-from diffopt.qot.model import SpanAttentionQoT
-from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.shortest_path import spfa
-from diffopt.topology import load_topology
+from _common import add_common_args, build_context, demands_for, edge_weights_of, schedule_at
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", default=None,
-                        help="E2E checkpoint; omit to use random weights")
-    parser.add_argument("--seed", type=int, default=1)
+    add_common_args(parser)
+    # This script's --checkpoint default is deliberately different from
+    # every other script's: None means "report on random-init routing heads
+    # (train.py's epoch-0 state)", not "fall back to <checkpoint_dir>/
+    # best_e2e.pt". That distinction is the point of the script (compare
+    # untrained vs trained surrogate health), so it's kept and re-documented
+    # here rather than unified away. add_common_args' --seed default (1)
+    # already matches this script's own historical default.
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
-    device = torch.device("cpu")
-
-    topology = load_topology(cfg["topology"], cfg["modulation_formats"])
-    mod_cfg = ModulationConfig.from_yaml(cfg["modulation_formats"])
-
-    # Seed before constructing any net so the random-init path (no
-    # --checkpoint given) reproduces train.py's epoch-0 state bit-exactly —
-    # same ordering as scripts/diagnose_edge_weight_gradient.py.
-    torch.manual_seed(cfg.get("seed", 42))
-
-    # ------------------------------------------------------------------ model
-    from diffopt.train import load_qot_model
-    qot_model = load_qot_model(cfg.get("qot_checkpoint", "checkpoints/best_qot.pt"), cfg, device)
-
-    edge_weight_net = EdgeWeightNet().to(device)
-    regen_placement = RegenPlacement(topology.num_nodes).to(device)
+    cfg = yaml.safe_load(open(args.config))
+    ctx = build_context(cfg, load_e2e_checkpoint=bool(args.checkpoint), checkpoint_path=args.checkpoint)
+    pipeline = ctx.pipeline
+    topology = ctx.topology
+    mod_cfg = ctx.mod_cfg
 
     if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        edge_weight_net.load_state_dict(ckpt["edge_weight_net_state"])
-        with torch.no_grad():
-            regen_placement.regen_logits.copy_(ckpt["regen_logits"].to(device))
-        print(f"Loaded e2e checkpoint: epoch {ckpt['epoch']}, loss {ckpt['total_loss']:.4f}")
+        print(f"Loaded e2e checkpoint: epoch {ctx.ckpt['epoch']}, loss {ctx.ckpt['total_loss']:.4f}")
     else:
         print("No --checkpoint given: reporting on randomly-initialised routing "
               "heads (seeded, matches train.py's epoch-0 state).")
 
-    pipeline = DiffONetPipeline(
-        topology=topology,
-        qot_model=qot_model,
-        segment_combiner=SegmentCombiner(),
-        edge_weight_net=edge_weight_net,
-        regen_placement=regen_placement,
-        channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
-    ).to(device)
-
-    lambda_ = cfg["training"]["vlastelica_lambda"]
     lambda_cost = cfg["pipeline"]["lambda_cost"]
-    tau = cfg["training"]["regen_tau_start"]
-    # Snapshot at the start-of-training value, matching `tau` above using
-    # regen_tau_start rather than an annealed mid-training value.
-    soft_max_temp = cfg.get("segment_combiner", {}).get("soft_max_temperature", 0.5)
+    # Start-of-training values (epoch 1): matches this script's own
+    # historical tau=regen_tau_start / soft_max_temperature start /
+    # undecayed vlastelica_lambda when no --checkpoint overrides them.
+    tau, soft_max_temp, lambda_ = schedule_at(cfg, epoch=1)
 
-    demands = generate_demands(
-        topology, cfg["num_demands"], cfg["bitrate_options"], seed=args.seed
-    )
+    demands = demands_for(ctx, seed=args.seed)
 
     # ------------------------------------------------ intercept grad_output
-    # Register hooks on each path_indicator to capture ∂L/∂path_indicator
+    # edge_weights_of independently recomputes exactly what pipeline.forward
+    # will compute internally for edge_weights (same live edge_weight_net /
+    # regen_placement, same tau) -- no monkeypatch needed to capture it.
+    # The hook below is only for grad_output on each path_indicator, which
+    # edge_weights_of has no access to.
+    captured_edge_weights = edge_weights_of(ctx, tau).detach().clone()
     captured_grad_output: Dict[int, torch.Tensor] = {}
-    captured_edge_weights: List[torch.Tensor] = []
 
-    # We patch the forward to capture edge_weights and attach hooks to
-    # path_indicators before they enter the surrogate backward.
     original_forward = pipeline.forward
 
     def instrumented_forward(demands, tau=1.0, lambda_=10.0, soft_max_temperature=0.5):
-        regen_probs = pipeline.regen_placement.get_regen_probs(tau)
-        edge_feats = torch.cat([
-            pipeline._topo_edge_features,
-            regen_probs[pipeline._edge_src_ids].unsqueeze(1),
-            regen_probs[pipeline._edge_dst_ids].unsqueeze(1),
-        ], dim=1)
-        raw_ew = pipeline.edge_weight_net(edge_feats).squeeze(-1)
-        # Match pipeline.forward's unit-mean renormalisation exactly (Task 1's
-        # fix): the pipeline never routes on EdgeWeightNet's raw output, it
-        # routes on raw / raw.mean().clamp_min(1e-12). Capturing the raw value
-        # here would reconstruct the Vlastelica perturbed solve against
-        # weights the real pipeline never used, off by ~mean(raw).
-        ew = raw_ew / raw_ew.mean().clamp_min(1e-12)
-        captured_edge_weights.clear()
-        captured_edge_weights.append(ew.detach().clone())
-
         path_noise_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out = \
             original_forward(demands, tau=tau, lambda_=lambda_, soft_max_temperature=soft_max_temperature)
 
@@ -154,7 +108,7 @@ def main() -> None:
     )
     loss.backward()
 
-    edge_weights_np = captured_edge_weights[0].numpy()
+    edge_weights_np = captured_edge_weights.numpy()
     edge_index_np = pipeline._edge_index.numpy()
     num_nodes = topology.num_nodes
 
@@ -171,7 +125,7 @@ def main() -> None:
     sorted_probs = np.sort(rp)[::-1]
     top5 = sorted_probs[:5]
     print(f"  top-5 probs       : {' '.join(f'{v:.3f}' for v in top5)}")
-    regen_candidates = topology.regen_candidate_nodes
+    regen_candidates = sorted(ctx.regen_candidates)
     print(f"  regen candidates  : nodes {regen_candidates}")
     print(f"  their probs       : {' '.join(f'{rp[n]:.3f}' for n in regen_candidates)}")
 

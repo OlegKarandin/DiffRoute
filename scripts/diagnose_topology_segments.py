@@ -1,48 +1,44 @@
 """Compare the per-segment noise scale across topologies.
 
 Answers: was t=0.01 ever right, and if so for which topology?
+
+Every other config key (QoT checkpoint, pipeline params, seed, ...) comes
+from --config; only `topology` is overridden per iteration, since comparing
+topologies is this script's entire purpose.
 """
-import math, sys
-from pathlib import Path
-import torch, yaml
+import argparse
+import math
 
-from diffopt.demands import generate_demands
-from diffopt.pipeline import DiffONetPipeline, segment_path
-from diffopt.placement.regenerator import RegenPlacement
-from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
+import torch
+import yaml
+
+from diffopt.pipeline import segment_path
 from diffopt.routing.surrogate import surrogate_shortest_path
-from diffopt.topology import load_topology
-from diffopt.train import load_qot_model
+from _common import add_common_args, build_context, demands_for, edge_weights_of
 
-base = yaml.safe_load(Path("configs/experiment/small_test_ind132.yaml").read_text())
-device = torch.device("cpu")
+ap = argparse.ArgumentParser()
+add_common_args(ap, with_checkpoint=False, with_demands=False)
+args = ap.parse_args()
+
+base_cfg = yaml.safe_load(open(args.config))
 
 for topo_name in ["german_17", "ind_132"]:
-    torch.manual_seed(0)
-    topology = load_topology(f"configs/topology/{topo_name}.json", base["modulation_formats"])
-    qot = load_qot_model(base["qot_checkpoint"], base, device)
-    regen = RegenPlacement(topology.num_nodes)
-    pipe = DiffONetPipeline(
-        topology=topology, qot_model=qot, segment_combiner=SegmentCombiner(),
-        edge_weight_net=EdgeWeightNet(), regen_placement=regen,
-        channel_loading_fraction=base["pipeline"]["channel_loading_fraction"],
-        max_spans=base.get("max_spans_per_segment", 60))
-
-    edges = list(topology.undirected_edges)
-    cands = set(topology.regen_candidate_nodes)
-    demands = generate_demands(topology, 100, base["bitrate_options"], seed=1)
+    cfg = dict(base_cfg)
+    cfg["topology"] = f"configs/topology/{topo_name}.json"
+    ctx = build_context(cfg, load_e2e_checkpoint=False)
+    pipe = ctx.pipeline
+    topology = ctx.topology
+    edges = ctx.edges
+    cands = ctx.regen_candidates
+    demands = demands_for(ctx, seed=1)
+    vlastelica_lambda = cfg["training"]["vlastelica_lambda"]
 
     seg_g, nseg, seg_len, path_len = [], [], [], []
     with torch.no_grad():
-        rp = regen.get_regen_probs(1.0)
-        ef = torch.cat([pipe._topo_edge_features,
-                        rp[pipe._edge_src_ids].unsqueeze(1),
-                        rp[pipe._edge_dst_ids].unsqueeze(1)], dim=1)
-        ew = pipe.edge_weight_net(ef).squeeze(-1)
+        ew = edge_weights_of(ctx, tau=1.0)
         for d in demands:
             pi = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
-                                         pipe._num_nodes, lambda_=10.0)
+                                         pipe._num_nodes, lambda_=vlastelica_lambda)
             ordered = pipe._reconstruct_path(pi, d.src, d.dst)
             if not ordered:
                 continue
@@ -51,7 +47,7 @@ for topo_name in ["german_17", "ind_132"]:
             nseg.append(len(segs))
             for s in segs:
                 seg_len.append(sum(edges[e].length_km for e in s))
-                sf, pm = pipe._extract_span_features(s, device)
+                sf, pm = pipe._extract_span_features(s, ctx.device)
                 seg_g.append(pipe.qot_model(sf, pm)[0].item())
 
     g = torch.tensor(seg_g)

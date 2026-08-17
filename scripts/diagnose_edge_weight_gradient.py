@@ -48,22 +48,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
 
-from diffopt.demands import generate_demands
-from diffopt.modulation import ModulationConfig
-from diffopt.pipeline import DiffONetPipeline
-from diffopt.placement.regenerator import RegenPlacement
-from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.shortest_path import dijkstra
-from diffopt.topology import load_topology
-from diffopt.train import linear_anneal, load_qot_model
+from _common import add_common_args, build_context, demands_for, edge_weights_of, schedule_at
 
 
 def grad_of(term: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
@@ -89,67 +81,38 @@ def describe(name: str, w: np.ndarray, lens: np.ndarray) -> None:
           f"  corr(w, length_km)={corr:+.3f}")
 
 
-def build_pipeline(cfg, topo, qot, dev):
-    """Construct a pipeline."""
-    sc = SegmentCombiner()
-    ewn = EdgeWeightNet().to(dev)
-    regen = RegenPlacement(topo.num_nodes).to(dev)
-    pipe = DiffONetPipeline(
-        topology=topo, qot_model=qot, segment_combiner=sc,
-        edge_weight_net=ewn, regen_placement=regen,
-        channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
-        max_spans=cfg.get("max_spans_per_segment", 60),
-    ).to(dev)
-    return pipe, ewn, regen
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/experiment/small_test_ind132.yaml")
-    ap.add_argument("--checkpoint", default=None,
-                    help="Defaults to <checkpoint_dir>/best_e2e.pt")
+    add_common_args(ap, with_demands=False)
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
-    dev = torch.device("cpu")
+    cfg = yaml.safe_load(open(args.config))
     t_cfg, p_cfg = cfg["training"], cfg["pipeline"]
-    sc_cfg = cfg.get("segment_combiner", {})
 
-    topo = load_topology(cfg["topology"], cfg["modulation_formats"])
-    mod_cfg = ModulationConfig.from_yaml(cfg["modulation_formats"])
+    # ---- untrained context (training's actual starting point) --------------
+    # build_context seeds with cfg.get("seed", 42) before any module
+    # construction, matching train.py's own ordering, so this is
+    # bit-identical to training's epoch-0 EdgeWeightNet/RegenPlacement.
+    ctx_init = build_context(cfg, load_e2e_checkpoint=False)
 
-    # Seed exactly as train.py does *before* loading the QoT model, so the
-    # untrained EdgeWeightNet below is bit-identical to training's epoch-0 state.
-    torch.manual_seed(cfg.get("seed", 42))
-    qot = load_qot_model(cfg["qot_checkpoint"], cfg, dev)
-
-    edges = list(topo.undirected_edges)
+    # ---- trained context ------------------------------------------------
+    ctx = build_context(cfg, load_e2e_checkpoint=True, checkpoint_path=args.checkpoint)
+    topo = ctx.topology
+    edges = ctx.edges
     lens = np.array([e.length_km for e in edges], dtype=float)
     n_edges = len(edges)
 
-    # ---- untrained pipeline (training's actual starting point) -------------
-    pipe_init, ewn_init, regen_init = build_pipeline(cfg, topo, qot, dev)
-
-    # ---- trained pipeline --------------------------------------------------
-    pipe, ewn, regen = build_pipeline(cfg, topo, qot, dev)
-    ckpt_path = Path(args.checkpoint or f"{cfg['checkpoint_dir']}/best_e2e.pt")
-    ckpt = torch.load(ckpt_path, map_location=dev)
-    ewn.load_state_dict(ckpt["edge_weight_net_state"])
-    with torch.no_grad():
-        regen.regen_logits.copy_(ckpt["regen_logits"])
-
+    ckpt_path = args.checkpoint or f"{cfg['checkpoint_dir']}/best_e2e.pt"
     print(f"config={args.config}")
-    print(f"checkpoint={ckpt_path} (epoch {ckpt['epoch']}, loss={ckpt['total_loss']:.4f})")
+    print(f"checkpoint={ckpt_path} (epoch {ctx.ckpt['epoch']}, loss={ctx.ckpt['total_loss']:.4f})")
     print(f"nodes={topo.num_nodes} edges={n_edges}  "
           f"lambda_cost={p_cfg['lambda_cost']} lambda_infeasible={p_cfg['lambda_infeasible']} "
           f"lambda_regen={p_cfg['lambda_regen']}\n")
 
     final_epoch = t_cfg["epochs_e2e"]
-    tau = t_cfg["regen_tau_end"]
-    t_sm = sc_cfg.get("soft_max_temperature_min", 0.01)
-    vl = ckpt["vlastelica_lambda"]
-    demands = generate_demands(topo, cfg["num_demands"], cfg["bitrate_options"],
-                               seed=final_epoch)
+    tau, t_sm, _ = schedule_at(cfg, epoch=final_epoch)
+    vl = ctx.ckpt["vlastelica_lambda"]  # checkpoint's own value -- see schedule_at's docstring
+    demands = demands_for(ctx, seed=final_epoch)
 
     # =====================================================================
     # D. Collapse vs never-had-structure
@@ -158,20 +121,8 @@ def main() -> None:
     print("D. WEIGHT DISTRIBUTION: trained vs untrained-at-training's-seed")
     print("=" * 78)
 
-    def edge_weights_of(pipeline_obj, regen_obj):
-        with torch.no_grad():
-            rp = regen_obj.get_regen_probs(tau)
-            feats = torch.cat([
-                pipeline_obj._topo_edge_features,
-                rp[pipeline_obj._edge_src_ids].unsqueeze(1),
-                rp[pipeline_obj._edge_dst_ids].unsqueeze(1),
-            ], dim=1)
-            raw = pipeline_obj.edge_weight_net(feats).squeeze(-1)
-            # Match pipeline.forward's unit-mean renormalisation exactly.
-            return (raw / raw.mean().clamp_min(1e-12)).numpy()
-
-    w_init = edge_weights_of(pipe_init, regen_init)
-    w_trained = edge_weights_of(pipe, regen)
+    w_init = edge_weights_of(ctx_init, tau).numpy()
+    w_trained = edge_weights_of(ctx, tau).numpy()
     describe("untrained (init)", w_init, lens)
     describe("trained", w_trained, lens)
 
@@ -190,7 +141,7 @@ def main() -> None:
     print("=" * 78)
     print("A. SCALE DEGENERACY: does uniformly scaling all weights change routing?")
     print("=" * 78)
-    ei_np = pipe._edge_index.numpy()
+    ei_np = ctx.pipeline._edge_index.numpy()
     identical = 0
     for d in demands:
         p1 = dijkstra(w_trained.astype(np.float64), ei_np, d.src, d.dst, topo.num_nodes)
@@ -212,9 +163,19 @@ def main() -> None:
 
     # =====================================================================
     # B/C/F. Gradient decomposition at both operating points
+    #
+    # NOT via edge_weights_of: it runs under torch.no_grad() and returns a
+    # detached snapshot by construction (see its docstring), so it cannot
+    # supply the graph-connected raw tensor these checks differentiate
+    # through. A live register_forward_hook during an actual pipeline(...)
+    # call is the only way to get that.
     # =====================================================================
-    for label, pl, rg in [("UNTRAINED (epoch 0)", pipe_init, regen_init),
-                          ("TRAINED (epoch %d)" % ckpt["epoch"], pipe, regen)]:
+    for label, ctx_i, tau_i, t_sm_i, vl_i, dem_i in [
+        ("UNTRAINED (epoch 0)", ctx_init, *schedule_at(cfg, epoch=1),
+         demands_for(ctx_init, seed=1)),
+        ("TRAINED (epoch %d)" % ctx.ckpt["epoch"], ctx, tau, t_sm, vl, demands),
+    ]:
+        pl = ctx_i.pipeline
         print("=" * 78)
         print(f"B/C/F. GRADIENT DECOMPOSITION ON EdgeWeightNet's RAW output "
               f"(pre-normalisation, NOT the normalised routing weight) - {label}")
@@ -237,23 +198,8 @@ def main() -> None:
             captured["w"] = out
 
         h = pl.edge_weight_net.register_forward_hook(hook)
-        # Untrained point is evaluated on epoch 1's schedule/demands, trained
-        # point on the final epoch's — each at the settings training actually used.
-        if "UNTRAINED" in label:
-            tau_x = linear_anneal(1, t_cfg["regen_tau_start"], t_cfg["regen_tau_end"],
-                                  t_cfg["regen_tau_anneal_start_epoch"],
-                                  t_cfg["regen_tau_anneal_end_epoch"])
-            t_sm_x = linear_anneal(1, sc_cfg.get("soft_max_temperature", 0.5),
-                                   sc_cfg.get("soft_max_temperature_min", 0.01),
-                                   t_cfg["regen_tau_anneal_start_epoch"],
-                                   t_cfg["regen_tau_anneal_end_epoch"])
-            vl_x = t_cfg["vlastelica_lambda"]
-            dem = generate_demands(topo, cfg["num_demands"], cfg["bitrate_options"], seed=1)
-        else:
-            tau_x, t_sm_x, vl_x, dem = tau, t_sm, vl, demands
-
         path_noise_costs, gsnr_preds, path_inds, regen_probs = pl(
-            dem, tau=tau_x, lambda_=vl_x, soft_max_temperature=t_sm_x)
+            dem_i, tau=tau_i, lambda_=vl_i, soft_max_temperature=t_sm_i)
         h.remove()
         w_t = captured["w"]
         # Mirror edge_weights_of's unit-mean renormalisation: the raw hook
@@ -264,8 +210,8 @@ def main() -> None:
 
         feas = torch.zeros(1)
         n_infeas = 0
-        for d in dem:
-            thr = torch.tensor(mod_cfg.required_snr_threshold(d.bitrate_gbps))
+        for d in dem_i:
+            thr = torch.tensor(ctx_i.mod_cfg.required_snr_threshold(d.bitrate_gbps))
             sf = F.relu(thr - gsnr_preds[d.id])
             feas = feas + sf
             if sf.item() > 0:
@@ -286,13 +232,13 @@ def main() -> None:
         # the fix the split was 14.46 direct vs 2.2e-6 surrogate; a nonzero
         # direct component here means the term is reading edge_weights again.
         usage = torch.zeros(n_edges)
-        for d in dem:
+        for d in dem_i:
             usage += path_inds[d.id].detach()
         g_cost_direct = torch.zeros(n_edges)
         g_cost_surrogate = g_cost - g_cost_direct
 
-        print(f"  demands={len(dem)}  infeasible={n_infeas}  tau={tau_x:.3f} "
-              f"t_sm={t_sm_x:.4f} vlastelica_lambda={vl_x:.3f}")
+        print(f"  demands={len(dem_i)}  infeasible={n_infeas}  tau={tau_i:.3f} "
+              f"t_sm={t_sm_i:.4f} vlastelica_lambda={vl_i:.3f}")
         print(f"  L_feas={L_feas.item():.4f}  L_regen={L_regen.item():.4f}  "
               f"L_cost={L_cost.item():.6f}\n")
 
@@ -340,9 +286,9 @@ def main() -> None:
         wv = w_t_norm
         # grad_output flowing into the surrogate == d(total)/d(path_indicator).
         # Reconstruct its scale from the two contributing terms for one demand.
-        gpi = grad_of(L_feas + L_cost, path_inds[dem[0].id])
-        pert = vl_x * gpi.abs()
-        print(f"\n  F. perturbation scale check (demand {dem[0].id}):")
+        gpi = grad_of(L_feas + L_cost, path_inds[dem_i[0].id])
+        pert = vl_i * gpi.abs()
+        print(f"\n  F. perturbation scale check (demand {dem_i[0].id}):")
         print(f"     median |w|            = {wv.median():.4e}")
         print(f"     median lambda*|dL/dz| = {pert.median():.4e}   "
               f"max = {pert.max():.4e}")

@@ -1,7 +1,8 @@
 """Does ind_132 actually need regenerators?
 
 Routes every demand on the shortest-by-km path (physical baseline, no
-dependence on EdgeWeightNet init), then evaluates each path in three
+dependence on EdgeWeightNet init — this deliberately does NOT use
+edge_weights_of/EdgeWeightNet at all), then evaluates each path in three
 regimes and compares against the demand's real SNR threshold:
 
   p=0  fully TRANSPARENT   (no regenerator anywhere)  <- the honest question
@@ -18,45 +19,39 @@ Usage:
     python scripts/diagnose_regen_necessity.py --config configs/experiment/base.yaml
 """
 import argparse
-from pathlib import Path
-import numpy as np, torch, yaml
 
-from diffopt.demands import generate_demands
-from diffopt.modulation import ModulationConfig
-from diffopt.pipeline import DiffONetPipeline, segment_path
-from diffopt.placement.regenerator import RegenPlacement
+import numpy as np
+import torch
+import yaml
+
+from diffopt.pipeline import segment_path
 from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.shortest_path import dijkstra
-from diffopt.topology import load_topology
-from diffopt.train import load_qot_model
+from _common import add_common_args, build_context, demands_for
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--config", default="configs/experiment/small_test_ind132.yaml")
-ap.add_argument("--num-demands", type=int, default=400)
+add_common_args(ap, with_checkpoint=False)
+# Overrides for this script's own historical defaults: 400 demands (not
+# cfg["num_demands"]=100) at a fixed seed=7 -- diagnose_regen_ablation.py's
+# own --seed default explicitly documents "matches diagnose_regen_necessity.py",
+# so this default must stay 7, not add_common_args' generic default of 1.
+ap.set_defaults(num_demands=400, seed=7)
 args = ap.parse_args()
 
-cfg = yaml.safe_load(Path(args.config).read_text())
-dev = torch.device("cpu")
-torch.manual_seed(0)
-topo = load_topology(cfg["topology"], cfg["modulation_formats"])
-mod = ModulationConfig.from_yaml(cfg["modulation_formats"])
-qot = load_qot_model(cfg["qot_checkpoint"], cfg, dev)
-pipe = DiffONetPipeline(topology=topo, qot_model=qot, segment_combiner=SegmentCombiner(),
-                        edge_weight_net=EdgeWeightNet(), regen_placement=RegenPlacement(topo.num_nodes),
-                        channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
-                        max_spans=60)
-edges = list(topo.undirected_edges)
-cands = set(topo.regen_candidate_nodes)
+cfg = yaml.safe_load(open(args.config))
+ctx = build_context(cfg, load_e2e_checkpoint=False)
+pipe = ctx.pipeline
+edges = ctx.edges
+cands = ctx.regen_candidates
 ei = pipe._edge_index.numpy()
 lens = np.array([e.length_km for e in edges], dtype=float)
 comb = SegmentCombiner()
 
-demands = generate_demands(topo, args.num_demands, cfg["bitrate_options"], seed=7)
+demands = demands_for(ctx, seed=args.seed, num_demands=args.num_demands)
 rows = []
 with torch.no_grad():
     for d in demands:
-        pi = dijkstra(lens, ei, d.src, d.dst, topo.num_nodes)
+        pi = dijkstra(lens, ei, d.src, d.dst, ctx.topology.num_nodes)
         if pi is None:
             continue
         pit = torch.tensor(pi, dtype=torch.float32)
@@ -66,8 +61,8 @@ with torch.no_grad():
         km = sum(edges[e].length_km for e in ordered)
         nsp = sum(edges[e].num_spans for e in ordered)
         segs, bnodes = segment_path(ordered, d.src, cands, edges, d.dst)
-        gs = [qot(*pipe._extract_span_features(s, dev))[0] for s in segs]
-        thr = mod.required_snr_threshold(d.bitrate_gbps)
+        gs = [pipe.qot_model(*pipe._extract_span_features(s, ctx.device))[0] for s in segs]
+        thr = ctx.mod_cfg.required_snr_threshold(d.bitrate_gbps)
         out = {}
         for name, p in [("p0", 0.0), ("p05", 0.5), ("p1", 1.0)]:
             bp = [torch.tensor(p)] * (len(segs) - 1)
@@ -75,7 +70,7 @@ with torch.no_grad():
         rows.append((km, nsp, len(segs), d.bitrate_gbps, thr,
                      out["p0"], out["p05"], out["p1"]))
 
-print(f"{len(rows)} demands, shortest-by-km routing, ind_132\n")
+print(f"{len(rows)} demands (seed={args.seed}), shortest-by-km routing, ind_132\n")
 buckets = [(0, 500), (500, 1000), (1000, 2000), (2000, 3000), (3000, 4000), (4000, 10000)]
 print(f"{'path km':>13} {'n':>4} {'segs':>5} {'spans':>6} | "
       f"{'GSNR p=0':>9} {'p=0.5':>7} {'p=1':>7} | {'infeasible @ p=0':>17} {'@ p=1':>7}")
@@ -98,9 +93,9 @@ print(f"\nTOTAL infeasible fully-transparent (p=0): {tot0}/{len(rows)}")
 print(f"TOTAL infeasible fully-regenerated (p=1): {tot1}/{len(rows)}")
 print(f"demands RESCUED by regeneration:          {rescued}/{len(rows)}")
 print(f"\nlongest path: {max(r[0] for r in rows):.0f} km, "
-      f"{max(r[1] for r in rows)} spans (max_spans=60)")
-print(f"paths exceeding max_spans=60 as ONE segment: "
-      f"{sum(1 for r in rows if r[1] > 60)}/{len(rows)}")
+      f"{max(r[1] for r in rows)} spans (max_spans={pipe.max_spans})")
+print(f"paths exceeding max_spans={pipe.max_spans} as ONE segment: "
+      f"{sum(1 for r in rows if r[1] > pipe.max_spans)}/{len(rows)}")
 
 print("\nGSNR gain from regeneration (p=1 minus p=0), by path length:")
 for lo, hi in buckets:

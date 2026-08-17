@@ -24,11 +24,12 @@ Usage:
 """
 import argparse, csv, math
 from pathlib import Path
-from diffopt.train import linear_anneal
 import yaml
 
+from _common import add_common_args, schedule_at
+
 ap = argparse.ArgumentParser()
-ap.add_argument("--config", default="configs/experiment/small_test_ind132.yaml")
+add_common_args(ap, with_checkpoint=False, with_demands=False)
 ap.add_argument("--log", default="logs/e2e_ind132/e2e_train_log.csv")
 ap.add_argument("--num-nodes", type=int, default=132)
 args = ap.parse_args()
@@ -46,9 +47,7 @@ print(f"{'ep':>3} {'tau':>6} {'logit':>8} {'p_pred':>7} | "
 errs = []
 for r in rows:
     e = int(r["epoch"])
-    tau = linear_anneal(e, t_cfg["regen_tau_start"], t_cfg["regen_tau_end"],
-                        t_cfg["regen_tau_anneal_start_epoch"],
-                        t_cfg["regen_tau_anneal_end_epoch"])
+    tau, _, _ = schedule_at(cfg, epoch=e)
     logit = -LR * e
     p = 1.0 / (1.0 + math.exp(-logit / tau))
     pred = N * p
@@ -61,9 +60,7 @@ print(f"\nmean relative error of the pure-drift prediction: {100*sum(errs)/len(e
 
 last = rows[-1]
 n_ep = int(last["epoch"])
-tau_end = linear_anneal(n_ep, t_cfg["regen_tau_start"], t_cfg["regen_tau_end"],
-                        t_cfg["regen_tau_anneal_start_epoch"],
-                        t_cfg["regen_tau_anneal_end_epoch"])
+tau_end, _, _ = schedule_at(cfg, epoch=n_ep)
 
 if "regen_logit_min" in last:
     lo, hi = float(last["regen_logit_min"]), float(last["regen_logit_max"])

@@ -1,42 +1,40 @@
 """Walk one real demand through the pipeline, printing each stage."""
-from pathlib import Path
-import torch, yaml
+import argparse
 
-from diffopt.demands import generate_demands
-from diffopt.pipeline import DiffONetPipeline, segment_path
-from diffopt.placement.regenerator import RegenPlacement
-from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
+import torch
+import yaml
+
+from diffopt.pipeline import segment_path
 from diffopt.routing.surrogate import surrogate_shortest_path
-from diffopt.topology import load_topology
-from diffopt.train import load_qot_model
+from _common import add_common_args, build_context, demands_for, edge_weights_of
 
-cfg = yaml.safe_load(Path("configs/experiment/small_test_ind132.yaml").read_text())
-torch.manual_seed(0)
-topology = load_topology(cfg["topology"], cfg["modulation_formats"])
-qot = load_qot_model(cfg["qot_checkpoint"], cfg, torch.device("cpu"))
-regen = RegenPlacement(topology.num_nodes)
-pipe = DiffONetPipeline(
-    topology=topology, qot_model=qot, segment_combiner=SegmentCombiner(),
-    edge_weight_net=EdgeWeightNet(), regen_placement=regen,
-    channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
-    max_spans=60)
-edges = list(topology.undirected_edges)
-cands = set(topology.regen_candidate_nodes)
-demands = generate_demands(topology, 100, cfg["bitrate_options"], seed=1)
+ap = argparse.ArgumentParser()
+add_common_args(ap, with_checkpoint=False, with_demands=False)
+args = ap.parse_args()
+
+cfg = yaml.safe_load(open(args.config))
+ctx = build_context(cfg, load_e2e_checkpoint=False)
+pipe = ctx.pipeline
+topology = ctx.topology
+edges = ctx.edges
+cands = ctx.regen_candidates
+vlastelica_lambda = cfg["training"]["vlastelica_lambda"]
+demands = demands_for(ctx, seed=1)
 
 with torch.no_grad():
-    rp = regen.get_regen_probs(1.0)
-    ef = torch.cat([pipe._topo_edge_features,
-                    rp[pipe._edge_src_ids].unsqueeze(1),
-                    rp[pipe._edge_dst_ids].unsqueeze(1)], dim=1)
-    ew = pipe.edge_weight_net(ef).squeeze(-1)
+    # NORMALISED — this is the unit-mean-renormalised weight pipeline.forward
+    # actually routes on (correction #9), not EdgeWeightNet's raw Softplus
+    # output. Before this script was migrated onto scripts/_common.py it
+    # printed the raw output labelled "edge_weights", which described a
+    # tensor the pipeline never used — if you're diffing against an older
+    # run's output, that's why the numbers below moved.
+    ew = edge_weights_of(ctx, tau=1.0, normalised=True)
 
     # pick a demand with a few segments
     pick = None
     for d in demands:
         pi = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
-                                     pipe._num_nodes, lambda_=10.0)
+                                     pipe._num_nodes, lambda_=vlastelica_lambda)
         o = pipe._reconstruct_path(pi, d.src, d.dst)
         s, b = segment_path(o, d.src, cands, edges, d.dst)
         if 3 <= len(s) <= 4 and len(o) >= 5:
@@ -45,7 +43,7 @@ with torch.no_grad():
 
     print(f"DEMAND {d.id}: node {d.src} -> node {d.dst}, {d.bitrate_gbps} Gbps")
     print(f"  edge_index shape {tuple(pipe._edge_index.shape)}, "
-          f"edge_weights shape {tuple(ew.shape)}")
+          f"edge_weights (normalised, unit-mean) shape {tuple(ew.shape)}")
     print(f"\nSTAGE 4a  path_indicator: (E,) binary, {int(pi.sum())} of {len(edges)} edges = 1")
     print(f"STAGE 4c  _reconstruct_path -> ordered edge IDs: {ordered}")
 
@@ -68,14 +66,15 @@ with torch.no_grad():
         km = sum(edges[e].length_km for e in s)
         ns = sum(edges[e].num_spans for e in s)
         tot += ns
-        sf, pm = pipe._extract_span_features(s, torch.device("cpu"))
-        g = qot(sf, pm)[0].item()
+        sf, pm = pipe._extract_span_features(s, ctx.device)
+        g = pipe.qot_model(sf, pm)[0].item()
         n = 10 ** (-g / 10)
         print(f"    seg {i}: edges {s}  {km:7.1f} km  {ns:2d} spans "
               f"-> STAGE 4e QoT = {g:6.2f} dB  (noise {n:.5f})")
     print(f"    (path total {tot} spans; max_spans={pipe.max_spans})")
 
-    gs = [qot(*pipe._extract_span_features(s, torch.device('cpu')))[0] for s in segs]
+    rp = pipe.regen_placement.get_regen_probs(1.0)
+    gs = [pipe.qot_model(*pipe._extract_span_features(s, ctx.device))[0] for s in segs]
     bp = [rp[n] for n in bnodes]
     print(f"\nSTAGE 4f  SegmentCombiner(segment_gsnrs, boundary_probs={[f'{p:.2f}' for p in bp]})")
     for t in [0.5, 0.01]:
@@ -83,7 +82,7 @@ with torch.no_grad():
         print(f"    temperature={t:<5} -> path GSNR = {out.item():6.2f} dB")
     print(f"\n  span features fed to QoT are 5 cols: "
           f"[span_len, fiber_idx, amp_nf, load_frac, accum_dist]")
-    sf, pm = pipe._extract_span_features(segs[-1], torch.device("cpu"))
+    sf, pm = pipe._extract_span_features(segs[-1], ctx.device)
     ns = int(pm.sum())
     print(f"  e.g. last segment's {ns} real spans (of {pipe.max_spans} padded rows):")
     for r in range(ns):

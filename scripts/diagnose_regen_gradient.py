@@ -8,21 +8,12 @@ infeasible paths (the ones that *should* be climbing).
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import yaml
 
-from diffopt.demands import generate_demands
-from diffopt.modulation import ModulationConfig
-from diffopt.pipeline import DiffONetPipeline
-from diffopt.placement.regenerator import RegenPlacement
-from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
-from diffopt.topology import load_topology
-from diffopt.train import linear_anneal, load_qot_model
-
-import torch.nn.functional as F
+from _common import add_common_args, build_context, demands_for, schedule_at
 
 
 def grad_of(term: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
@@ -32,57 +23,38 @@ def grad_of(term: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/experiment/small_test_ind132.yaml")
+    add_common_args(ap, with_checkpoint=False, with_demands=False)
     ap.add_argument("--epochs", default="1,5,10,15,18,20")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
-    device = torch.device("cpu")
-    torch.manual_seed(0)
+    cfg = yaml.safe_load(open(args.config))
+    ctx = build_context(cfg, load_e2e_checkpoint=False)
+    pipeline = ctx.pipeline
+    topology = ctx.topology
+    mod_cfg = ctx.mod_cfg
+    regen = ctx.regen_placement
 
-    topology = load_topology(cfg["topology"], cfg["modulation_formats"])
-    mod_cfg = ModulationConfig.from_yaml(cfg["modulation_formats"])
-    qot_model = load_qot_model(cfg["qot_checkpoint"], cfg, device)
-
-    regen = RegenPlacement(topology.num_nodes).to(device)
-    pipeline = DiffONetPipeline(
-        topology=topology,
-        qot_model=qot_model,
-        segment_combiner=SegmentCombiner(),
-        edge_weight_net=EdgeWeightNet().to(device),
-        regen_placement=regen,
-        channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
-        max_spans=cfg.get("max_spans_per_segment", 60),
-    ).to(device)
-
-    t_cfg = cfg["training"]
     p_cfg = cfg["pipeline"]
-    sc = cfg.get("segment_combiner", {})
+    t_cfg = cfg["training"]
 
-    n_cand = len(set(topology.regen_candidate_nodes))
-    print(f"nodes={topology.num_nodes}  edges={len(list(topology.undirected_edges))}  "
+    n_cand = len(ctx.regen_candidates)
+    print(f"nodes={topology.num_nodes}  edges={len(ctx.edges)}  "
           f"regen_candidates(deg>=3)={n_cand}")
     print(f"lambda_regen={p_cfg['lambda_regen']}  lambda_infeasible={p_cfg['lambda_infeasible']}  "
           f"lambda_cost={p_cfg['lambda_cost']}  lr_regen={t_cfg['lr_regen']}\n")
 
     for epoch in [int(x) for x in args.epochs.split(",")]:
-        tau = linear_anneal(epoch, t_cfg["regen_tau_start"], t_cfg["regen_tau_end"],
-                            t_cfg["regen_tau_anneal_start_epoch"],
-                            t_cfg["regen_tau_anneal_end_epoch"])
-        tsm = linear_anneal(epoch, sc.get("soft_max_temperature", 0.5),
-                            sc.get("soft_max_temperature_min", 0.01),
-                            t_cfg["regen_tau_anneal_start_epoch"],
-                            t_cfg["regen_tau_anneal_end_epoch"])
+        tau, tsm, vlastelica_lambda = schedule_at(cfg, epoch=epoch)
 
-        demands = generate_demands(topology, cfg["num_demands"],
-                                   cfg["bitrate_options"], seed=epoch)
+        # seed=epoch: matches train.py's per-epoch demand reseeding exactly.
+        demands = demands_for(ctx, seed=epoch)
 
         # fresh logits at 0 each time: isolates the temperature effect
         with torch.no_grad():
             regen.regen_logits.zero_()
 
         path_noise_costs, gsnr_preds, _, regen_probs = pipeline(
-            demands, tau=tau, lambda_=t_cfg["vlastelica_lambda"], soft_max_temperature=tsm)
+            demands, tau=tau, lambda_=vlastelica_lambda, soft_max_temperature=tsm)
 
         feas = torch.zeros(1)
         infeasible_ids = []
