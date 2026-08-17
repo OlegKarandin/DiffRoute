@@ -51,31 +51,39 @@ ALL_TOPOLOGY_JSONS = sorted((BASE / "configs/topology").glob("*.json"))
     "topo_json", ALL_TOPOLOGY_JSONS, ids=lambda p: p.stem
 )
 def test_all_committed_spans_ge_20km(topo_json):
-    """Every span produced by *splitting* a link must be >= 20 km.
+    """Splitting a link must never leave a short remainder span.
 
     Reads the committed JSON rather than the .dat sources: the .dat files are
     not distributed with the repo (see configs/topology/README.md), and the
     JSON is the artifact the pipeline actually consumes.
 
-    Single-span (num_spans == 1) edges are exempt: the invariant is about
-    split_link_into_spans() never leaving a short remainder when it divides a
-    link into multiple pieces (CLAUDE.md, "Topology" constraints). A link
-    that is itself shorter than 20 km isn't split at all -- it is used as a
-    single whole-length span -- so its length is a physical property of the
-    topology, not something the splitting algorithm chose. ind_132 (1 edge,
-    19.0 km) and jp_70 (7 edges, 8.0-19.0 km) both have real single-span
-    edges below 20 km; german_17 and eu_19 do not, which is why this case
-    was never exercised before ind_132/jp_70 got test coverage.
+    A span may be shorter than 20 km only if it is the link's sole span AND
+    equals the link length exactly: split_link_into_spans() falls back to
+    n=1 when no candidate split keeps every span >= 20 km, so a link shorter
+    than 20 km stays whole rather than being split into an even-shorter
+    remainder. That fallback is a real, physical case -- ind_132 has one
+    edge (19.0 km) and jp_70 has seven (8.0-19.0 km) that are short, unsplit
+    links, not splitting-algorithm defects. This assertion checks every edge
+    (no exemption by num_spans) so a future short span that is NOT the sole,
+    whole-length span -- i.e. an actual short remainder from splitting --
+    still fails.
     """
     data = json.loads(topo_json.read_text())
     assert data["edges"], f"{topo_json.name} has no edges"
     for edge in data["edges"]:
-        if edge["num_spans"] <= 1:
-            continue
         spans = edge["span_lengths_km"]
-        assert all(s >= 20.0 for s in spans), (
+        short = [s for s in spans if s < 20.0]
+        if not short:
+            continue
+        assert len(spans) == 1, (
             f"{topo_json.name} edge {edge['src']}-{edge['dst']} "
-            f"({edge['length_km']} km): span < 20 km: {spans}"
+            f"({edge['length_km']} km) was split into {len(spans)} spans, "
+            f"one of which is < 20 km: {spans}"
+        )
+        assert spans[0] == pytest.approx(edge["length_km"]), (
+            f"{topo_json.name} edge {edge['src']}-{edge['dst']}: sole span "
+            f"{spans[0]} km is < 20 km but does not equal the link length "
+            f"{edge['length_km']} km"
         )
 
 
