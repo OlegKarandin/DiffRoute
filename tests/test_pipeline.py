@@ -799,6 +799,22 @@ def test_topology_edge_features_are_standardised():
 # ~8.2e7x over 60 epochs while rank-corr with init stayed at +0.999.
 # ---------------------------------------------------------------------------
 
+def test_segment_longer_than_max_spans_raises_a_named_error():
+    """A route whose segment exceeds max_spans must fail loudly.
+
+    SpanAttentionQoT's positional embedding is nn.Embedding(max_spans); going
+    past it otherwise raises a bare IndexError from inside torch.
+    """
+    topo = make_hub_topology()
+    pipeline = make_pipeline(topo)
+    pipeline.max_spans = 1  # every real segment here has more than 1 span
+
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    with pytest.raises(ValueError, match="max_spans"):
+        pipeline(demands, lambda_=5.0)
+
+
 def test_edge_weights_do_not_collapse_over_training():
     torch.manual_seed(0)
     topo = make_hub_topology()

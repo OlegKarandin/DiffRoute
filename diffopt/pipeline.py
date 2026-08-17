@@ -396,6 +396,14 @@ class DiffONetPipeline(nn.Module):
 
         if all_segments:
             batch_max_spans = max(1, max(len(rows) for rows in all_segment_rows))
+            if batch_max_spans > self.max_spans:
+                raise ValueError(
+                    f"Routed a transparent segment of {batch_max_spans} spans, but "
+                    f"max_spans={self.max_spans} is a hard architecture parameter "
+                    f"(SpanAttentionQoT's positional embedding is sized to it). "
+                    f"Either shorten the route or regenerate datasets and retrain "
+                    f"with a larger max_spans."
+                )
             n_total = len(all_segments)
             batched_span_feats = torch.zeros(n_total, batch_max_spans, 5, device=device)
             batched_padding_mask = torch.zeros(n_total, batch_max_spans, dtype=torch.bool, device=device)
