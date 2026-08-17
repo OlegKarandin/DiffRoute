@@ -23,7 +23,8 @@ ap = argparse.ArgumentParser()
 add_common_args(ap, with_checkpoint=False, with_demands=False)
 args = ap.parse_args()
 
-cfg = yaml.safe_load(open(args.config))
+with open(args.config) as f:
+    cfg = yaml.safe_load(f)
 ctx = build_context(cfg, load_e2e_checkpoint=False)
 pipe = ctx.pipeline
 topology = ctx.topology

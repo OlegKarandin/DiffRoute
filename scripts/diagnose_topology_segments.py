@@ -20,7 +20,8 @@ ap = argparse.ArgumentParser()
 add_common_args(ap, with_checkpoint=False, with_demands=False)
 args = ap.parse_args()
 
-base_cfg = yaml.safe_load(open(args.config))
+with open(args.config) as f:
+    base_cfg = yaml.safe_load(f)
 
 for topo_name in ["german_17", "ind_132"]:
     cfg = dict(base_cfg)

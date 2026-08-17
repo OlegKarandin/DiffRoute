@@ -27,7 +27,8 @@ def main() -> None:
     ap.add_argument("--epochs", default="1,5,10,15,18,20")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
     ctx = build_context(cfg, load_e2e_checkpoint=False)
     pipeline = ctx.pipeline
     topology = ctx.topology
@@ -44,6 +45,19 @@ def main() -> None:
           f"lambda_cost={p_cfg['lambda_cost']}  lr_regen={t_cfg['lr_regen']}\n")
 
     for epoch in [int(x) for x in args.epochs.split(",")]:
+        # vlastelica_lambda here is the DECAYED per-epoch value schedule_at
+        # replays from train.py's loop (t_cfg["vlastelica_lambda"] *
+        # vlastelica_lambda_decay**(epoch-1), clamped at vlastelica_lambda_min)
+        # -- not the constant t_cfg["vlastelica_lambda"] this script used
+        # pre-migration. It enters the Vlastelica backward directly
+        # (diffopt/routing/surrogate.py's c_target = w + lambda_*grad_output),
+        # and regen_logits' gradient flows through regen_probs -> edge_feats
+        # -> edge_weights -> that surrogate, so this is a SECOND source of
+        # cross-epoch gradient-magnitude change here, independent of tau/
+        # t_softmax annealing. Printed alongside them below for exactly that
+        # reason -- matches train.py:183,200 exactly, which is why this is a
+        # fix, not a divergence, but it does mean pre- vs post-migration runs
+        # of this script are not comparing like for like at epoch > 1.
         tau, tsm, vlastelica_lambda = schedule_at(cfg, epoch=epoch)
 
         # seed=epoch: matches train.py's per-epoch demand reseeding exactly.
@@ -81,7 +95,8 @@ def main() -> None:
         # descent moves logit by -grad; negative total grad == prob climbs
         climbing = int((g_tot < 0).sum())
 
-        print(f"--- epoch {epoch:2d}  tau={tau:.3f}  t_softmax={tsm:.4f} ---")
+        print(f"--- epoch {epoch:2d}  tau={tau:.3f}  t_softmax={tsm:.4f}  "
+              f"lambda={vlastelica_lambda:.3f} ---")
         print(f"  infeasible demands: {len(infeasible_ids)}/{len(demands)}   "
               f"feasibility_loss={feas.item():.2f}")
         print(f"  nodes with nonzero feasibility grad: {n_touched}/{topology.num_nodes}")

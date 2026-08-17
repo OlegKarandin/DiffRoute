@@ -41,8 +41,10 @@ add_common_args(ap)
 ap.set_defaults(num_demands=400, seed=7)
 args = ap.parse_args()
 
+with open(args.config) as f:
+    _cfg_for_ctx = yaml.safe_load(f)
 ctx = build_context(
-    yaml.safe_load(open(args.config)),
+    _cfg_for_ctx,
     load_e2e_checkpoint=True,
     checkpoint_path=args.checkpoint,
 )

@@ -16,6 +16,7 @@ import pytest
 import torch
 import yaml
 
+import diffopt.pipeline as pipeline_mod
 from diffopt.demands import Demand
 from diffopt.train import linear_anneal
 
@@ -49,13 +50,31 @@ def _context_for(topo, pipeline) -> DiagContext:
 # edge_weights_of — must mirror pipeline.forward exactly
 # ---------------------------------------------------------------------------
 
-def test_edge_weights_of_matches_pipeline_forward():
+def test_edge_weights_of_matches_pipeline_forward(monkeypatch):
     """The single most important guarantee: a diagnostic must route on the
-    same weights the pipeline routes on. Correction #9's unit-mean
-    renormalisation was applied in 2 of 6 places before this module
-    existed. Captured via a forward hook on a REAL pipeline.forward() call
-    (not a reimplementation of its steps), so this fails if edge_weights_of
-    ever drifts from what the pipeline actually computed."""
+    same weights the pipeline routes on.
+
+    Both halves of this test capture a value the pipeline itself produced
+    during a REAL pipeline(...) call — neither recomputes pipeline.py's
+    normalisation formula independently:
+
+    - `expected_raw` comes from a register_forward_hook on edge_weight_net
+      (the tensor as EdgeWeightNet produced it).
+    - `expected_normalised` comes from monkeypatching
+      diffopt.pipeline.surrogate_shortest_path to record its first
+      positional argument on its first call — that argument IS the
+      `edge_weights` tensor pipeline.forward routes on
+      (diffopt/pipeline.py's `surrogate_shortest_path(edge_weights, ...)`
+      call), captured as the pipeline actually computed it, not
+      reimplemented from the normalisation formula in a second place.
+
+    If pipeline.py:311's normalisation formula ever changes (e.g. the
+    divisor's clamp epsilon, or reintroducing the .detach() correction #9
+    exists to forbid) without a matching update to edge_weights_of, this
+    test must go red — see docs/investigations for the regression this
+    guards against, and task-16-report.md's Finding-1 fix-round evidence
+    for a demonstration that it actually does.
+    """
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
     ctx = _context_for(topo, pipeline)
@@ -67,12 +86,22 @@ def test_edge_weights_of_matches_pipeline_forward():
         captured["raw"] = output.detach().clone()
 
     handle = pipeline.edge_weight_net.register_forward_hook(hook)
+
+    original_surrogate = pipeline_mod.surrogate_shortest_path
+
+    def capturing_surrogate(edge_weights, *args, **kwargs):
+        if "normalised" not in captured:
+            captured["normalised"] = edge_weights.detach().clone()
+        return original_surrogate(edge_weights, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "surrogate_shortest_path", capturing_surrogate)
+
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
     pipeline(demands, tau=tau)
     handle.remove()
 
     expected_raw = captured["raw"].squeeze(-1)
-    expected_normalised = expected_raw / expected_raw.mean().clamp_min(1e-12)
+    expected_normalised = captured["normalised"]
 
     got_normalised = edge_weights_of(ctx, tau, normalised=True)
     got_raw = edge_weights_of(ctx, tau, normalised=False)
@@ -82,8 +111,9 @@ def test_edge_weights_of_matches_pipeline_forward():
         "output pipeline.forward actually computed"
     )
     assert torch.allclose(got_normalised, expected_normalised, atol=1e-6), (
-        "edge_weights_of(normalised=True) does not match pipeline.forward's "
-        "unit-mean-renormalised routing weight"
+        "edge_weights_of(normalised=True) does not match the exact tensor "
+        "pipeline.forward passed into surrogate_shortest_path — i.e. the "
+        "tensor the pipeline actually routed on"
     )
     # And the two must actually differ on a fixture with nonuniform weights —
     # otherwise the normalised/raw distinction this test exists to catch is
@@ -200,10 +230,28 @@ def test_demands_for_is_seed_deterministic():
 # build_context — real config, real checkpoint
 # ---------------------------------------------------------------------------
 
-def test_build_context_seeds_before_module_construction():
+def test_build_context_seeds_before_module_construction(monkeypatch):
     """Two contexts built from the same seeded config, without loading a
     checkpoint, must produce bit-identical randomly-initialised nets —
-    exactly train.py's epoch-0 reproducibility guarantee."""
+    exactly train.py's epoch-0 reproducibility guarantee.
+
+    Stubs load_qot_model the same way test_build_context_max_spans_from_
+    config_not_hardcoded does: build_context calls it unconditionally
+    (load_e2e_checkpoint only gates the *e2e* checkpoint, not the QoT one),
+    and checkpoints/best_qot.pt is gitignored — requiring it here would
+    fail this test on a clean clone rather than skip, which is what a
+    prior review round caught. This test only needs SOME QoT model to
+    exist so build_context can finish constructing the pipeline; it never
+    inspects QoT weights.
+    """
+    import scripts._common as common_mod
+    from diffopt.qot.model import SpanAttentionQoT
+
+    def fake_load_qot_model(checkpoint_path, cfg, device):
+        return SpanAttentionQoT(max_spans=cfg.get("max_spans_per_segment", 60))
+
+    monkeypatch.setattr(common_mod, "load_qot_model", fake_load_qot_model)
+
     cfg = yaml.safe_load(_SMALL_TEST_IND132.read_text())
 
     ctx_a = build_context(cfg, load_e2e_checkpoint=False)

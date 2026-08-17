@@ -263,10 +263,14 @@ def edge_weights_of(ctx: DiagContext, tau: float, *, normalised: bool = True) ->
     diagnose_pipeline_walkthrough.py).
 
     `normalised=False` returns EdgeWeightNet's raw pre-normalisation
-    Softplus output — only for diagnostics explicitly about the raw/
-    normalised distinction itself (e.g. diagnose_edge_weight_gradient.py's
-    "D" weight-distribution report, which shows raw and normalised side by
-    side).
+    Softplus output. No migrated script currently passes `normalised=False`
+    — diagnose_edge_weight_gradient.py's "D" report compares raw vs
+    normalised statistics, but gets its raw values from its own
+    `register_forward_hook` (needed anyway for Check B/C/F's live gradient
+    decomposition below it), not from this function. This parameter exists
+    for the diagnostic that wants a raw, no-grad, forward-value-only
+    snapshot without setting up a hook — describe it accurately if a future
+    script ends up being that caller.
 
     This whole function runs under `torch.no_grad()` and returns a
     detached, forward-value-only snapshot either way — it is not a

@@ -18,7 +18,11 @@ Checks two things the smoke-run output does not reveal:
 
 Usage:
     conda activate diffopt
-    python scripts/diagnose_surrogate.py --config configs/experiment/small_test.yaml
+    python scripts/diagnose_surrogate.py --config configs/experiment/small_test_ind132.yaml
+
+--config now defaults to configs/experiment/small_test_ind132.yaml (via
+add_common_args, matching every other migrated script) rather than being
+required with no default — pass --config explicitly to use a different one.
 """
 from __future__ import annotations
 
@@ -46,7 +50,8 @@ def main() -> None:
     # already matches this script's own historical default.
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
     ctx = build_context(cfg, load_e2e_checkpoint=bool(args.checkpoint), checkpoint_path=args.checkpoint)
     pipeline = ctx.pipeline
     topology = ctx.topology

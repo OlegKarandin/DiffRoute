@@ -86,7 +86,8 @@ def main() -> None:
     add_common_args(ap, with_demands=False)
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
     t_cfg, p_cfg = cfg["training"], cfg["pipeline"]
 
     # ---- untrained context (training's actual starting point) --------------
