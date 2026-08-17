@@ -123,7 +123,6 @@ def main() -> None:
     lambda_min: float = t_cfg["vlastelica_lambda_min"]
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
     epochs: int = t_cfg["epochs_e2e"]
-    checkpoint_interval: int = t_cfg.get("checkpoint_interval", 10)
 
     log_dir = Path(cfg.get("log_dir", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -231,7 +230,8 @@ def main() -> None:
                     f"| tau={tau:.3f} | t_sm={soft_max_temp:.3f} | λ={vlastelica_lambda:.3f}"
                 )
 
-            if epoch % checkpoint_interval == 0 and loss.item() < best_loss:
+            improved = loss.item() < best_loss
+            if improved:
                 best_loss = loss.item()
                 ckpt_path = checkpoint_dir / "best_e2e.pt"
                 torch.save(
