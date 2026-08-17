@@ -820,7 +820,22 @@ def test_edge_weights_do_not_collapse_over_training():
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
     mod_cfg = make_mod_config()
-    optimizer = torch.optim.Adam(pipeline.edge_weight_net.parameters(), lr=1e-3)
+    # lr=0.1 / 200 steps *explodes* the raw median weight ~150x even on the
+    # healthy, committed pipeline.py on this 5-edge toy fixture -- the
+    # fixture is small enough that an aggressive optimizer setting
+    # overwhelms any signal from the correction-#9 fix either way. Swept
+    # lr in {0.01, 0.02, 0.03, 0.05} x steps in {50, 100, 200}: lr=0.01/50
+    # steps is the combination where the healthy pipeline's raw median
+    # weight stays close to its starting value (ratio ~1.01, comfortably
+    # inside the 2x band below), while reverting correction #9's
+    # divisor-detach fix in pipeline.py (`.mean().clamp_min(1e-12)` ->
+    # `.mean().clamp_min(1e-12).detach()`) collapses the same measurement
+    # by ~20 orders of magnitude (7.1e-01 -> 3.5e-20) in the same 50 steps
+    # -- an unambiguous discriminator, not a coin flip. Verified by hand:
+    # mutate pipeline.py that one line, `pytest -k collapse` fails with
+    # exactly that number, `git checkout -- diffopt/pipeline.py`, passes
+    # again.
+    optimizer = torch.optim.Adam(pipeline.edge_weight_net.parameters(), lr=0.01)
 
     demands = [
         Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
@@ -842,7 +857,7 @@ def test_edge_weights_do_not_collapse_over_training():
 
     before = median_raw_weight()
 
-    for _ in range(10):
+    for _ in range(50):
         optimizer.zero_grad()
         path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
         loss, _ = compute_loss(
@@ -858,10 +873,10 @@ def test_edge_weights_do_not_collapse_over_training():
     after = median_raw_weight()
 
     assert before > 0.0, "degenerate fixture: initial median weight is zero"
-    assert after > before / 10.0, (
+    assert after > before / 2.0, (
         f"median raw edge weight collapsed {before:.6e} -> {after:.6e} "
-        f"({before / max(after, 1e-30):.2e}x) over 10 epochs"
+        f"({before / max(after, 1e-30):.2e}x) over 50 steps at lr=0.01"
     )
-    assert after < before * 10.0, (
+    assert after < before * 2.0, (
         f"median raw edge weight exploded {before:.6e} -> {after:.6e}"
     )

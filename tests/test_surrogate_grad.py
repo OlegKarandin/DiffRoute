@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 import torch
 
-from diffopt.routing.shortest_path import dijkstra, batched_dijkstra
 from diffopt.routing.surrogate import surrogate_shortest_path
 
 

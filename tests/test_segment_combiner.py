@@ -270,3 +270,67 @@ def test_numerical_stability():
             f"Got non-finite result {result.item()} for "
             f"gsnrs={[g.item() for g in gsnrs]}, p={[p.item() for p in probs]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: accumulation precision — CLAUDE.md: "accumulates noise internally
+# in float64 and casts back to float32 on return. Do not move this to
+# float32 — overflow on long noisy paths is real."
+# ---------------------------------------------------------------------------
+
+def test_accumulation_is_float64_not_float32():
+    """CLAUDE.md: 'accumulates noise internally in float64 and casts back
+    to float32 on return. Do not move this to float32 — overflow on long
+    noisy paths is real.'
+
+    A 40-segment chain (the brief's original guess) does not actually
+    discriminate here: per-segment linear noise is bounded to
+    [10**-3.5, 10**0.5] by the [-5, 35] dB clamp, so accumulation is at
+    most O(N) — nowhere near float32's overflow point — and float32's
+    compounding rounding error over only 40 additions is far below any
+    reasonable dB tolerance (measured ~1e-7 dB with float64 forced down
+    to float32, no distinguishable divergence at N=40). Empirically,
+    forcing float32 needs a long chain (thousands of additions, verified
+    at N=8000 giving ~5e-4 dB divergence from the float64 answer,
+    swamping the ~2e-7 dB the real float64 path measures) before
+    compounding rounding error becomes visible in the output dB value.
+
+    One -5 dB (max per-segment noise) segment followed by 8000 35 dB
+    (min per-segment noise) segments, no regeneration anywhere (p=0), so
+    noise is a plain running sum the whole way — the exact scenario the
+    float64-accumulation choice exists to protect.
+    """
+    combiner = SegmentCombiner()
+    n_segments = 8000
+    gsnrs = [t(-5.0)] + [t(35.0) for _ in range(n_segments)]
+    regen_probs = [t(0.0) for _ in range(n_segments)]
+
+    result = combiner(gsnrs, regen_probs, temperature=0.01)
+
+    total_noise = 10 ** (5.0 / 10.0) + n_segments * 10 ** (-35.0 / 10.0)
+    expected = -10.0 * math.log10(total_noise)
+    assert result.item() == pytest.approx(expected, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Test 9: GSNR clamp — CLAUDE.md: "GSNR inputs are clamped to [-5, 35] dB
+# before conversion to linear noise. This is intentional."
+# ---------------------------------------------------------------------------
+
+def test_gsnr_inputs_are_clamped_to_the_documented_range():
+    """Values far outside [-5, 35] dB must behave identically to the
+    clamped boundary values — not blow up (e.g. 10**(50/10) in linear
+    noise) or otherwise diverge."""
+    combiner = SegmentCombiner()
+
+    wild = combiner(
+        [t(-50.0), t(80.0)],
+        [t(0.0)],
+        temperature=0.01,
+    )
+    clamped = combiner(
+        [t(-5.0), t(35.0)],
+        [t(0.0)],
+        temperature=0.01,
+    )
+    assert wild.item() == pytest.approx(clamped.item(), abs=1e-4)
