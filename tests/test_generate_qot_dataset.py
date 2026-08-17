@@ -12,15 +12,10 @@ tests tested exactly that removed mechanism and have been replaced below.
 from __future__ import annotations
 
 import random
-import sys
-from pathlib import Path
 
 import networkx as nx
 import pandas as pd
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "data"))
 
 from diffopt.topology import Edge
 from generate_qot_dataset import (
@@ -80,14 +75,11 @@ def _chain_edge_lookup(path: list, lengths_km: list) -> dict:
 
 def test_splits_at_first_candidate_reaching_target_reach():
     """path=[0,1,2,3,4], edges each 100km, regen candidates at 1,2,3, fixed
-    target reach 150km. Accumulated distance reaches 150 only once it hits
-    node 2 (200km >= 150) — node 1 (100km) is a candidate but not yet at
-    reach, so no split there. After splitting at 2, the second segment
-    covers only 2 more edges (200km again reaches the resampled 150km
-    target at node... wait, only one edge left after the split point at
-    node 2 in a 4-edge path would be nodes 2-3-4, so the split target is
-    reached again only at the final edge, which is excluded from splitting
-    (never split at the destination) -> single trailing segment."""
+    target reach 150km. Node 1 (100km accumulated) is a candidate but hasn't
+    reached the 150km target, so the walk continues to node 2 (200km >=
+    150km) and splits there. The remaining sub-path 2-3-4 never re-reaches
+    a fresh 150km target before hitting the destination, so it stays a
+    single trailing segment: segments == [[0, 1, 2], [2, 3, 4]]."""
     path = [0, 1, 2, 3, 4]
     lookup = _chain_edge_lookup(path, [100.0, 100.0, 100.0, 100.0])
     rng = _FixedUniformRng(fixed_uniform=150.0)

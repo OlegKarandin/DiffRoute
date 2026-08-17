@@ -101,7 +101,7 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = log_dir / "train_log.csv"
-    val_rmse_target = cfg.get("val_rmse_target", 0.5)
+    val_rmse_target = cfg.get("val_rmse_target", 0.25)
     best_rmse = float("inf")
 
     with open(log_path, "w", newline="") as f:

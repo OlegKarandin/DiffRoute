@@ -140,15 +140,15 @@ def test_forward_pass_shapes():
         Demand(id=1, src=0, dst=3, bitrate_gbps=400.0),
         Demand(id=2, src=1, dst=4, bitrate_gbps=400.0),
     ]
-    path_costs, gsnr_preds, path_indicators, regen_probs = pipeline(demands)
+    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline(demands)
 
     assert len(gsnr_preds) == 3
-    assert len(path_costs) == 3
+    assert len(path_noise_costs) == 3
     assert len(path_indicators) == 3
 
     for did in [0, 1, 2]:
         assert gsnr_preds[did].shape == torch.Size([])   # scalar
-        assert path_costs[did].shape == torch.Size([])   # scalar
+        assert path_noise_costs[did].shape == torch.Size([])   # scalar
         assert path_indicators[did].shape == torch.Size([len(topo.undirected_edges)])
 
     assert regen_probs.shape == torch.Size([topo.num_nodes])
@@ -164,11 +164,11 @@ def test_gradient_flow_edge_weight_net():
     mod_cfg = make_mod_config()
 
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_noise_costs=path_costs,
+        path_noise_costs=path_noise_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -192,11 +192,11 @@ def test_gradient_flow_regen_logits():
 
     # Demand 0→4 routes through node 3 (regen candidate) → boundary prob used
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_noise_costs=path_costs,
+        path_noise_costs=path_noise_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -218,11 +218,11 @@ def test_qot_frozen():
     mod_cfg = make_mod_config()
 
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_costs, gsnr_preds, _, regen_probs = pipeline(demands)
+    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_noise_costs=path_costs,
+        path_noise_costs=path_noise_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -247,7 +247,7 @@ def test_single_segment_identity():
     pipeline = make_pipeline(topo)
 
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
-    path_costs, gsnr_preds, path_indicators, regen_probs = pipeline([demand])
+    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline([demand])
 
     # Find which edges are on the path
     indicator = path_indicators[0].detach()
@@ -297,11 +297,11 @@ def test_loss_backward_no_nan():
         Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
         Demand(id=1, src=0, dst=3, bitrate_gbps=400.0),
     ]
-    path_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_noise_costs=path_costs,
+        path_noise_costs=path_noise_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -372,7 +372,7 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
     )
 
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
-    path_costs, gsnr_preds, path_indicators, regen_probs = pipeline([demand], lambda_=5.0)
+    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline([demand], lambda_=5.0)
 
     pi = path_indicators[0]
     pi.retain_grad()
@@ -385,7 +385,7 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
     edge_weights = pipeline.edge_weight_net(edge_feats).squeeze(-1).detach()
 
     loss, _ = compute_loss(
-        gsnr_preds=gsnr_preds, path_noise_costs=path_costs, demands=[demand],
+        gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
         regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
     )
     loss.backward()
@@ -420,9 +420,9 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
 
     def run(pipeline: DiffONetPipeline) -> torch.Tensor:
-        path_costs, gsnr_preds, _, regen_probs = pipeline([demand], lambda_=5.0)
+        path_noise_costs, gsnr_preds, _, regen_probs = pipeline([demand], lambda_=5.0)
         loss, _ = compute_loss(
-            gsnr_preds=gsnr_preds, path_noise_costs=path_costs, demands=[demand],
+            gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
             regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
         )
         loss.backward()
@@ -651,12 +651,12 @@ def test_scale_direction_gradient_is_zero():
 
     handle = pipeline.edge_weight_net.register_forward_hook(hook)
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
     handle.remove()
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
-        path_noise_costs=path_costs,
+        path_noise_costs=path_noise_costs,
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
@@ -695,12 +695,12 @@ def test_total_loss_invariant_to_edge_weight_scale():
         inner = pipeline.edge_weight_net
         pipeline.edge_weight_net = _ScaledNet(inner, scale)
         try:
-            path_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
+            path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
                 demands, lambda_=5.0
             )
             loss, _ = compute_loss(
                 gsnr_preds=gsnr_preds,
-                path_noise_costs=path_costs,
+                path_noise_costs=path_noise_costs,
                 demands=demands,
                 regen_probs=regen_probs,
                 modulation_config=mod_cfg,

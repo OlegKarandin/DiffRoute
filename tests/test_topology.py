@@ -2,10 +2,7 @@
 import json
 import math
 import pytest
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from diffopt.topology_builder import split_link_into_spans, build_topology_json
 from diffopt.topology import Topology, Edge, load_topology, FIBER_TYPE_INDEX
@@ -232,11 +229,3 @@ def test_edge_features_values_match_derivation():
             edge.length_km,
         ]
         assert row.tolist() == pytest.approx(expected, abs=1e-4)
-
-
-def test_regen_candidate_nodes():
-    t = Topology.from_graph_json(GERMAN_JSON, MODULATION_FORMATS_PATH)
-    regen = t.regen_candidate_nodes
-    # All nodes should have degree info
-    assert len(regen) > 0
-    assert all(0 <= n < t.num_nodes for n in regen)

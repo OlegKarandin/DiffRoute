@@ -4,22 +4,8 @@ import pytest
 
 from diffopt.demands import Demand
 from diffopt.loss import compute_loss
-from diffopt.modulation import ModulationConfig
 
-
-def make_mod_config() -> ModulationConfig:
-    """Minimal ModulationConfig with a single 400 Gbps format.
-
-    Copied from tests/test_pipeline.py's make_mod_config() helper so this
-    file's fixtures match the rest of the suite.
-    """
-    return ModulationConfig(
-        channel_spacing_ghz=100.0,
-        symbol_rate_gbaud=64.0,
-        num_channels_cband=48,
-        cut_channel_index=24,
-        formats=[{"bitrate_gbps": 400, "snr_threshold_db": 20.0}],
-    )
+from tests.test_pipeline import make_mod_config
 
 
 @pytest.fixture
