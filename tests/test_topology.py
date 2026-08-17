@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from diffopt.topology_builder import split_link_into_spans, parse_dat_file, build_topology_json
+from diffopt.topology_builder import split_link_into_spans, build_topology_json
 from diffopt.topology import Topology, Edge, load_topology, FIBER_TYPE_INDEX
 
 from multilayer_optical_network.model.optical_network import OpticalNetworkModel
@@ -44,25 +44,52 @@ def test_split_353km_four_spans():
     assert all(s >= 20.0 for s in spans)
 
 
-def test_all_german_spans_ge_20km():
-    """All spans from German topology must be >= 20 km."""
-    base = Path(__file__).parent.parent
-    _, edges = parse_dat_file(str(base / "german_17.dat"))
-    for src, dst, length in edges:
-        spans = split_link_into_spans(length)
+ALL_TOPOLOGY_JSONS = sorted((BASE / "configs/topology").glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "topo_json", ALL_TOPOLOGY_JSONS, ids=lambda p: p.stem
+)
+def test_all_committed_spans_ge_20km(topo_json):
+    """Every span produced by *splitting* a link must be >= 20 km.
+
+    Reads the committed JSON rather than the .dat sources: the .dat files are
+    not distributed with the repo (see configs/topology/README.md), and the
+    JSON is the artifact the pipeline actually consumes.
+
+    Single-span (num_spans == 1) edges are exempt: the invariant is about
+    split_link_into_spans() never leaving a short remainder when it divides a
+    link into multiple pieces (CLAUDE.md, "Topology" constraints). A link
+    that is itself shorter than 20 km isn't split at all -- it is used as a
+    single whole-length span -- so its length is a physical property of the
+    topology, not something the splitting algorithm chose. ind_132 (1 edge,
+    19.0 km) and jp_70 (7 edges, 8.0-19.0 km) both have real single-span
+    edges below 20 km; german_17 and eu_19 do not, which is why this case
+    was never exercised before ind_132/jp_70 got test coverage.
+    """
+    data = json.loads(topo_json.read_text())
+    assert data["edges"], f"{topo_json.name} has no edges"
+    for edge in data["edges"]:
+        if edge["num_spans"] <= 1:
+            continue
+        spans = edge["span_lengths_km"]
         assert all(s >= 20.0 for s in spans), (
-            f"Edge {src}-{dst} ({length} km): span < 20 km: {spans}"
+            f"{topo_json.name} edge {edge['src']}-{edge['dst']} "
+            f"({edge['length_km']} km): span < 20 km: {spans}"
         )
 
 
-def test_all_eu_spans_ge_20km():
-    """All spans from EU topology must be >= 20 km."""
-    base = Path(__file__).parent.parent
-    _, edges = parse_dat_file(str(base / "EU_19.dat"))
-    for src, dst, length in edges:
-        spans = split_link_into_spans(length)
-        assert all(s >= 20.0 for s in spans), (
-            f"Edge {src}-{dst} ({length} km): span < 20 km: {spans}"
+@pytest.mark.parametrize(
+    "topo_json", ALL_TOPOLOGY_JSONS, ids=lambda p: p.stem
+)
+def test_committed_spans_sum_to_link_length(topo_json):
+    """Span lengths must sum to the link length within 0.01 km."""
+    data = json.loads(topo_json.read_text())
+    for edge in data["edges"]:
+        total = sum(edge["span_lengths_km"])
+        assert abs(total - edge["length_km"]) < 0.01, (
+            f"{topo_json.name} edge {edge['src']}-{edge['dst']}: "
+            f"spans sum to {total}, expected {edge['length_km']}"
         )
 
 

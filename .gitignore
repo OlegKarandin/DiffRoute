@@ -34,3 +34,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Topology sources — third-party, not redistributed (see configs/topology/README.md)
+*.dat
