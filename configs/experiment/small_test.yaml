@@ -48,7 +48,10 @@ val_rmse_target: 0.75
 dataset_dir: data/datasets/german_17
 
 # Phase 1c: end-to-end pipeline
-qot_checkpoint: checkpoints/best_qot.pt
+# This config trains its own german_17 QoT model (unlike small_test_ind132.yaml
+# and small_test_jp70.yaml, which reuse base.yaml's ind_132-trained model), so
+# qot_checkpoint must track checkpoint_dir to load the trained model.
+qot_checkpoint: checkpoints/german_17/best_qot.pt
 
 pipeline:
   lambda_regen: 1.0
