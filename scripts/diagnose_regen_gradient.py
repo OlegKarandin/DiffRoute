@@ -103,7 +103,7 @@ def main() -> None:
         print(f"  grad_feasibility : sum={g_feas.sum():+.4f}  min={g_feas.min():+.4f}  "
               f"max={g_feas.max():+.4f}")
         print(f"  grad_regen_count : sum={g_regen.sum():+.4f}  per-node={g_regen.max():+.4f}")
-        print(f"  grad_path_cost   : sum={g_cost.sum():+.4f}  |max|={g_cost.abs().max():+.4f}")
+        print(f"  grad_path_noise  : sum={g_cost.sum():+.4f}  |max|={g_cost.abs().max():+.4f}")
         print(f"  grad_TOTAL       : min={g_tot.min():+.4f}  max={g_tot.max():+.4f}  "
               f"nodes wanting MORE regen (grad<0): {climbing}/{topology.num_nodes}")
         if n_touched:

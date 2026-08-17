@@ -1,6 +1,9 @@
 """Does unconditional segmentation vanish at p=0?
 
-Option C's correctness rests on:  cut + blend at p=0  ==  never cut.
+The pipeline always segments a path at every regen-candidate node and lets
+SegmentCombiner blend across the boundaries, rather than special-casing
+"don't cut here" for a low regen probability. That design's correctness
+rests on the identity  cut + blend at p=0  ==  never cut.
 Test it directly: for real paths short enough to fit in one QoT call
 (<= max_spans), compare
     (i)  QoT(whole path as ONE segment)                  <- ground truth

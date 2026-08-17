@@ -10,11 +10,16 @@ Checks two things the smoke-run output does not reveal:
 
 2. Hamming distance in the Vlastelica backward
    For the surrogate to provide routing-change signal, the perturbed solve
-   must find a DIFFERENT path. If grad_output = ∂L/∂path_indicator is
-   proportional to edge_weights (e.g., only from path_cost), then
-   c_target = w + λ * g = w * (1 + λ * λ_cost), which is a uniform scaling
-   that preserves the shortest-path ordering — Hamming distance is zero and
-   the surrogate gradient is zero.
+   must find a DIFFERENT path. Since correction #6, grad_output =
+   ∂L/∂path_indicator is dominated by the straight-through per-edge
+   ASE-noise proxy (threshold-gated, regen-modulated), not by edge_weights;
+   and since correction #9, the path_noise_cost term it is added to is
+   denominated in edge_ase_noise rather than edge_weights. Neither term is
+   proportional to edge_weights, so a zero Hamming distance here no longer
+   reflects the old uniform-scaling degeneracy — it would mean the
+   ASE-noise-driven perturbation happens to leave the shortest path
+   unchanged for every demand, which is worth investigating on its own
+   (see the report this script prints when that happens).
 
 Usage:
     conda activate diffopt
@@ -190,20 +195,16 @@ def main() -> None:
         print("  WARNING: Hamming distance is 0 for ALL demands.")
         print("  The Vlastelica backward is finding the same path after perturbation.")
         print()
-        print("  Root cause: ∂L/∂path_indicator = λ_cost * edge_weights.")
-        print("  The perturbation c_target = w + λ*(λ_cost*w) = w*(1 + λ*λ_cost)")
-        print("  is a uniform scaling of all edge costs, which preserves the")
-        print("  shortest-path ordering. The surrogate gradient to EdgeWeightNet")
-        print("  is therefore zero — only the direct ∂(p·w)/∂w = p term is active.")
-        print()
-        print("  EdgeWeightNet still receives gradient (from the direct path term),")
-        print("  but it only learns 'reduce weights of currently-selected edges',")
-        print("  NOT 'change routing to improve feasibility'.")
-        print()
-        print("  Fix: ∂L/∂path_indicator needs per-edge differentiation.")
-        print("  Option A: per-edge GSNR proxy (requires E QoT calls per demand).")
-        print("  Option B: segment-level differentiation by making boundary_nodes")
-        print("            a soft function of path_indicator instead of a hard detach.")
+        print("  This is no longer explained by grad_output being proportional to")
+        print("  edge_weights: since correction #6, grad_output is dominated by the")
+        print("  straight-through per-edge ASE-noise proxy, and since correction #9")
+        print("  path_noise_cost is denominated in edge_ase_noise, not edge_weights.")
+        print("  Both terms already differentiate per edge, so a zero Hamming")
+        print("  distance here means the ASE-noise-driven perturbation happens to")
+        print("  leave every demand's shortest path unchanged on this topology --")
+        print("  check whether edge_ase_noise actually varies across its edges")
+        print("  (CLAUDE.md: 'on a topology whose edges are physically identical,")
+        print("  the STE contributes no within-segment routing signal').")
 
     # ================================================================ REPORT 3
     print()

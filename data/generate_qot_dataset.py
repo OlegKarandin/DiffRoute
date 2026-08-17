@@ -118,8 +118,7 @@ def split_path_into_segments(
     Real coherent regeneration reach is bitrate-dependent, not a fixed node
     count. Measured directly against this project's own
     configs/modulation_formats.yaml via real GNPy on a synthetic 80km-span
-    chain (see scratch/reach_experiment.py from the design discussion):
-    reach ranges from ~320km (800 Gbps, 15.1dB threshold) to beyond 3600km
+    chain: reach ranges from ~320km (800 Gbps, 15.1dB threshold) to beyond 3600km
     (300 Gbps, 4.8dB threshold) at full (48-channel) loading. `min_reach_km`/
     `max_reach_km` default to that measured range with a small margin
     (250-3700km), spanning the full set of `bitrate_options` this project
@@ -225,8 +224,8 @@ def generate_sample(
 
         # Simulate GSNR via real GNPy (diffopt.qot.optical_bridge). `mode_id`
         # is fixed once per run (see main()) — GSNR is mode-invariant given
-        # the shared 87.5GBaud/0.15 roll-off across all formats, see Task 4's
-        # test_optical_bridge.py mode-invariance test.
+        # the shared 87.5GBaud/0.15 roll-off across all formats, see
+        # tests/test_optical_bridge.py's mode-invariance test.
         oms_sequence = oms_sequence_for_node_path(topology, seg_path)
         gsnr_db = segment_gsnr_db(topology, oms_sequence, mode_id, n_channels)
 
@@ -352,9 +351,9 @@ def main():
     regen_candidates = topology.regen_candidate_nodes
 
     # Fixed once for the whole run: GSNR is mode-invariant given the shared
-    # 87.5GBaud/0.15 roll-off across all formats — see Task 4's
-    # test_optical_bridge.py mode-invariance test. Resampling per segment
-    # would just add noise-free-but-pointless variance to the dataset.
+    # 87.5GBaud/0.15 roll-off across all formats — see
+    # tests/test_optical_bridge.py's mode-invariance test. Resampling per
+    # segment would just add noise-free-but-pointless variance to the dataset.
     mode_id = topology.modes.list()[0].id
 
     max_spans = cfg.get("max_spans_per_segment", 60)

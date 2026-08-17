@@ -1,4 +1,4 @@
-"""Does ind_132 actually need regenerators?
+"""Does this topology actually need regenerators?
 
 Routes every demand on the shortest-by-km path (physical baseline, no
 dependence on EdgeWeightNet init — this deliberately does NOT use
@@ -19,6 +19,7 @@ Usage:
     python scripts/diagnose_regen_necessity.py --config configs/experiment/base.yaml
 """
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -71,7 +72,8 @@ with torch.no_grad():
         rows.append((km, nsp, len(segs), d.bitrate_gbps, thr,
                      out["p0"], out["p05"], out["p1"]))
 
-print(f"{len(rows)} demands (seed={args.seed}), shortest-by-km routing, ind_132\n")
+topo_name = Path(cfg["topology"]).stem
+print(f"{len(rows)} demands (seed={args.seed}), shortest-by-km routing, {topo_name}\n")
 buckets = [(0, 500), (500, 1000), (1000, 2000), (2000, 3000), (3000, 4000), (4000, 10000)]
 print(f"{'path km':>13} {'n':>4} {'segs':>5} {'spans':>6} | "
       f"{'GSNR p=0':>9} {'p=0.5':>7} {'p=1':>7} | {'infeasible @ p=0':>17} {'@ p=1':>7}")

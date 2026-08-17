@@ -35,7 +35,8 @@ def compute_loss(
         modulation_config: Bitrate → SNR threshold lookup.
         lambda_regen:     Weight on regenerator count penalty.
         lambda_infeasible: Weight on GSNR feasibility shortfall.
-        lambda_cost:      Weight on path noise cost; enables EdgeWeightNet gradient.
+        lambda_cost:      Weight on the ASE-denominated path-noise regulariser. Not the
+                          primary routing signal -- the STE in pipeline.forward supplies that.
 
     Returns:
         (total_loss, metrics_dict)

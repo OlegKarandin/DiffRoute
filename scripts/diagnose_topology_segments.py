@@ -1,6 +1,13 @@
 """Compare the per-segment noise scale across topologies.
 
-Answers: was t=0.01 ever right, and if so for which topology?
+The temperature was never the right lever (CLAUDE.md correction #8) — no
+fixed t makes the pre-fix absolute soft_max floor safe across topologies,
+because per-segment noise itself varies by topology. This script measures
+that per-topology noise scale directly, and reports what the old absolute
+floor (t*ln2) would have inverted at a couple of reference temperatures, for
+comparison against the current scale-normalised soft_max (see
+scripts/diagnose_segment_noise_scale.py, which does the identical
+old-floor-vs-current comparison for a single topology in more detail).
 
 Every other config key (QoT checkpoint, pipeline params, seed, ...) comes
 from --config; only `topology` is overridden per iteration, since comparing
@@ -64,9 +71,10 @@ for topo_name in ["german_17", "ind_132"]:
           f"median={float(torch.tensor(seg_len).median()):.0f}")
     print(f"  segment GSNR dB: median={float(g.median()):6.2f}  p5={float(torch.quantile(g,0.05)):.2f}")
     print(f"  segment NOISE  : median={med_noise:.5f}")
+    print(f"  What the OLD absolute floor (t*ln2) would have done on this topology:")
     for t in [0.5, 0.01]:
         floor = t * math.log(2)
         frac = float((noise < floor).float().mean())
         print(f"    t={t:<5}: floor={floor:.5f} = {floor/med_noise:7.2f}x median noise "
-              f"-> {frac*100:5.1f}% of segments INVERTED")
+              f"-> {frac*100:5.1f}% of segments where 'regen helps' WOULD HAVE BEEN INVERTED")
     print()

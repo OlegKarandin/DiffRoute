@@ -29,11 +29,12 @@ components and runs five checks that discriminate between the candidate
 mechanisms:
 
   A. Scale degeneracy       — is "shrink all weights" a free descent direction?
-  B. Gradient decomposition — does path_cost dominate feasibility, and does
+  B. Gradient decomposition — does path_noise dominate feasibility, and does
                               feasibility reach edge_weights at all?
-  C. Direct vs surrogate    — is path_cost's gradient the plain positive
-                              d/dw of (path_indicator . w), or does the
-                              Vlastelica backward contribute?
+  C. Direct vs surrogate    — post-fix, path_noise is denominated in the fixed
+                              edge_ase_noise buffer, so its direct d/d(edge_weights)
+                              is identically zero; does all of its gradient now
+                              arrive via the Vlastelica surrogate instead?
   D. Collapse vs no-structure — did training destroy a length-correlation
                               that existed at init, or was there never one?
   E. Barrier routing        — are detours caused by avoiding a few surviving
@@ -248,7 +249,7 @@ def main() -> None:
             print(f"  {nm:<26} L1={g.abs().sum():.4e}  max|g|={g.abs().max():.4e}  "
                   f"nonzero={nz}/{n_edges}  sum={g.sum():+.4e}")
 
-        gstat("grad path_cost  (total)", g_cost)
+        gstat("grad path_noise (total)", g_cost)
         gstat("  |- direct d/dw", g_cost_direct)
         gstat("  |- via surrogate", g_cost_surrogate)
         gstat("grad feasibility (STE)", g_feas)
@@ -256,22 +257,27 @@ def main() -> None:
         gstat("grad TOTAL", g_tot)
 
         l1c, l1f = g_cost.abs().sum().item(), g_feas.abs().sum().item()
-        print(f"\n  ratio  L1(path_cost) / L1(feasibility) = "
+        print(f"\n  ratio  L1(path_noise) / L1(feasibility) = "
               f"{(l1c / l1f) if l1f > 0 else float('inf'):.3f}")
         pos_frac = float((g_cost_direct > 0).float().sum() / max(1, int((usage > 0).sum())))
-        print(f"  path_cost's direct component is >=0 on every edge "
+        print(f"  path_noise's direct component is >=0 on every edge "
               f"(pure shrink): {bool((g_cost_direct >= 0).all())}")
         print(f"  edges used by >=1 demand: {int((usage > 0).sum())}/{n_edges}"
               f"   (pos_frac={pos_frac:.2f})")
 
         # G. Scale-direction derivative: dL(c*w)/dc at c=1, which by the chain
-        # rule is sum_e g_e * w_e. This is the exact quantity that drives the
-        # collapse. For a degree-1 homogeneous term (path_cost) Euler's theorem
-        # gives dL/dc == L itself; for a scale-invariant term (feasibility,
-        # regen) it is 0 exactly, since Dijkstra's argmin ignores global scale.
+        # rule is sum_e g_e * w_e. Pre-fix, this was the exact quantity that
+        # drove the collapse: path_cost (the pre-fix name for this term) was
+        # degree-1 homogeneous in edge_weights, so Euler's theorem gave
+        # dL/dc == L itself -- a permanent positive shrink pressure -- while
+        # feasibility/regen were already scale-invariant (Dijkstra's argmin
+        # ignores global scale, so dL/dc == 0 for those).
+        # Post-fix, path_noise is denominated in the fixed edge_ase_noise
+        # buffer, so it is degree-0 in edge_weights too: dL/dc should now
+        # read ~0 for every term, same as feasibility/regen always did.
         wv_ = w_t_norm
         print("\n  G. scale-direction derivative  dL(c*w)/dc |_(c=1) = sum_e g_e*w_e:")
-        for nm, g, ref in [("path_cost", g_cost, L_cost.item()),
+        for nm, g, ref in [("path_noise", g_cost, L_cost.item()),
                            ("feasibility", g_feas, None),
                            ("regen_count", g_regen, None),
                            ("TOTAL", g_tot, None)]:

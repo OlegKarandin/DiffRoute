@@ -1,6 +1,12 @@
-"""Follow-up #2 (open_followups.md): is EdgeWeightNet routing ~1.8x longer
-than the shortest-by-km path, now that the soft_max scale-normalisation fix
-(8e96307) has un-confounded the training signal?
+"""Regression check: does EdgeWeightNet route close to the shortest-by-km
+path?
+
+Pre-correction-#9, the edge-weight scale collapse made trained routes run
+~2.1x longer than shortest-by-km (docs/investigations/edge_weight_scale_collapse.md).
+The fix (unit-mean weight renormalisation + ASE-denominated path-noise loss)
+brought that down to ~1.03x on a 60-epoch small_test_ind132 retrain. This
+script re-measures the ratio against whatever checkpoint is passed, so it
+doubles as the regression check for a repeat of that collapse.
 
 Loads a trained e2e checkpoint (default: checkpoints/e2e_ind132/best_e2e.pt)
 and, on the exact demand set the training run used for its final epoch
