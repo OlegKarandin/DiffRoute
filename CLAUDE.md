@@ -8,7 +8,7 @@ Differentiable optical network design: jointly optimize **routing** and **regene
 
 ```bash
 # Activate environment (all commands assume this)
-conda activate diffopt   # Python 3.11, at /c/Users/olegk/miniconda3/envs/diffopt/
+conda activate diffopt   # Python 3.11
 
 # Install / reinstall after pyproject changes
 pip install -e ".[dev]"
@@ -140,7 +140,7 @@ All 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 tota
 ## Corrections made during Phase 1a
 
 1. **`pyproject.toml` build backend**: generated as `setuptools.backends.legacy:build` (doesn't exist), corrected to `setuptools.build_meta`.
-2. **Channel grid**: the old `IMPLEMENTATION_PLAN_PHASE1A.md` specified 96 channels on a 50 GHz ITU grid. The final plan and the actual modulation format data use **48 channels on a 100 GHz grid**. The code uses 48/100 GHz everywhere.
+2. **Channel grid**: an early draft plan specified 96 channels on a 50 GHz ITU grid. The final plan and the actual modulation format data use **48 channels on a 100 GHz grid**. The code uses 48/100 GHz everywhere.
 3. **Topology file names**: old plan used `nobel_germany.json` / `european.json`; actual files are `german_17.json` / `eu_19.json` matching the `.dat` source filenames.
 
 ## Architectural constraints — Phase 1c additions
@@ -161,7 +161,7 @@ All 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 tota
 
 ## Corrections made during Phase 1b
 
-1. **Vlastelica perturbation sign**: `DIFFOPT_PROJECT_SPEC.md §4` wrote `c_target = w - λ * (∂L/∂p*)`. This is wrong. The correct formula is `c_target = w + λ * grad_output` because the paper's ŷ is the negative gradient. Using minus gives zero surrogate gradient on every call.
+1. **Vlastelica perturbation sign**: the original project spec (§4) wrote `c_target = w - λ * (∂L/∂p*)`. This is wrong. The correct formula is `c_target = w + λ * grad_output` because the paper's ŷ is the negative gradient. Using minus gives zero surrogate gradient on every call.
 2. **Dijkstra in backward pass**: The spec's `shortest_path.py` description did not mention negative weights. The Vlastelica backward produces perturbed weights that can be negative; Dijkstra hangs on these. SPFA was added to handle this.
 3. **`soft_max` scale sensitivity**: The spec showed `temperature=0.1` as a default example. At that temperature, `soft_max` still overestimates `max(a,b)` by up to `0.07` for noise values ~0.1–0.3, which is enough to break the "regen helps" invariant. Tests that verify physical correctness (monotonicity, gradient sign) use `temperature=0.01`. **Superseded by Phase 1c correction #8**: the "~0.1–0.3" noise range quoted here is the *unit-test fixture* range (5–10 dB segments), not the production one. Real segments are ~26 dB → noise ~0.0025, ~100x smaller, and `0.01` is inverted there too. The temperature constant was never the right lever; the scale normalisation in correction #8 is.
 
