@@ -24,15 +24,26 @@
 - No `name`, `x`, `y` fields anywhere
 - `fiber_type` currently only `"SSMF"` in generated configs; `FIBER_TYPE_INDEX` in `topology.py` maps it to integer 0
 
-## `Topology` dataclass (`diffopt/topology.py`)
+## `Topology` (`diffopt/topology.py`)
 
-| Property | Type | Notes |
+`Topology(OpticalNetworkModel)` — subclasses the upstream
+`multilayer_optical_mcp.model.optical_network.OpticalNetworkModel` directly; it is not a
+standalone dataclass.
+
+| Property / method | Type | Notes |
 |---|---|---|
-| `num_nodes` | `int` | |
-| `num_edges` | `int` | undirected edges only |
+| `num_nodes` | `int` | derived from ROADM ids; raises `ValueError` if node ids are not contiguous `0..N-1` |
+| `undirected_edges` | `List[Edge]` | one `Edge` per undirected pair (`src < dst`), NOT `.edges` |
 | `edge_index` | `LongTensor (2, E)` | row 0 = src, row 1 = dst; recomputed each call |
 | `get_edge_features()` | `FloatTensor (E, 5)` | see feature order below |
 | `regen_candidate_nodes` | `List[int]` | nodes with undirected degree ≥ 3 |
+| `from_graph_json(topology_path, modulation_formats_path)` | classmethod | builds a `Topology` from a topology JSON + modulation-formats YAML |
+
+Module-level `load_topology(topology_path, modulation_formats_path)` is a thin alias for
+`Topology.from_graph_json` — it now takes **two** required arguments, not one.
+
+**Node-id contiguity contract:** node ids must be contiguous `0..N-1`; accessing `num_nodes` on a
+topology with gaps raises `ValueError` rather than silently producing a wrong count.
 
 `get_edge_features()` column order: `[mean_span_length_km, fiber_type_idx, mean_amp_nf_db, num_spans, total_length_km]`
 
@@ -53,28 +64,42 @@ Loaded from `configs/modulation_formats.yaml`. Key contract:
 - Valid bitrates: 300–800 Gbps in 50 Gbps steps.
 - SNR thresholds: 4.8–15.1 dB (300–800 Gbps).
 
-## `simulate_segment` (`diffopt/qot/gnpy_bridge.py`)
+## `segment_gsnr_db` (`diffopt/qot/optical_bridge.py`)
+
+Replaces the old (deleted) `diffopt/qot/gnpy_bridge.py::simulate_segment`. This module wraps
+`multilayer_optical_mcp.gnpy_adapter.adapter.compute_qot` and runs real GNPy — there is no
+analytical fallback and no bare `except Exception` anywhere in the file (enforced by an AST
+test in `tests/test_optical_bridge.py`). Every call either returns a real GNPy-derived GSNR or
+raises.
 
 ```python
-simulate_segment(
-    span_lengths_km: List[float],   # length of each fiber span
-    amplifier_nf_db: List[float],   # NF of post-span EDFA; same length as above
-    fiber_type: str = "SSMF",       # only "SSMF" is implemented
-    n_channels: int = 24,           # active WDM channels, 1–48
-    launch_power_dbm: float = -1.0, # per-channel launch power
-    seed: Optional[int] = None,     # for channel selection reproducibility
+segment_gsnr_db(
+    topology,                        # diffopt Topology (subclasses OpticalNetworkModel)
+    oms_sequence: Tuple[str, ...],    # e.g. from oms_sequence_for_node_path(topology, node_path)
+    mode_id: str,                     # upstream modulation-format id
+    n_channels: int,                  # active WDM channels, 1–48
+    cache: Optional[QoTCache] = None,
 ) -> float  # GSNR in dB at CUT (193.5 THz)
 ```
 
-- `len(span_lengths_km) == len(amplifier_nf_db)` required
-- CUT is always index 24 (193.5 THz) on the 100 GHz grid from 191.1 THz
-- `n_channels=1` → only CUT active; upper bound is `NUM_CHANNELS=48`
-- Falls back silently to `analytical_gsnr_db` on any exception — callers cannot distinguish GNPy vs. analytical labels
+- `oms_sequence_for_node_path(topology, node_path)` converts a diffopt numeric node path into
+  the validated OMS id tuple this function expects; each id is checked via `topology.get_oms`,
+  which raises `KeyError` for a nonexistent edge rather than deferring the failure into GNPy.
+- Internally calls `compute_qot` with `direction=Direction.FORWARD` and
+  `center_freq_hz=CUT_FREQ_HZ` (193.5 THz, slot 21 on the 191.4 THz/100 GHz/48-slot grid)
+  always set explicitly — omitting `center_freq_hz` silently selects the wrong probe channel
+  (measured ~0.05 dB error in one case).
+- `build_loading(n_channels, mode_id)` builds a deterministic, CUT-centered `LoadingState`:
+  slots expand outward from the CUT slot (not `FillPolicy.FULL`), `power_dbm` is always literal
+  `None` on every `Channel` (every ROADM re-equalizes to a fixed target output power, so
+  per-channel launch power is physically inert — there is no `launch_power_dbm` knob anymore).
+- Raises `RuntimeError` if GNPy returns a non-finite GSNR (physically impossible on a real span).
+- GSNR is invariant across all 11 modulation formats in `configs/modulation_formats.yaml` (they
+  share 87.5 GBaud / 0.15 roll-off), which is why callers pick a single arbitrary `mode_id`
+  rather than tracking bitrate.
 
-WDM grid constants (not configurable at call time):
-- `CHANNEL_SPACING_HZ = 100e9`
-- `GRID_START_HZ = 191.1e12` (CUT at index 24 → 193.5 THz)
-- SSMF: α=0.2 dB/km, D=17 ps/nm/km, γ=1.3 /W/km
+WDM grid: fixed C-band grid shared with upstream — anchor 191.4 THz, 100 GHz spacing, 48 slots
+(191.4–196.1 THz); CUT is slot 21 (193.5 THz), diffopt's C-band-center convention.
 
 ## Parquet dataset schema (`data/datasets/{train,val}.parquet`)
 
@@ -94,7 +119,7 @@ Total columns: `max_spans * 5 + 2`. Default `max_spans=60` → 302 columns.
 | 1 | `fiber_type_idx` | 0=SSMF, 1=LEAF, 2=TWRS |
 | 2 | `amp_nf_db` | dB, float |
 | 3 | `channel_loading_fraction` | n_channels / 48, range [1/48, 1.0] |
-| 4 | `accum_dist_km` | cumulative km from segment start to end of this span |
+| 4 | `accum_dist_km` | cumulative km of all prior spans (0.0 before the first span; distance to this span's *start*, not its end) |
 
 Padding spans have all five values set to 0.0.
 
@@ -128,24 +153,31 @@ forward(
 ## `SegmentCombiner` (`diffopt/qot/segment_combiner.py`)
 
 ```python
-SegmentCombiner(soft_max_temperature: float = 0.5)
+SegmentCombiner()  # stateless — takes no constructor arguments
 
 forward(
     segment_gsnrs_db:          List[Tensor],  # N scalar float32 tensors (GSNR in dB)
     regen_probs_at_boundaries: List[Tensor],  # N-1 scalar float32 tensors ∈ (0, 1)
+    temperature:               float,          # required, no default — see below
 ) -> Tensor  # scalar float32, end-to-end GSNR in dB
 ```
 
+- `temperature` is a **required** `forward()` argument, not a constructor parameter — matches `DiffONetPipeline.forward()`'s `tau`/`lambda_` pattern (passed per-call, never stored, to prevent stale annealing state). An earlier version took `soft_max_temperature` at construction and it was never annealed anywhere in the codebase — see CLAUDE.md's Phase 1c corrections for the bug this caused and the fix.
 - `len(regen_probs_at_boundaries) == len(segment_gsnrs_db) - 1` is enforced.
 - Inputs are clamped to `[-5, 35]` dB internally; caller does not need to clamp.
 - Gradient flows through `regen_probs_at_boundaries`; also through `segment_gsnrs_db` if those tensors require grad.
+- `DiffONetPipeline.forward(..., soft_max_temperature: float = 0.5)` passes this straight through to `self.segment_combiner(...)`. `diffopt/train.py` anneals it every epoch from `segment_combiner.soft_max_temperature` (config, default 0.5) down to `segment_combiner.soft_max_temperature_min` (config, default 0.01) over the same epoch window as `regen_tau`.
 
 Module-level helpers (also importable):
 
 ```python
 db_to_linear_noise(gsnr_db: Tensor) -> Tensor   # 10^(-gsnr_db/10), preserves dtype
 linear_noise_to_db(noise: Tensor) -> Tensor      # -10*log10(noise), preserves dtype
-soft_max(a, b, temperature=0.1) -> Tensor        # t * logsumexp([a/t, b/t])
+soft_max(a, b, temperature=0.5) -> Tensor
+    # m*t*logsumexp([a/m/t, b/m/t]) where m = max(a,b).detach()
+    # Scale-normalised deliberately: the plain form's t*ln2 error is ABSOLUTE
+    # in linear-noise units and inverts the "regen helps" invariant at the
+    # real per-segment noise scale (~0.0025). See CLAUDE.md correction #8.
 ```
 
 ## `dijkstra` / `spfa` / `batched_dijkstra` (`diffopt/routing/shortest_path.py`)
@@ -199,15 +231,14 @@ Implemented as `DijkstraSurrogate.apply(...)`. The returned tensor is not a prop
 | Key | Used by | Notes |
 |---|---|---|
 | `topology` | `generate_qot_dataset.py`, `train_qot.py` | path to topology JSON |
-| `modulation_formats` | `train_qot.py` (future) | path to modulation YAML |
+| `modulation_formats` | `generate_qot_dataset.py`, `diffopt/train.py` (via `load_topology`), `scripts/diagnose_surrogate.py` | path to modulation YAML |
 | `max_spans_per_segment` | both | must match dataset and model |
 | `num_channels_cband` | `generate_qot_dataset.py` | denominator for channel_loading_fraction |
-| `launch_power_dbm` | `generate_qot_dataset.py` | passed to simulate_segment |
 | `dataset_dir` | both | directory containing train.parquet / val.parquet |
 | `batch_size`, `learning_rate`, `epochs` | `train_qot.py` | |
 | `checkpoint_dir`, `log_dir` | `train_qot.py` | created if absent |
-| `segment_combiner.soft_max_temperature` | `SegmentCombiner` | annealing start value; default 0.5 |
-| `segment_combiner.soft_max_temperature_min` | training loop (future) | annealing end value; default 0.05 |
+| `segment_combiner.soft_max_temperature` | `diffopt/train.py` | anneal start value (default 0.5 if section absent) |
+| `segment_combiner.soft_max_temperature_min` | `diffopt/train.py` | anneal end value (default 0.01 if section absent) — see CLAUDE.md's Phase 1c corrections for why this was previously hardcoded and never annealed |
 | `training.vlastelica_lambda` | `DijkstraSurrogate` | perturbation strength start; default 10.0 |
-| `training.vlastelica_lambda_min` | training loop (future) | decay floor; default 1.0 |
-| `training.vlastelica_lambda_decay` | training loop (future) | per-epoch multiplier; default 0.995 |
+| `training.vlastelica_lambda_min` | `diffopt/train.py` | decay floor; default 1.0 |
+| `training.vlastelica_lambda_decay` | `diffopt/train.py` | per-epoch multiplier; default 0.995 |

@@ -9,7 +9,7 @@ One model: `SpanAttentionQoT`. Takes the physical parameters of a single transpa
 ```
 .dat files
   → topology_builder.py       (one-time; produces JSON configs)
-  → generate_qot_dataset.py   (produces parquet; uses GNPy or analytical fallback)
+  → generate_qot_dataset.py   (produces parquet; real GNPy only, no fallback)
   → SegmentQoTDataset         (loads parquet; pads to max_spans=60)
   → SpanAttentionQoT          (predicts GSNR)
   → train_qot.py              (MSE loss, Adam, cosine LR)
@@ -61,13 +61,13 @@ With 50k training samples and a small model (64-dim, 2 layers), regularisation v
 
 **Channel selection is random per sample.** At each sample, n_channels is drawn uniformly from [1, 48], and the specific channels are randomly selected (always including the CUT). This randomises both the loading level and the specific NLI pattern seen by the CUT, producing a diverse training distribution.
 
-**`accum_dist_km` as a feature.** This encodes the cumulative distance from the segment start to the end of each span. Combined with positional encoding, it gives the model both the index-based and distance-based position of each span. The two are not redundant: the positional encoding captures discrete order; accum_dist captures physical length accumulation (which drives ASE scaling).
+**`accum_dist_km` as a feature.** Distance starts at `0.0` before the first span; the value recorded for span *i* is the accumulated length of all *prior* spans (not including span *i* itself), and the running total increments only after each span is recorded. So this is the distance to the *start* of each span, not its end. Combined with positional encoding, it gives the model both the index-based and distance-based position of each span. The two are not redundant: the positional encoding captures discrete order; accum_dist captures physical length accumulation (which drives ASE scaling).
 
-**GNPy fallback is silent.** `simulate_segment` catches all exceptions from the GNPy path and falls back to the analytical GN model without logging. Labels in the dataset may come from either source. This is pragmatic for data generation robustness; the analytical model is a reasonable approximation for training data diversity purposes.
+**No GNPy fallback.** `diffopt/qot/optical_bridge.py::segment_gsnr_db` (which replaced the old, deleted `diffopt/qot/gnpy_bridge.py::simulate_segment`) has no `try`/`except` around the GNPy call — an AST test (`tests/test_optical_bridge.py`) enforces that no bare `except Exception` exists anywhere in the module. Every label in the dataset is a real GNPy-derived GSNR; a GNPy failure raises and generation stops rather than silently substituting an analytical approximation. This is a correction, not a design choice: for the project's entire history before this migration, the old bridge silently fell back to the analytical GN model on any GNPy exception, so every prior dataset's labels came from that fallback and real GNPy never once executed (see `CLAUDE.md`'s "Upstream dependency" section for the full story).
 
 ## Phase 1b integration point
 
-`SpanAttentionQoT.forward(span_features, padding_mask)` returns a differentiable scalar per segment. In Phase 1b, this is called per segment of each candidate lightpath during the differentiable routing loop. The model weights are frozen; gradients flow through the predicted GSNR into the routing/placement loss.
+`SpanAttentionQoT.forward(span_features, padding_mask)` returns a differentiable scalar per segment. In Phase 1b, this is called once per training step in **one batched call over every segment of every demand** (padded to the batch's true max span count, not the architectural `max_spans=60`) — not once per segment — during the differentiable routing loop; results are then scattered back per demand. The model weights are frozen; gradients flow through the predicted GSNR into the routing/placement loss.
 
 ---
 
@@ -82,7 +82,9 @@ edge_weights (tensor, grad-tracked)
   → DijkstraSurrogate             (forward: numpy Dijkstra → binary path indicator)
   → path indicator (tensor)
       → segment_path()            (split path at regen-candidate nodes)
-      → SpanAttentionQoT × N      (one call per transparent segment; frozen)
+      → SpanAttentionQoT          (one batched call over every segment of every
+                                    demand, padded to the batch's true max span
+                                    count; frozen; results scattered back per demand)
       → [gsnr_seg_0, …, gsnr_seg_N]  (list of scalar tensors)
   → SegmentCombiner               (physics-based noise accumulation)
       ← regen_probs[boundary nodes]
@@ -119,7 +121,15 @@ Noise values for a good 25 dB segment are ~0.003. Over a long path with 10 such 
 
 ### soft_max temperature
 
-`soft_max(a, b, t) = t * logsumexp([a/t, b/t])` overestimates `max(a, b)` by `t * log(1 + exp(-|a-b|/t))`. For noise values ~0.1 and `t=0.5` this overestimate is ~0.21 — larger than the noise itself, making the regen path seem *worse* than no-regen. Keep `t ≤ 0.05` for the approximation to be physically meaningful. The default `t=0.5` in config is the annealing start value; actual training should decay toward `t_min=0.05`.
+`soft_max` is **scale-normalised**: `soft_max(a, b, t) = m * t * logsumexp([a/m/t, b/m/t])` where `m = max(a, b).detach()`. This divides by `m` before the log-sum-exp and multiplies back after, which makes the overshoot above `max(a, b)` a fixed *fraction* of `m` — `m * t * log(1 + exp(-|a-b|/(m*t)))`, bounded above by `m * t * ln2` — rather than an absolute quantity. Because the error is relative, "regen helps" (`soft_max(a, b) < a + b` for `a ≈ b`) holds for any `temperature < 1/ln2 ≈ 1.44`, at any noise magnitude. Do not simplify this back to the plain `t * logsumexp([a/t, b/t])` form — see the "Superseded" subsection below for why that form is broken.
+
+`temperature` is a required `SegmentCombiner.forward()` argument (no constructor default to accidentally rely on), and `diffopt/train.py` anneals it every epoch from `segment_combiner.soft_max_temperature` (config, default 0.5) down to `segment_combiner.soft_max_temperature_min` (config, default **0.01** — the exact value CLAUDE.md's Phase 1b correction #3 validated via `monotonicity`/`gradient-sign` unit tests), over the same epoch window as `regen_tau`. Because the normalisation makes the temperature schedule sign-correct at any noise scale, this anneal is no longer load-bearing for correctness the way it was pre-fix — it remains useful for keeping the approximation tight (`soft_max ≈ hard max`) late in training.
+
+#### Superseded (pre-correction-#8)
+
+The plain (non-normalised) form `soft_max(a, b, t) = t * logsumexp([a/t, b/t])` overestimates `max(a, b)` by `t * log(1 + exp(-|a-b|/t))`, bounded above by `t * ln2`. For noise values ~0.1 and `t=0.5` this overestimate is ~0.21 — larger than the noise itself, making the regen path seem *worse* than no-regen. Framed this way, temperature looked like the lever that had to be kept small enough for the *fixed* noise scale in the unit-test fixtures (5–15 dB segments, noise ~0.1–0.3).
+
+That framing was wrong: the overshoot is **absolute** in linear-noise units and does not shrink with the operands, so it does not track the noise scale actually seen in training. Real per-segment noise on `ind_132` is ~0.0025 (segments run ~26 dB) — the schedule's sharpest temperature, `0.01`, has an absolute floor of `t*ln2 ≈ 0.00693`, over 2x the noise itself, which inverted the "regen helps" invariant on every topology since Phase 1b (see CLAUDE.md's Phase 1c correction #8 for the full diagnosis). An earlier version of `diffopt/train.py` additionally fixed `t=0.5` for the entire run and never annealed it, compounding the problem (Phase 1c correction #7). The fix was the scale normalisation described above, not a smaller temperature — no fixed temperature makes the plain form's absolute error track an unknown noise scale.
 
 ## DijkstraSurrogate (Vlastelica layer)
 

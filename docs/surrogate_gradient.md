@@ -84,9 +84,28 @@ With the wrong sign (`c - λ * grad`), the perturbation *reduces* the cost of pe
 
 ## Why SPFA instead of Dijkstra in the backward pass
 
-After adding `λ * grad_output` to edge weights, some perturbed weights can go negative. (Example: edge cost 1.0, `grad_output` entry 2.0, λ=10 → but wait, the perturbation adds, so 1 + 10*2 = 21. Actually for negative, consider: a different setup where we subtract — but even with addition, other components of the system might have negative weights for other reasons.)
+The Vlastelica backward perturbs edge costs as `c_target = w + λ·grad_output`.
+`grad_output` is `∂L/∂path_indicator`, which is negative on edges the loss
+wants the route to avoid, so a perturbed cost `w + λ·(negative)` can drop
+below zero — and does, since λ is a fixed additive constant (10.0 by default)
+while learned weights are O(1).
 
-Actually the issue arises because once SPFA is needed for robustness: some graph configurations with the perturbation applied can produce edge weights less than zero. Dijkstra's heap-based approach makes an implicit assumption that distances only ever decrease, and will loop or produce wrong results on negative weights. SPFA (a BFS-style Bellman-Ford) relaxes edges repeatedly until no further improvements are found — it handles negative weights correctly as long as there are no negative-weight cycles.
+Dijkstra assumes that once a node is settled its distance can never improve,
+which is exactly what a negative edge violates: it either returns a wrong
+answer or, with a decrease-key implementation, fails to terminate. SPFA (a
+queue-based Bellman-Ford) re-relaxes edges until no distance improves, so it
+handles negative weights correctly provided there is no negative cycle.
+
+The routing graph is undirected, so a single negative edge already forms a
+negative 2-cycle (cross it and cross back, cost keeps dropping). `spfa()`
+(`diffopt/routing/shortest_path.py`) detects this via a relaxation-count
+guard and returns `None` rather than hanging; `DijkstraSurrogate.backward`
+(`diffopt/routing/surrogate.py:75-77`) then falls back to `path_star` (the
+forward-pass path) as `path_target`, which makes `grad_weights` exactly zero
+for that demand — a graceful no-signal outcome, not a solved perturbed
+shortest path. SPFA's real benefit here is graceful failure instead of a
+hang, not correct negative-cycle handling — there is no correct answer to
+"shortest path" on a graph with a negative cycle.
 
 ---
 
@@ -123,7 +142,9 @@ path_indicator
      ↓
 [split path into segments at regen-candidate nodes]
      ↓
-SpanAttentionQoT × N segments  ← frozen, called once per segment
+SpanAttentionQoT  ← frozen; one batched call over every segment of every
+                     demand (padded to the batch's true max span count),
+                     results scattered back per demand
      ↓
 [gsnr_seg_0, ..., gsnr_seg_N]
      ↓

@@ -33,9 +33,10 @@ pytest tests/test_segment_combiner.py tests/test_surrogate_grad.py -v
 # Run tests — Phase 1c
 pytest tests/test_pipeline.py -v
 
-# Run full test suite (107 tests; 105 pass, 2 topology tests require .dat source files
-# not in the repo — includes tests/test_optical_bridge.py, tests/test_generate_qot_dataset.py,
-# tests/test_edge_noise.py added during the GNPy migration)
+# Run full test suite (150 tests, 150 pass, 0 fail — includes tests/test_optical_bridge.py,
+# tests/test_generate_qot_dataset.py, tests/test_edge_noise.py added during the GNPy migration,
+# and tests/test_train.py, tests/test_loss.py, tests/test_shortest_path.py,
+# tests/test_span_features.py, tests/test_scripts_common.py, tests/conftest.py added since)
 pytest tests/ -v
 
 # Diagnostics (scripts/diagnose_*.py) — all take --config, default small_test_ind132.yaml.
@@ -62,18 +63,18 @@ Re-baselined target is **0.25 dB** (matches `configs/experiment/base.yaml`'s `va
 
 ## Phase 1b milestone
 
-All 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 total) → ready for Phase 1c (end-to-end pipeline assembly).
+At the time of that milestone: all 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 total) → ready for Phase 1c (end-to-end pipeline assembly).
 
 ## Phase 1c milestone
 
-6/6 `test_pipeline.py` tests pass, 40/42 full suite (2 pre-existing topology failures require `.dat` source files not in the repo). Smoke training run confirms regen count decreasing and loss improving → ready for Phase 1d (evaluation, baselines, visualization).
+At the time of that milestone: 6/6 `test_pipeline.py` tests pass, 40/42 full suite (2 pre-existing topology failures require `.dat` source files not in the repo). Smoke training run confirms regen count decreasing and loss improving → ready for Phase 1d (evaluation, baselines, visualization).
 
 ## Architectural constraints — must not break in future phases
 
 **Topology:**
 - Nodes are integer IDs only. No names, no coordinates, no `x`/`y` anywhere.
 - Edges are undirected and stored as `src < dst`. The `.dat` files have bidirectional entries; deduplication is by `src < dst` at parse time.
-- Span splitting is balanced (no short remainder span). Algorithm: find `n` in `[ceil(L/100), ceil(L/40)]` minimising `|L/n - 80|`. Never produce spans < 20 km.
+- Span splitting is balanced (no short remainder span). Algorithm: find `n` in `[ceil(L/100), ceil(L/40)]` minimising `|L/n - 80|`, subject to every candidate span being ≥ 20 km. If no `n` in that range keeps every span ≥ 20 km, `split_link_into_spans` falls back to `n=1` and the link stays whole. **A span may be shorter than 20 km only if it is the link's sole span and equals the link length exactly** — splitting itself never leaves a short remainder. This is a real, physical case, not a defect: `ind_132` has one such edge (19.0 km) and `jp_70` has seven (8.0–19.0 km). Enforced for every committed topology by `tests/test_topology.py::test_all_committed_spans_ge_20km`.
 - All span and amplifier parameters are stored per-span in the topology JSON (not aggregated).
 
 **Modulation / demands:**
@@ -116,7 +117,7 @@ All 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 tota
 - Any test of the "regen helps" invariant must include a case at the **production** noise scale (two segments at ~26 dB → noise ~0.0025), not only the 5–15 dB fixtures. `tests/test_segment_combiner.py::test_gradient_wrt_regen_prob_at_production_noise_scale` and `::test_regen_never_increases_noise_across_noise_scales` exist for exactly this and are what caught correction #8.
 
 **Surrogate gradient / routing:**
-- `surrogate.py` backward uses **SPFA** (not Dijkstra) for the perturbed solve. Perturbed weights `c + λ·grad` can be negative; Dijkstra hangs on negative weights.
+- `surrogate.py` backward uses **SPFA** (not Dijkstra) for the perturbed solve. Perturbed weights `c + λ·grad` can be negative; Dijkstra assumes distances only ever decrease and hangs (or returns a wrong answer) on negative weights. SPFA does not "handle" negative weights in general, though — the routing graph is **undirected**, so a single negative edge is already a negative 2-cycle, which has no correct shortest path. `spfa` (`diffopt/routing/shortest_path.py`) detects this via a relaxation-count guard and returns `None` instead of hanging; `diffopt/routing/surrogate.py:75-77` then falls back to `path_star`, making the surrogate gradient **exactly zero** for that demand. SPFA's real benefit is graceful failure instead of a hang, not correct negative-cycle resolution.
 - The Vlastelica perturbation is `c_target = w + λ·grad_output` (positive sign). The formula in the paper uses ŷ = −∂L/∂z; since PyTorch's `grad_output = ∂L/∂z`, the sign flips: `c − λŷ = c + λ·grad_output`. Using the wrong sign (minus) gives zero gradient everywhere.
 - Gradient on an edge from `DijkstraSurrogate` is **negative** for active-path edges when the loss penalises their use. Gradient descent (`w -= lr·grad`) then increases those edge costs, routing away from them. This is counterintuitive but correct — do not flip the sign in tests.
 - **`edge_weights` are renormalised to unit mean** in `pipeline.forward`, and
@@ -162,7 +163,7 @@ All 7 segment combiner tests and all 5 surrogate gradient tests pass (36/36 tota
 ## Corrections made during Phase 1b
 
 1. **Vlastelica perturbation sign**: the original project spec (§4) wrote `c_target = w - λ * (∂L/∂p*)`. This is wrong. The correct formula is `c_target = w + λ * grad_output` because the paper's ŷ is the negative gradient. Using minus gives zero surrogate gradient on every call.
-2. **Dijkstra in backward pass**: The spec's `shortest_path.py` description did not mention negative weights. The Vlastelica backward produces perturbed weights that can be negative; Dijkstra hangs on these. SPFA was added to handle this.
+2. **Dijkstra in backward pass**: The spec's `shortest_path.py` description did not mention negative weights. The Vlastelica backward produces perturbed weights that can be negative; Dijkstra hangs on these. SPFA was added to handle this. (Precisely: the routing graph is undirected, so a single negative edge is already a negative 2-cycle with no correct shortest path — SPFA's actual contribution is detecting that via a relaxation-count guard and returning `None` gracefully, which `surrogate.py` then treats as a zero gradient for that demand, rather than hanging like Dijkstra would. See the "Surrogate gradient / routing" architectural constraints above for the precise mechanism.)
 3. **`soft_max` scale sensitivity**: The spec showed `temperature=0.1` as a default example. At that temperature, `soft_max` still overestimates `max(a,b)` by up to `0.07` for noise values ~0.1–0.3, which is enough to break the "regen helps" invariant. Tests that verify physical correctness (monotonicity, gradient sign) use `temperature=0.01`. **Superseded by Phase 1c correction #8**: the "~0.1–0.3" noise range quoted here is the *unit-test fixture* range (5–10 dB segments), not the production one. Real segments are ~26 dB → noise ~0.0025, ~100x smaller, and `0.01` is inverted there too. The temperature constant was never the right lever; the scale normalisation in correction #8 is.
 
 ## Corrections made during Phase 1c
