@@ -36,7 +36,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/OlegKarandin/diffRouting"
+Repository = "https://github.com/OlegKarandin/DiffRoute"
 
 [tool.setuptools.packages.find]
 where = ["."]
