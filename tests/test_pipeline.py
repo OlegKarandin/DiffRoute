@@ -601,17 +601,17 @@ def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Test 14/15: edge-weight scale degeneracy (docs/investigations/
-# edge_weight_scale_collapse.md). These tests verify Task 1's renormalisation
-# specifically: once EdgeWeightNet's raw output is renormalised to unit mean
-# with a live (non-detached) divisor, the loss is homogeneous of degree 0 in
-# that raw output for ANY downstream loss, so the scale-direction gradient is
-# exactly zero and "shrink every weight" is not a descent direction. This
-# property holds regardless of what the path-cost term happens to be
-# denominated in — it would still pass even under a regression back to
-# Task 2's bug (path_cost_loss reading edge_weights instead of
-# edge_ase_noise). These tests therefore CANNOT detect that regression;
-# test_path_noise_cost_equals_ase_noise_along_route is the dedicated guard
-# for Task 2's property.
+# edge_weight_scale_collapse.md). These tests verify the unit-mean
+# renormalisation specifically: once EdgeWeightNet's raw output is
+# renormalised to unit mean with a live (non-detached) divisor, the loss is
+# homogeneous of degree 0 in that raw output for ANY downstream loss, so the
+# scale-direction gradient is exactly zero and "shrink every weight" is not
+# a descent direction. This property holds regardless of what the path-cost
+# term happens to be denominated in — it would still pass even under a
+# regression back to the pre-fix bug where path_cost_loss read edge_weights
+# instead of edge_ase_noise. These tests therefore CANNOT detect that
+# regression; test_path_noise_cost_equals_ase_noise_along_route is the
+# dedicated guard for the ASE-denominated path-cost invariant.
 # ---------------------------------------------------------------------------
 
 class _ScaledNet(torch.nn.Module):
@@ -794,12 +794,6 @@ def test_topology_edge_features_are_standardised():
     assert pipeline._topo_feat_std.shape == (1, 5)
 
 
-# ---------------------------------------------------------------------------
-# Test 18: weights must not collapse over a real (if short) training loop.
-# End-to-end statement of the bug: on ind_132 the median raw weight fell
-# ~8.2e7x over 60 epochs while rank-corr with init stayed at +0.999.
-# ---------------------------------------------------------------------------
-
 def test_segment_longer_than_max_spans_raises_a_named_error():
     """A route whose segment exceeds max_spans must fail loudly.
 
@@ -808,13 +802,23 @@ def test_segment_longer_than_max_spans_raises_a_named_error():
     """
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
-    pipeline.max_spans = 1  # every real segment here has more than 1 span
+    # The 0->4 route via node 1 splits at regen candidate node 3 into a
+    # 2-span segment (eids 0,2) and a 1-span segment (eid 4). max_spans=1
+    # still fires the guard because batch_max_spans is a max over all
+    # segments in the batch, and the first segment already exceeds it.
+    pipeline.max_spans = 1
 
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
 
     with pytest.raises(ValueError, match="max_spans"):
         pipeline(demands, lambda_=5.0)
 
+
+# ---------------------------------------------------------------------------
+# Test 18: weights must not collapse over a real (if short) training loop.
+# End-to-end statement of the bug: on ind_132 the median raw weight fell
+# ~8.2e7x over 60 epochs while rank-corr with init stayed at +0.999.
+# ---------------------------------------------------------------------------
 
 def test_edge_weights_do_not_collapse_over_training():
     torch.manual_seed(0)

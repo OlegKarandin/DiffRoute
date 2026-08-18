@@ -17,7 +17,8 @@ pip install -e ".[dev]"
 ## Key commands
 
 ```bash
-# Re-generate topology JSONs from .dat files (run from project root)
+# Re-generate topology JSONs from .dat files (run from project root; .dat
+# sources are not distributed in a clean clone — see configs/topology/README.md)
 python diffopt/topology_builder.py
 
 # Generate QoT training data
@@ -33,7 +34,7 @@ pytest tests/test_segment_combiner.py tests/test_surrogate_grad.py -v
 # Run tests — Phase 1c
 pytest tests/test_pipeline.py -v
 
-# Run full test suite (150 tests, 150 pass, 0 fail — includes tests/test_optical_bridge.py,
+# Run full test suite (includes tests/test_optical_bridge.py,
 # tests/test_generate_qot_dataset.py, tests/test_edge_noise.py added during the GNPy migration,
 # and tests/test_train.py, tests/test_loss.py, tests/test_shortest_path.py,
 # tests/test_span_features.py, tests/test_scripts_common.py, tests/conftest.py added since)
@@ -48,7 +49,8 @@ python scripts/diagnose_segment_noise_scale.py --config configs/experiment/base.
 python -m diffopt.qot.train_qot --config configs/experiment/small_test.yaml
 python -m diffopt.qot.train_qot --config configs/experiment/base.yaml
 
-# Train end-to-end pipeline (Phase 1c; requires checkpoints/best_qot.pt)
+# Train end-to-end pipeline (Phase 1c; requires the config's `qot_checkpoint`
+# — run train_qot for that config first)
 python -m diffopt.train --config configs/experiment/small_test.yaml
 python -m diffopt.train --config configs/experiment/base.yaml
 ```

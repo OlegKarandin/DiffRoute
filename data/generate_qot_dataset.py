@@ -240,6 +240,13 @@ def generate_sample(
             channel_loading_fraction=channel_loading_fraction,
         )
 
+        # n_spans (from edge.num_spans) and span_feature_list (from
+        # span_feature_rows) are two independent lookups over the same
+        # segment; nothing ties them together structurally, so a future
+        # divergence would silently misalign every padded row below with no
+        # exception raised.
+        assert len(span_feature_list) == n_spans
+
         # Pad to max_spans
         padded = span_feature_list + [[0.0] * SPAN_FEATURE_DIM] * (max_spans - n_spans)
         flat = [v for span in padded for v in span]

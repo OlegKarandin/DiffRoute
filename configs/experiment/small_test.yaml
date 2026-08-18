@@ -34,7 +34,7 @@ batch_size: 32
 learning_rate: 1.0e-3
 checkpoint_dir: checkpoints/german_17
 log_dir: logs/german_17
-# NOTE: re-baselined post-GNPy-migration (Task 8). Measured best val RMSE on
+# NOTE: re-baselined post-GNPy-migration. Measured best val RMSE on
 # this config's own real-GNPy-labeled data (500 train / 100 val, 20 epochs):
 # 0.6319 dB — did NOT hit the old 0.5 dB target, unlike base.yaml's much
 # larger run (see base.yaml's val_rmse_target comment: with only 500 samples
@@ -84,7 +84,7 @@ training:
   # Window is proportional to epochs_e2e above (60) — mirrors the validated
   # small_test_ind132.yaml window (10/40, anneal ends at 67% of training).
   # soft_max_temperature (segment_combiner, above) is annealed over this same
-  # window per CLAUDE.md Phase 1c correction #7: if epochs_e2e changes again,
+  # window per docs/investigations/CHANGELOG.md#correction-1c-7: if epochs_e2e changes again,
   # update both together rather than leaving this pair stale relative to it.
   regen_tau_anneal_start_epoch: 10
   regen_tau_anneal_end_epoch: 40

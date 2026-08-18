@@ -148,7 +148,7 @@ Backward:
 
 Two path-finding functions live in `shortest_path.py`:
 - `dijkstra` — heap-based, positive weights only; used in forward pass.
-- `spfa` — Bellman-Ford with deque, handles negative weights; used in backward pass.
+- `spfa` — Bellman-Ford with deque; used in backward pass because perturbed weights can be negative, but on this undirected graph a negative edge is already a negative 2-cycle, so `spfa`'s real benefit is failing gracefully (returns `None`, caller falls back to `path_star`) instead of hanging — not correct negative-weight/negative-cycle resolution.
 
 ### Why the sign is + not -
 

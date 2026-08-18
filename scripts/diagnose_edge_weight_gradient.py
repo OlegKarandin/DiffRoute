@@ -68,7 +68,7 @@ def describe(name: str, w: np.ndarray, lens: np.ndarray) -> None:
     # frac<1e-6 / frac<1e-3 were calibrated against pre-fix RAW EdgeWeightNet
     # output, which could (and did) collapse toward the Softplus floor with
     # no lower bound. Post-fix, `w` here is the unit-mean-normalised weight
-    # (see edge_weights_of below) — Task 1's fix pins its mean to exactly 1,
+    # (see edge_weights_of below) — the unit-mean renormalisation pins its mean to exactly 1,
     # so a "pure GLOBAL SCALE collapse" reading (every edge tiny) is
     # structurally unreachable: the normalisation itself prevents the whole
     # population from drifting toward 0. These two fractions reading ~0% post-
@@ -206,7 +206,7 @@ def main() -> None:
         w_t = captured["w"]
         # Mirror edge_weights_of's unit-mean renormalisation: the raw hook
         # output is EdgeWeightNet's pre-normalisation Softplus output, not
-        # what pipeline.forward actually routes with, and Task 1's fix makes
+        # what pipeline.forward actually routes with, and the unit-mean renormalisation makes
         # the loss degree-0 in that raw scale, so it can drift freely.
         w_t_norm = w_t.detach().squeeze(-1) / w_t.detach().squeeze(-1).mean().clamp_min(1e-12)
 

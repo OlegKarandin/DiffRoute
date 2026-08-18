@@ -72,8 +72,7 @@ def test_edge_weights_of_matches_pipeline_forward(monkeypatch):
     divisor's clamp epsilon, or reintroducing the .detach() correction #9
     exists to forbid) without a matching update to edge_weights_of, this
     test must go red — see docs/investigations for the regression this
-    guards against, and task-16-report.md's Finding-1 fix-round evidence
-    for a demonstration that it actually does.
+    guards against.
     """
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
