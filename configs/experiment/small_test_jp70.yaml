@@ -1,0 +1,79 @@
+topology: configs/topology/jp_70.json
+modulation_formats: configs/modulation_formats.yaml
+
+# Ad hoc e2e-pipeline smoke test: small_test.yaml re-pointed at jp_70.json.
+# Reuses the existing checkpoints/best_qot.pt (trained on ind_132 via
+# base.yaml's 50k/10k run) as qot_checkpoint — QoT training was skipped for
+# this run, only the Phase 1c e2e pipeline (routing + regen placement) runs.
+# NOTE: the QoT model was never trained on jp_70's span-length/fiber-type
+# distribution, so its GSNR predictions here are an out-of-distribution
+# approximation, not a validated fit for this topology.
+
+# Dataset generation
+num_train_samples: 500
+num_val_samples: 100
+num_demands: 5
+bitrate_options: [300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800]
+k_paths: 5
+seed: 42
+
+min_regen_reach_km: 250.0
+max_regen_reach_km: 3700.0
+
+# WDM
+num_channels_cband: 48
+
+# Model
+max_spans_per_segment: 60
+feature_dim: 5
+model_dim: 64
+num_heads: 4
+num_layers: 2
+ff_dim: 128
+
+# Training
+epochs: 20
+batch_size: 32
+learning_rate: 1.0e-3
+checkpoint_dir: checkpoints/e2e_jp70
+log_dir: logs/e2e_jp70
+val_rmse_target: 0.75
+
+# Data
+dataset_dir: data/datasets/jp_70
+
+# Phase 1c: end-to-end pipeline
+qot_checkpoint: checkpoints/best_qot.pt
+
+pipeline:
+  lambda_regen: 1.0
+  lambda_infeasible: 10.0
+  lambda_cost: 0.01
+  channel_loading_fraction: 0.5
+
+segment_combiner:
+  soft_max_temperature: 0.5
+  soft_max_temperature_min: 0.01
+
+training:
+  lr_edge_net: 1.0e-3
+  # Adam's step is ~lr regardless of gradient magnitude, so a logit moves at
+  # most lr_regen per epoch. Crossing p>0.5 from a drifted-down logit needs
+  # tens of consecutive correct-sign steps; the old 20 epochs x 1e-2 gave a
+  # total excursion of 0.2 and could not place a regenerator even with a
+  # correctly-signed gradient. See
+  # docs/investigations/regen_placement_not_concentrating.md.
+  lr_regen: 2.0e-2
+  epochs_e2e: 60
+  vlastelica_lambda: 10.0
+  vlastelica_lambda_min: 1.0
+  vlastelica_lambda_decay: 0.995
+  regen_tau_start: 1.0
+  regen_tau_end: 0.1
+  # Window is proportional to epochs_e2e above (60) — mirrors the validated
+  # small_test_ind132.yaml window (10/40, anneal ends at 67% of training).
+  # soft_max_temperature (segment_combiner, above) is annealed over this same
+  # window per CLAUDE.md Phase 1c correction #7: if epochs_e2e changes again,
+  # update both together rather than leaving this pair stale relative to it.
+  regen_tau_anneal_start_epoch: 10
+  regen_tau_anneal_end_epoch: 40
