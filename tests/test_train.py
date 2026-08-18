@@ -3,8 +3,9 @@
 `linear_anneal` (renamed/generalized from `compute_regen_tau`) now drives
 both RegenPlacement's `tau` and SegmentCombiner's `soft_max_temperature` —
 the fix for the bug where soft_max_temperature was hardcoded at a fixed
-0.5 and never annealed (see CLAUDE.md's Phase 1c corrections, and
-diffopt/qot/segment_combiner.py's docstring, for the physics diagnosis).
+0.5 and never annealed (see docs/investigations/CHANGELOG.md's Phase 1c
+corrections, and diffopt/qot/segment_combiner.py's docstring, for the
+physics diagnosis).
 """
 from __future__ import annotations
 

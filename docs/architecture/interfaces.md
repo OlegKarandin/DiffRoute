@@ -162,7 +162,7 @@ forward(
 ) -> Tensor  # scalar float32, end-to-end GSNR in dB
 ```
 
-- `temperature` is a **required** `forward()` argument, not a constructor parameter — matches `DiffONetPipeline.forward()`'s `tau`/`lambda_` pattern (passed per-call, never stored, to prevent stale annealing state). An earlier version took `soft_max_temperature` at construction and it was never annealed anywhere in the codebase — see CLAUDE.md's Phase 1c corrections for the bug this caused and the fix.
+- `temperature` is a **required** `forward()` argument, not a constructor parameter — matches `DiffONetPipeline.forward()`'s `tau`/`lambda_` pattern (passed per-call, never stored, to prevent stale annealing state). An earlier version took `soft_max_temperature` at construction and it was never annealed anywhere in the codebase — see `docs/investigations/CHANGELOG.md`'s Phase 1c corrections for the bug this caused and the fix.
 - `len(regen_probs_at_boundaries) == len(segment_gsnrs_db) - 1` is enforced.
 - Inputs are clamped to `[-5, 35]` dB internally; caller does not need to clamp.
 - Gradient flows through `regen_probs_at_boundaries`; also through `segment_gsnrs_db` if those tensors require grad.
@@ -177,7 +177,8 @@ soft_max(a, b, temperature=0.5) -> Tensor
     # m*t*logsumexp([a/m/t, b/m/t]) where m = max(a,b).detach()
     # Scale-normalised deliberately: the plain form's t*ln2 error is ABSOLUTE
     # in linear-noise units and inverts the "regen helps" invariant at the
-    # real per-segment noise scale (~0.0025). See CLAUDE.md correction #8.
+    # real per-segment noise scale (~0.0025). See
+    # docs/investigations/CHANGELOG.md#correction-1c-8.
 ```
 
 ## `dijkstra` / `spfa` / `batched_dijkstra` (`diffopt/routing/shortest_path.py`)
@@ -238,7 +239,7 @@ Implemented as `DijkstraSurrogate.apply(...)`. The returned tensor is not a prop
 | `batch_size`, `learning_rate`, `epochs` | `train_qot.py` | |
 | `checkpoint_dir`, `log_dir` | `train_qot.py` | created if absent |
 | `segment_combiner.soft_max_temperature` | `diffopt/train.py` | anneal start value (default 0.5 if section absent) |
-| `segment_combiner.soft_max_temperature_min` | `diffopt/train.py` | anneal end value (default 0.01 if section absent) — see CLAUDE.md's Phase 1c corrections for why this was previously hardcoded and never annealed |
+| `segment_combiner.soft_max_temperature_min` | `diffopt/train.py` | anneal end value (default 0.01 if section absent) — see `docs/investigations/CHANGELOG.md`'s Phase 1c corrections for why this was previously hardcoded and never annealed |
 | `training.vlastelica_lambda` | `DijkstraSurrogate` | perturbation strength start; default 10.0 |
 | `training.vlastelica_lambda_min` | `diffopt/train.py` | decay floor; default 1.0 |
 | `training.vlastelica_lambda_decay` | `diffopt/train.py` | per-epoch multiplier; default 0.995 |

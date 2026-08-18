@@ -203,7 +203,7 @@ def main() -> None:
         print("  distance here means the ASE-noise-driven perturbation happens to")
         print("  leave every demand's shortest path unchanged on this topology --")
         print("  check whether edge_ase_noise actually varies across its edges")
-        print("  (CLAUDE.md: 'on a topology whose edges are physically identical,")
+        print("  (docs/architecture/invariants.md: 'on a topology whose edges are physically identical,")
         print("  the STE contributes no within-segment routing signal').")
 
     # ================================================================ REPORT 3

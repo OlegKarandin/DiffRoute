@@ -72,8 +72,8 @@ class SegmentCombiner(nn.Module):
     constructor parameter — this class holds no annealing state, matching
     `DiffONetPipeline.forward()`'s own `tau`/`lambda_` pattern (passed
     per-call, never stored as a module attribute, to prevent stale
-    annealing state across epochs). See CLAUDE.md's "Pipeline"
-    architectural constraints.
+    annealing state across epochs). See docs/architecture/invariants.md's
+    "Pipeline" architectural constraints.
 
     Historical note: an earlier version took `soft_max_temperature` at
     construction, defaulting to 0.5 and never annealed anywhere — this
@@ -81,8 +81,9 @@ class SegmentCombiner(nn.Module):
     training (at t=0.5 the soft-max approximation's floor, `t*ln(2)`,
     swamps real per-segment noise values, making every multi-segment path
     look worse than not regenerating at all). Fixed by making the caller
-    supply a real, annealed temperature every call — see CLAUDE.md's
-    Phase 1c corrections for the measured numbers.
+    supply a real, annealed temperature every call — see
+    docs/investigations/CHANGELOG.md's Phase 1c corrections for the measured
+    numbers.
     """
 
     def forward(
@@ -102,7 +103,7 @@ class SegmentCombiner(nn.Module):
         temperature:
             Soft-max sharpness for this call. Lower → closer to true max
             (more physically accurate); higher → looser approximation.
-            CLAUDE.md's Phase 1b correction #3 established 0.01 as the
+            docs/investigations/CHANGELOG.md's Phase 1b correction #3 established 0.01 as the
             value at which the "regen helps" invariant reliably holds —
             callers doing real training should anneal toward that value,
             not hold a fixed loose one.

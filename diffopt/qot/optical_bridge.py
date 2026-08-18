@@ -38,7 +38,7 @@ from multilayer_optical_network.model.spectrum import SpectrumGrid
 # 48 slots (191.4-196.1 THz).
 GRID = SpectrumGrid.default()
 
-# diffopt's C-band-center convention (CLAUDE.md).
+# diffopt's C-band-center convention (docs/architecture/invariants.md).
 CUT_FREQ_HZ = 193.5e12
 
 # Module-level guard: ``slot_of`` raises ValueError for an off-grid frequency,

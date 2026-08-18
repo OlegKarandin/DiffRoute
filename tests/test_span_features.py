@@ -1,6 +1,6 @@
 """Pins the canonical span-feature ordering.
 
-CLAUDE.md declares [span_length_km, fiber_type_idx, amp_nf_db,
+docs/architecture/invariants.md declares [span_length_km, fiber_type_idx, amp_nf_db,
 channel_loading_fraction, accum_dist_km] a fixed invariant, and the parquet
 schema (span_features_0 .. span_features_{max_spans*5-1}) is laid out in that
 order. A change here invalidates every existing dataset.

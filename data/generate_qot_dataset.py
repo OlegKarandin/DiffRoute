@@ -231,9 +231,10 @@ def generate_sample(
 
         # Build per-span features via the shared span_feature_rows — the
         # canonical [span_length_km, fiber_type_idx, amp_nf_db,
-        # channel_loading_fraction, accum_dist_km] ordering CLAUDE.md
-        # declares a fixed invariant, now defined once in
-        # diffopt.qot.span_features instead of duplicated here.
+        # channel_loading_fraction, accum_dist_km] ordering
+        # docs/architecture/invariants.md declares a fixed invariant, now
+        # defined once in diffopt.qot.span_features instead of duplicated
+        # here.
         span_feature_list = span_feature_rows(
             topology, seg_edge_ids,
             channel_loading_fraction=channel_loading_fraction,
@@ -270,8 +271,9 @@ def compute_duplication_stats(train_df: pd.DataFrame, val_df: pd.DataFrame) -> d
     A small topology's segment/channel-loading space is finite (bounded by
     node/edge count x 48 quantized loading levels) — at high enough sample
     counts, duplication is an expected, real property of that bounded
-    space, not necessarily a bug (see CLAUDE.md's Phase 1a milestone note
-    for the investigation that established this for german_17). But it's
+    space, not necessarily a bug (see docs/investigations/CHANGELOG.md's
+    Phase 1a milestone note for the investigation that established this for
+    german_17). But it's
     invisible unless measured, and it directly affects how a `val_rmse`
     number should be interpreted (a val row that also appears in train
     isn't testing generalization to anything new). This makes it visible

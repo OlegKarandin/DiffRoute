@@ -5,7 +5,7 @@ The single most important guarantee this module makes is
 edge weights `pipeline.forward` actually routes on. Correction #9's
 unit-mean renormalisation was applied in only 2 of 6 places that
 recomputed edge_weights outside the real forward() call before this
-module existed — see CLAUDE.md's Phase 1c correction #9 and
+module existed — see docs/investigations/CHANGELOG.md#correction-1c-9 and
 docs/investigations/edge_weight_scale_collapse.md.
 """
 from __future__ import annotations
@@ -282,7 +282,7 @@ def test_build_context_loads_checkpoint_into_pipeline():
 
 def test_build_context_max_spans_from_config_not_hardcoded(monkeypatch):
     """pipeline.max_spans must come from cfg, never a bare literal — several
-    scripts hardcoded 60 (CLAUDE.md's own max_spans_per_segment default)
+    scripts hardcoded 60 (docs/architecture/invariants.md's own max_spans_per_segment default)
     before this module existed, silently drifting from cfg on any config
     that overrides it. Stubs load_qot_model so this doesn't require a real
     checkpoint trained at the nonstandard max_spans=7 used here."""

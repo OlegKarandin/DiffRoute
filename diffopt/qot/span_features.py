@@ -1,6 +1,6 @@
 """The one definition of the per-span feature ordering.
 
-CLAUDE.md declares ``[span_length_km, fiber_type_idx, amp_nf_db,
+docs/architecture/invariants.md declares ``[span_length_km, fiber_type_idx, amp_nf_db,
 channel_loading_fraction, accum_dist_km]`` a fixed architectural invariant,
 and the on-disk parquet schema (``span_features_0`` .. ``span_features_
 {max_spans*5-1}``) is laid out in that exact order. Before this module
@@ -55,7 +55,7 @@ def span_feature_rows(
             into `topology.undirected_edges`.
         channel_loading_fraction: Shared across every span in the segment —
             channel loading is sampled once per transparent segment, not
-            per span (see CLAUDE.md's GNPy bridge constraints).
+            per span (see docs/architecture/invariants.md's GNPy bridge constraints).
         accum_start: Starting value for `accum_dist_km`. Defaults to 0.0.
 
     Returns:

@@ -13,12 +13,14 @@ copies had quietly drifted apart:
     net is constructed. Several scripts used `torch.manual_seed(0)` (a net
     training never saw) or no seed at all.
   - edge_weights: `pipeline.forward` renormalises EdgeWeightNet's raw
-    Softplus output to unit mean before routing on it (correction #9 in
-    CLAUDE.md). That renormalisation was reproduced in only 2 of the 6
-    places scripts recomputed edge_weights outside the real forward() call;
-    one script printed the raw output labelled `edge_weights`.
+    Softplus output to unit mean before routing on it
+    (docs/investigations/CHANGELOG.md#correction-1c-9). That renormalisation
+    was reproduced in only 2 of the 6 places scripts recomputed edge_weights
+    outside the real forward() call; one script printed the raw output
+    labelled `edge_weights`.
   - max_spans: hardcoded `60` in several scripts vs `cfg.get(...)` in
-    train.py, for a parameter CLAUDE.md calls a hard architecture parameter.
+    train.py, for a parameter docs/architecture/invariants.md calls a hard
+    architecture parameter.
   - lambda_: hardcoded `10.0` in several scripts instead of
     `cfg["training"]["vlastelica_lambda"]`.
 

@@ -158,8 +158,9 @@ def main() -> None:
             # Annealed on the same epoch window as tau — see linear_anneal's
             # docstring for why. Un-annealed soft_max_temperature (fixed at
             # 0.5) previously made the "regen helps" invariant backwards;
-            # see SegmentCombiner's docstring and CLAUDE.md's Phase 1c
-            # corrections for the diagnosis.
+            # see SegmentCombiner's docstring and
+            # docs/investigations/CHANGELOG.md's Phase 1c corrections for
+            # the diagnosis.
             soft_max_temp = linear_anneal(
                 epoch,
                 soft_max_temp_start,

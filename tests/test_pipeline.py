@@ -682,7 +682,8 @@ def test_total_loss_invariant_to_edge_weight_scale():
     total loss and every chosen path bit-identical.
 
     Includes 1e-11 — the magnitude weights actually collapsed to in the
-    ind_132 run — applying CLAUDE.md's lesson from correction #8, where the
+    ind_132 run — applying the lesson from
+    docs/investigations/CHANGELOG.md#correction-1c-8, where the
     original soft_max tests passed only because they never covered the
     production scale.
     """

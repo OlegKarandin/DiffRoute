@@ -273,15 +273,16 @@ def test_numerical_stability():
 
 
 # ---------------------------------------------------------------------------
-# Test 8: accumulation precision — CLAUDE.md: "accumulates noise internally
-# in float64 and casts back to float32 on return. Do not move this to
-# float32 — overflow on long noisy paths is real."
+# Test 8: accumulation precision — docs/architecture/invariants.md:
+# "accumulates noise internally in float64 and casts back to float32 on
+# return. Do not move this to float32 — overflow on long noisy paths is
+# real."
 # ---------------------------------------------------------------------------
 
 def test_accumulation_is_float64_not_float32():
-    """CLAUDE.md: 'accumulates noise internally in float64 and casts back
-    to float32 on return. Do not move this to float32 — overflow on long
-    noisy paths is real.'
+    """docs/architecture/invariants.md: 'accumulates noise internally in
+    float64 and casts back to float32 on return. Do not move this to
+    float32 — overflow on long noisy paths is real.'
 
     A 40-segment chain (the brief's original guess) does not actually
     discriminate here: per-segment linear noise is bounded to
@@ -313,8 +314,9 @@ def test_accumulation_is_float64_not_float32():
 
 
 # ---------------------------------------------------------------------------
-# Test 9: GSNR clamp — CLAUDE.md: "GSNR inputs are clamped to [-5, 35] dB
-# before conversion to linear noise. This is intentional."
+# Test 9: GSNR clamp — docs/architecture/invariants.md: "GSNR inputs are
+# clamped to [-5, 35] dB before conversion to linear noise. This is
+# intentional."
 # ---------------------------------------------------------------------------
 
 def test_gsnr_inputs_are_clamped_to_the_documented_range():

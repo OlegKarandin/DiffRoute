@@ -1,6 +1,6 @@
 """
 Direct tests for spfa — the reason Dijkstra was replaced in the Vlastelica
-backward pass (CLAUDE.md, Phase 1b correction #2): perturbed weights
+backward pass (docs/investigations/CHANGELOG.md#correction-1b-2): perturbed weights
 c + lambda*grad can be negative, and Dijkstra hangs or is wrong on those.
 
 Real signature (read from diffopt/routing/shortest_path.py; the brief's
@@ -128,9 +128,9 @@ def test_spfa_detects_a_negative_cycle_even_when_dst_does_not_touch_it():
     distance is fixed early, but the 1-2 pair's distances decrease
     without bound and always sort ahead of node 3's heap entries, so
     dijkstra's `while heap` loop never drains and node 3 is never popped.
-    That is the literal "Dijkstra hangs on negative weights" CLAUDE.md
-    warns about — calling it here would hang the test suite, not just
-    this test.
+    That is the literal "Dijkstra hangs on negative weights"
+    docs/architecture/invariants.md warns about — calling it here would
+    hang the test suite, not just this test.
 
     spfa must not hang: its relaxation-count guard (shortest_path.py:
     63-65) is global, not scoped to edges on the src->dst path, so it

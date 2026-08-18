@@ -4,9 +4,9 @@ The `*.json` files here are the topology artifacts the pipeline consumes. They
 are committed, so nothing in this repo requires the `.dat` sources to run.
 
 Each JSON is generated from a `.dat` source by `diffopt/topology_builder.py`,
-which splits every link into balanced spans (see CLAUDE.md, "Topology"
-constraints). Regenerating them requires the `.dat` files, which are **not
-distributed here**:
+which splits every link into balanced spans (see
+`docs/architecture/invariants.md`, "Topology" constraints). Regenerating them
+requires the `.dat` files, which are **not distributed here**:
 
 | topology | nodes | source |
 |---|---|---|
