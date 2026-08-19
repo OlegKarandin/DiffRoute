@@ -46,3 +46,4 @@ Thumbs.db
 # Agent tooling scaffolding, not project content
 .claude/
 docs/superpowers/
+.worktrees/
