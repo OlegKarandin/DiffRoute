@@ -38,9 +38,15 @@ from diffopt.topology import Topology
 # reportable things rather than free-floating numbers.
 #
 #   realistic (alpha=1.0): gravity falls off with distance; big pipes land on
-#       short hops. Measured corr(bitrate, km) = -0.829, 0/865 infeasible.
-#   stress    (alpha=0.0): pure mass-product; bitrate uncorrelated with
-#       distance. Measured corr(bitrate, km) = -0.008, 20/865 infeasible.
+#       short hops.
+#   stress    (alpha=0.0): pure mass-product, no distance falloff; changes
+#       which pairs clear the volume floor and their volumes, not just their
+#       bitrate assignment. Spec design doc §8.4's "-0.008 corr, 20/865
+#       infeasible" evidence for the decoupled-bitrate case was measured by
+#       taking the alpha=1 pair set and shuffling bitrates at random, NOT by
+#       running this module's own alpha=0.0 kernel — the two are different
+#       constructions and this module's alpha=0.0 output should not be
+#       assumed to reproduce that number.
 #
 # Both are kept deliberately (spec §3): reporting only `realistic` would
 # demonstrate the dual machinery on a problem where the constraint never binds;

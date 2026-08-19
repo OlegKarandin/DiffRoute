@@ -56,12 +56,13 @@ def main() -> None:
         # -> edge_weights -> that surrogate, so this is a SECOND source of
         # cross-epoch gradient-magnitude change here, independent of tau/
         # t_softmax annealing. Printed alongside them below for exactly that
-        # reason -- matches train.py:183,200 exactly, which is why this is a
-        # fix, not a divergence, but it does mean pre- vs post-migration runs
-        # of this script are not comparing like for like at epoch > 1.
+        # reason.
         tau, tsm, vlastelica_lambda = schedule_at(cfg, epoch=epoch)
 
-        # seed=epoch: matches train.py's per-epoch demand reseeding exactly.
+        # seed=epoch: this script's own per-epoch demand draw for gradient
+        # decomposition; train.py no longer reseeds demands per epoch (Task 4
+        # of the feasibility-constraint migration built a fixed matrix once,
+        # before the loop).
         demands = demands_for(ctx, seed=epoch)
 
         # fresh logits at 0 each time: isolates the temperature effect
@@ -75,7 +76,7 @@ def main() -> None:
         infeasible_ids = []
         for d in demands:
             thr = torch.tensor(mod_cfg.required_snr_threshold(d.bitrate_gbps))
-            sf = F.relu(thr - gsnr_preds[d.id])
+            sf = F.relu(thr + c_cfg["margin_db"] - gsnr_preds[d.id])
             feas = feas + sf
             if sf.item() > 0:
                 infeasible_ids.append(d.id)

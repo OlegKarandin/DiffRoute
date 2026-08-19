@@ -215,7 +215,7 @@ def main() -> None:
         n_infeas = 0
         for d in dem_i:
             thr = torch.tensor(ctx_i.mod_cfg.required_snr_threshold(d.bitrate_gbps))
-            sf = F.relu(thr - gsnr_preds[d.id])
+            sf = F.relu(thr + c_cfg["margin_db"] - gsnr_preds[d.id])
             feas = feas + sf
             if sf.item() > 0:
                 n_infeas += 1

@@ -54,9 +54,12 @@ print(f"Loaded checkpoint {ckpt_label} (epoch {ctx.ckpt['epoch']}, "
 lens = np.array([e.length_km for e in edges], dtype=float)
 ei = pipe._edge_index.numpy()
 
-# Reproduce the exact demand set the training run scored at its final
-# epoch: train.py seeds generate_demands(..., seed=epoch), epoch runs
-# 1..epochs_e2e inclusive, so the final epoch's seed is epochs_e2e itself.
+# train.py no longer reseeds demands per epoch (it builds one fixed traffic
+# matrix before its epoch loop and reuses it throughout). This script's
+# seed=final_epoch below is purely this diagnostic's own convention for
+# picking a demand set to inspect -- not a mirror of train.py's behavior --
+# chosen as epochs_e2e (the last of the 1..epochs_e2e epoch range) simply to
+# have a stable, reproducible seed tied to the run's config.
 final_epoch = t_cfg["epochs_e2e"]
 demands = demands_for(ctx, seed=final_epoch)
 print(f"{len(demands)} demands (seed={final_epoch}, matching training's final epoch)\n")
