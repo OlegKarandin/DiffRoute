@@ -55,9 +55,28 @@ qot_checkpoint: checkpoints/german_17/best_qot.pt
 
 pipeline:
   lambda_regen: 1.0
-  lambda_infeasible: 10.0
   lambda_cost: 0.01              # demoted to regularizer; ASE-noise STE now dominates routing signal
   channel_loading_fraction: 0.5  # fixed during inference
+
+# Fixed traffic matrix. Regenerates deterministically from
+# (topology, seed, scale, alpha) — nothing is committed; the checksum is
+# pinned in tests/test_traffic.py instead.
+traffic:
+  scenario: stress        # "stress" (alpha 0.0) | "realistic" (alpha 1.0)
+  seed: 0                 # matrix identity
+  scale: 300000.0         # total offered load in Gbps
+  holdout_seed: 1         # a different matrix, for the generalisation gap
+
+# Feasibility as a constraint, not a penalty. `lambda_regen` above stays
+# fixed; these duals rise until feasibility is bought, so the regenerator
+# count is whatever the constraint requires. Values are reasoned starting
+# points, not measured optima — see the design spec §4.
+constraint:
+  margin_db: 0.5          # delta, added inside the hinge
+  dual_init: 10.0         # lambda_0 — matches the old lambda_infeasible, so
+                          # epoch 1 reproduces the previous behaviour
+  dual_lr: 1.0            # eta — a 1 dB shortfall moves a dual 10% of lambda_0
+  dual_max: 1000.0        # lambda_max — 100x lambda_0; a diagnostic cap
 
 # NOTE: see base.yaml's segment_combiner comment for the full story — this
 # was previously hardcoded at a fixed 0.5, never annealed, which silently

@@ -1,6 +1,11 @@
 topology: configs/topology/ind_132.json
 modulation_formats: configs/modulation_formats.yaml
 
+# Spec §6 step 4: the binding-constraint run. alpha=0.0 decouples bitrate from
+# distance, so the big pipes are NOT concentrated on short hops and the
+# constraint actually binds. Primary gate: num_violated reaches 0 and holds
+# for the final 10 epochs.
+
 # Ad hoc e2e-pipeline smoke test: small_test.yaml re-pointed at ind_132.json.
 # Reuses the existing checkpoints/best_qot.pt (trained on ind_132 via
 # base.yaml's 50k/10k run) as qot_checkpoint — QoT training was skipped for
@@ -32,8 +37,8 @@ ff_dim: 128
 epochs: 20
 batch_size: 32
 learning_rate: 1.0e-3
-checkpoint_dir: checkpoints/e2e_ind132
-log_dir: logs/e2e_ind132
+checkpoint_dir: checkpoints/constrained_stress
+log_dir: logs/constrained_stress
 val_rmse_target: 0.75
 
 # Data
