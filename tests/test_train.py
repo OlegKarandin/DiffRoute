@@ -18,6 +18,7 @@ import torch
 import yaml
 
 import diffopt.train as train_mod
+from diffopt.demands import Demand
 from diffopt.train import linear_anneal
 
 
@@ -184,11 +185,19 @@ def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None):
     def fake_load_qot_model(checkpoint_path, cfg, device):
         return None
 
+    # A single dummy demand — non-empty, so main()'s "preflight excluded
+    # every demand" guard sees a real raw_matrix AND a non-empty kept list
+    # (preflight excludes nothing here). Content is irrelevant: compute_loss
+    # is stubbed below and never reads it. See
+    # test_main_raises_when_preflight_excludes_every_demand for the guard's
+    # actual raise path, which this stub deliberately does NOT exercise.
+    _dummy_demand = Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)
+
     def fake_build_traffic_matrix(topology, **kwargs):
-        return []
+        return [_dummy_demand]
 
     def fake_preflight_filter(topology, demands, **kwargs):
-        return [], []
+        return list(demands), []
 
     def fake_compute_loss(**kwargs):
         idx = call_count["n"]
@@ -204,7 +213,7 @@ def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None):
             "num_infeasible": num_violated,
             "num_violated": num_violated,
             "worst_margin_db": 0.0,
-            "shortfalls": torch.zeros(0),
+            "shortfalls": torch.zeros(1),
         }
         return loss, metrics
 
@@ -315,3 +324,48 @@ def test_no_inert_placements_reports_zero(tmp_path, monkeypatch):
     row = _read_log(tmp_path)[0]
     assert int(row["num_regen_soft"]) == 2
     assert int(row["num_regen_noncand"]) == 0
+
+
+def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch):
+    """main() must fail fast — not silently train on zero demands — when a
+    non-empty traffic matrix survives build_traffic_matrix but preflight
+    excludes every single one of them (e.g. traffic.scale set so high, or so
+    mismatched to the topology, that nothing clears the GSNR bar even under
+    the most favourable routing/regen assumptions).
+
+    This is the guard's real purpose, distinct from every other test in this
+    module: those use a non-empty raw_matrix that preflight keeps entirely
+    (see _run_main's _dummy_demand), so they exercise the guard's happy
+    path, not its raise path. Without this test, `if not demands: raise
+    ValueError(...)` had zero coverage of the branch it exists for.
+    """
+    dummy_demand = Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)
+
+    def fake_load_topology(topology_path, modulation_formats_path):
+        return _DummyTopology()
+
+    def fake_load_qot_model(checkpoint_path, cfg, device):
+        return None
+
+    def fake_build_traffic_matrix(topology, **kwargs):
+        return [dummy_demand]
+
+    def fake_preflight_filter(topology, demands, **kwargs):
+        # Non-trivial raw matrix, but preflight legitimately excludes
+        # everything from it — the exact scenario the guard's message
+        # ("Preflight excluded every demand — check traffic.scale...")
+        # describes.
+        return [], [(dummy_demand, 5.0)]
+
+    monkeypatch.setattr(train_mod, "load_topology", fake_load_topology)
+    monkeypatch.setattr(train_mod, "load_qot_model", fake_load_qot_model)
+    monkeypatch.setattr(train_mod, "build_traffic_matrix", fake_build_traffic_matrix)
+    monkeypatch.setattr(train_mod, "preflight_filter", fake_preflight_filter)
+    monkeypatch.setattr(train_mod, "DiffONetPipeline", _DummyPipeline)
+    # compute_loss is never reached — main() must raise before the loop.
+
+    config_path = _write_config(tmp_path, epochs=1)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--config", str(config_path)])
+
+    with pytest.raises(ValueError, match="Preflight excluded every demand"):
+        train_mod.main()

@@ -128,7 +128,7 @@ def main() -> None:
             f"  excluded d{demand.id}: {demand.src}->{demand.dst} @ "
             f"{demand.bitrate_gbps:.0f}G, shortfall {shortfall:.2f} dB"
         )
-    if raw_matrix and not demands:
+    if not demands:
         raise ValueError(
             "Preflight excluded every demand — check traffic.scale and the "
             "qot_checkpoint before training."
@@ -282,7 +282,7 @@ def main() -> None:
                 eta=c_cfg["dual_lr"],
                 dual_max=c_cfg["dual_max"],
             )
-            lambda_max_observed = duals.max().item() if duals.numel() else 0.0
+            lambda_max_observed = duals.max().item()
             num_at_cap = int((duals >= c_cfg["dual_max"]).sum().item())
 
             # Placements that can never split a path. Expected to stay 0: a
@@ -397,8 +397,7 @@ def main() -> None:
             d = demands[i]
             print(f"  d{d.id}: {d.src}->{d.dst} @ {d.bitrate_gbps:.0f}G")
     else:
-        max_observed = duals.max().item() if duals.numel() else 0.0
-        print(f"No demands pinned at dual_max (max observed {max_observed:.2f})")
+        print(f"No demands pinned at dual_max (max observed {duals.max().item():.2f})")
     print(f"Log: {log_path}")
 
 
