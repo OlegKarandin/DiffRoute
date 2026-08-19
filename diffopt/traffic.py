@@ -16,13 +16,19 @@ commit").
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, List
+import heapq
+import math
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
 
 from multilayer_optical_network.model.traffic import (
     generate_demands as _gravity_demands,
 )
 
 from diffopt.demands import Demand
+from diffopt.pipeline import segment_path
+from diffopt.qot.span_features import SPAN_FEATURE_DIM, span_feature_rows
 from diffopt.topology import Topology
 
 
@@ -143,3 +149,193 @@ def traffic_matrix_checksum(demands: List[Demand]) -> str:
         f"{d.src}-{d.dst}-{d.bitrate_gbps:.6f}" for d in demands
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Preflight: exclude the impossible
+# ---------------------------------------------------------------------------
+
+def shortest_path_edges_by_km(
+    topology: Topology, src: int, dst: int
+) -> Optional[List[int]]:
+    """Edge ids of the minimum-kilometre path, in traversal order src -> dst.
+
+    Deliberately NOT routed by `EdgeWeightNet`: its routing changes during
+    training, which would make the traffic matrix depend on whichever
+    checkpoint happened to build it. Shortest-by-km is a fixed property of the
+    topology.
+
+    Returns `None` if `dst` is unreachable from `src`, and `[]` when
+    `src == dst`.
+
+    `diffopt.routing.shortest_path.dijkstra` is not reused here because it
+    returns an unordered `(E,)` binary indicator, and `segment_path` needs
+    traversal order — recovering the order from the indicator would mean a
+    second graph walk over the same data.
+    """
+    edges = topology.undirected_edges
+    adj: Dict[int, List[Tuple[int, int, float]]] = {}
+    for eid, e in enumerate(edges):
+        adj.setdefault(e.src, []).append((e.dst, eid, e.length_km))
+        adj.setdefault(e.dst, []).append((e.src, eid, e.length_km))
+
+    dist: Dict[int, float] = {src: 0.0}
+    prev: Dict[int, Tuple[int, int]] = {}
+    settled: set = set()
+    heap: List[Tuple[float, int]] = [(0.0, src)]
+
+    while heap:
+        d, u = heapq.heappop(heap)
+        if u in settled:
+            continue
+        settled.add(u)
+        if u == dst:
+            break
+        for v, eid, km in adj.get(u, []):
+            nd = d + km
+            if nd < dist.get(v, math.inf):
+                dist[v] = nd
+                prev[v] = (u, eid)
+                heapq.heappush(heap, (nd, v))
+
+    if dst not in dist:
+        return None
+
+    ordered: List[int] = []
+    node = dst
+    while node != src:
+        parent, eid = prev[node]
+        ordered.append(eid)
+        node = parent
+    ordered.reverse()
+    return ordered
+
+
+def preflight_filter(
+    topology: Topology,
+    demands: Sequence[Demand],
+    *,
+    qot_model: torch.nn.Module,
+    segment_combiner: torch.nn.Module,
+    modulation_config,
+    margin_db: float,
+    channel_loading_fraction: float = 0.5,
+    max_spans: int = 60,
+    soft_max_temperature: float = 0.01,
+) -> Tuple[List[Demand], List[Tuple[Demand, float]]]:
+    """Drop demands that are infeasible under the most favourable conditions.
+
+    Every demand is evaluated with **all** regen candidates active and routed
+    **shortest-by-km**. That route/placement pair is the most favourable one
+    available, so a demand infeasible under it is infeasible under every
+    placement the model could learn.
+
+    This is a **necessary, not sufficient** screen: a demand that survives it
+    may still be unreachable under the routing the model actually learns.
+    Those surface later as duals pinned at `dual_max` in
+    `diffopt/train.py`'s end-of-run report, not here.
+
+    The screen is very slightly conservative. `SegmentCombiner`'s `soft_max`
+    over-estimates a hard max by a *relative* `t*ln2` (invariants.md, "Segment
+    combiner"), so at `soft_max_temperature=0.01` a demand within ~0.03 dB of
+    the bar could be excluded when exact-max arithmetic would keep it. That is
+    the safe direction: the alternative is a demand whose dual runs to the cap
+    forever.
+
+    Args:
+        margin_db: The same delta the constrained loss adds inside the hinge.
+            Included here on purpose — a demand that cannot reach
+            `threshold + margin` even ideally can never satisfy the
+            constraint, so excluding it now is the difference between a
+            reported exclusion and a silently non-converging dual.
+
+    Returns:
+        `(kept, excluded)`. `kept` is renumbered with contiguous ids `0..N-1`
+        in input order — `Demand.id` indexes the dual vector, so a gap would
+        attach every later dual to the wrong demand. `excluded` is a list of
+        `(demand, shortfall_db)` with `shortfall_db = threshold + margin -
+        best_case_gsnr`, or `inf` when there is no route at all.
+    """
+    device = next(qot_model.parameters()).device
+    candidate_set = set(topology.regen_candidate_nodes)
+    edges = list(topology.undirected_edges)
+
+    # Pass 1 — route and segment everything, collecting segments for one
+    # batched QoT call (the same batching pipeline.forward step 5 does; a
+    # per-segment call over ~900 demands is ~6x slower for no benefit).
+    routed: List[Optional[Tuple[List[List[int]], List[int]]]] = []
+    all_segments: List[List[int]] = []
+    for demand in demands:
+        ordered = shortest_path_edges_by_km(topology, demand.src, demand.dst)
+        if ordered is None:
+            routed.append(None)
+            continue
+        segments, boundary_nodes = segment_path(
+            ordered, demand.src, candidate_set, edges, demand.dst
+        )
+        routed.append((segments, boundary_nodes))
+        all_segments.extend(segments)
+
+    with torch.no_grad():
+        if all_segments:
+            all_rows = [
+                span_feature_rows(
+                    topology, seg,
+                    channel_loading_fraction=channel_loading_fraction,
+                )
+                for seg in all_segments
+            ]
+            batch_max_spans = max(1, max(len(rows) for rows in all_rows))
+            if batch_max_spans > max_spans:
+                raise ValueError(
+                    f"Shortest-by-km routing produced a transparent segment of "
+                    f"{batch_max_spans} spans, but max_spans={max_spans} is a "
+                    f"hard architecture parameter (SpanAttentionQoT's positional "
+                    f"embedding is sized to it)."
+                )
+            n_total = len(all_segments)
+            span_feats = torch.zeros(
+                n_total, batch_max_spans, SPAN_FEATURE_DIM, device=device
+            )
+            padding_mask = torch.zeros(
+                n_total, batch_max_spans, dtype=torch.bool, device=device
+            )
+            for i, rows in enumerate(all_rows):
+                if rows:
+                    span_feats[i, :len(rows)] = torch.tensor(
+                        rows, dtype=torch.float32, device=device
+                    )
+                    padding_mask[i, :len(rows)] = True   # True = real span
+            batched_gsnr = qot_model(span_feats, padding_mask)
+        else:
+            batched_gsnr = torch.zeros(0, device=device)
+
+        # Pass 2 — combine each demand's segments with every boundary
+        # regenerator fully active (p = 1.0) and test against the bar.
+        kept: List[Demand] = []
+        excluded: List[Tuple[Demand, float]] = []
+        flat_idx = 0
+        one = torch.ones((), device=device)
+
+        for demand, entry in zip(demands, routed):
+            threshold = modulation_config.required_snr_threshold(demand.bitrate_gbps)
+            if entry is None:
+                excluded.append((demand, float("inf")))
+                continue
+            segments, boundary_nodes = entry
+            segment_gsnrs = [
+                batched_gsnr[flat_idx + i] for i in range(len(segments))
+            ]
+            flat_idx += len(segments)
+            path_gsnr = segment_combiner(
+                segment_gsnrs,
+                [one for _ in boundary_nodes],
+                temperature=soft_max_temperature,
+            )
+            shortfall = threshold + margin_db - float(path_gsnr.item())
+            if shortfall > 0.0:
+                excluded.append((demand, shortfall))
+            else:
+                kept.append(demand)
+
+    return [d._replace(id=i) for i, d in enumerate(kept)], excluded

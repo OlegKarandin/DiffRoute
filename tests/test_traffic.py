@@ -155,3 +155,152 @@ print(traffic_matrix_checksum(build_traffic_matrix(t, seed=0, scale=1.0e6, alpha
                                    bitrate_options=BITRATE_OPTIONS)
     assert len(demands) == expected_len
     assert traffic_matrix_checksum(demands) == expected_checksum
+
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+import torch
+
+from diffopt.demands import Demand
+from diffopt.modulation import ModulationConfig
+from diffopt.qot.segment_combiner import SegmentCombiner
+from diffopt.traffic import preflight_filter, shortest_path_edges_by_km
+
+from tests.test_pipeline import make_linear_topology
+
+
+class _ConstantQoT(torch.nn.Module):
+    """Stand-in for SpanAttentionQoT returning a fixed per-segment GSNR.
+
+    The preflight's job is a route/segment/threshold decision, not physics —
+    a constant makes the arithmetic exact and the test independent of any
+    trained checkpoint. Matches the real model's contract: forward(span_feats,
+    padding_mask) -> (batch,).
+    """
+
+    def __init__(self, gsnr_db: float) -> None:
+        super().__init__()
+        self.gsnr_db = gsnr_db
+        # A real parameter so `next(qot_model.parameters()).device` works.
+        self._anchor = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def forward(self, span_feats, padding_mask):
+        return torch.full((span_feats.shape[0],), self.gsnr_db,
+                          device=self._anchor.device)
+
+
+def _two_format_mod_config() -> ModulationConfig:
+    """400 G needs 20 dB (easy); 800 G needs 40 dB (impossible here)."""
+    return ModulationConfig(
+        channel_spacing_ghz=100.0,
+        symbol_rate_gbaud=64.0,
+        num_channels_cband=48,
+        cut_channel_index=24,
+        formats=[
+            {"bitrate_gbps": 400, "snr_threshold_db": 20.0},
+            {"bitrate_gbps": 800, "snr_threshold_db": 40.0},
+        ],
+    )
+
+
+def test_shortest_path_edges_by_km_returns_traversal_order():
+    """make_hub_topology: 0-1 (eid 0, 60km), 0-2 (eid 1, 100km),
+    1-3 (eid 2, 60km), 2-3 (eid 3, 100km), 3-4 (eid 4, 80km).
+    0->4 by kilometres is 60+60+80=200 via node 1, not 100+100+80=280."""
+    topo = make_hub_topology()
+    assert shortest_path_edges_by_km(topo, 0, 4) == [0, 2, 4]
+    assert shortest_path_edges_by_km(topo, 4, 0) == [4, 2, 0]
+    assert shortest_path_edges_by_km(topo, 0, 0) == []
+
+
+def test_shortest_path_edges_by_km_returns_none_when_disconnected():
+    """A two-node topology with no edge between the components."""
+    from tests.test_pipeline import _build_topology, _make_edge_dict
+    topo = _build_topology(4, [_make_edge_dict(0, 1), _make_edge_dict(2, 3)])
+    assert shortest_path_edges_by_km(topo, 0, 3) is None
+
+
+def test_preflight_excludes_impossible_demand():
+    """A demand whose threshold exceeds what full regeneration on the
+    shortest-by-km route can deliver is excluded and reported.
+
+    Constant 25 dB per segment. make_hub_topology has exactly one regen
+    candidate (node 3), and the 0->4 route [0, 2, 4] crosses it, so with all
+    candidates active the path is two transparent segments joined by a
+    regenerator: end-to-end GSNR ~= 25 dB (worst segment). 400 G (20 dB + 0.5
+    margin) clears; 800 G (40 dB) cannot.
+    """
+    topo = make_hub_topology()
+    demands = [
+        Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
+        Demand(id=1, src=0, dst=4, bitrate_gbps=800.0),
+    ]
+    kept, excluded = preflight_filter(
+        topo, demands,
+        qot_model=_ConstantQoT(25.0),
+        segment_combiner=SegmentCombiner(),
+        modulation_config=_two_format_mod_config(),
+        margin_db=0.5,
+    )
+    assert [d.bitrate_gbps for d in kept] == [400.0]
+    assert len(excluded) == 1
+    excluded_demand, shortfall = excluded[0]
+    assert excluded_demand.bitrate_gbps == 800.0
+    assert shortfall == pytest.approx(40.0 + 0.5 - 25.0, abs=0.2), (
+        "shortfall must be reported in dB against threshold + margin"
+    )
+
+
+def test_preflight_renumbers_kept_demands_contiguously():
+    """Duals are indexed by Demand.id — a gap left by an exclusion would
+    attach every later dual to the wrong demand."""
+    topo = make_hub_topology()
+    demands = [
+        Demand(id=0, src=0, dst=4, bitrate_gbps=800.0),   # excluded
+        Demand(id=1, src=0, dst=4, bitrate_gbps=400.0),   # kept
+        Demand(id=2, src=0, dst=3, bitrate_gbps=400.0),   # kept
+    ]
+    kept, excluded = preflight_filter(
+        topo, demands,
+        qot_model=_ConstantQoT(25.0),
+        segment_combiner=SegmentCombiner(),
+        modulation_config=_two_format_mod_config(),
+        margin_db=0.5,
+    )
+    assert len(excluded) == 1
+    assert [d.id for d in kept] == list(range(len(kept)))
+    assert [d.dst for d in kept] == [4, 3], "kept order must be preserved"
+
+
+def test_preflight_excludes_disconnected_demand():
+    """A src/dst pair with no route at all is excluded, not crashed on."""
+    from tests.test_pipeline import _build_topology, _make_edge_dict
+    topo = _build_topology(4, [_make_edge_dict(0, 1), _make_edge_dict(2, 3)])
+    kept, excluded = preflight_filter(
+        topo, [Demand(id=0, src=0, dst=3, bitrate_gbps=400.0)],
+        qot_model=_ConstantQoT(25.0),
+        segment_combiner=SegmentCombiner(),
+        modulation_config=_two_format_mod_config(),
+        margin_db=0.5,
+    )
+    assert kept == []
+    assert len(excluded) == 1
+    assert excluded[0][1] == float("inf")
+
+
+def test_preflight_keeps_everything_when_all_demands_clear():
+    """A linear chain has no regen candidates (all degrees <= 2), so every
+    path is a single transparent segment — the preflight must still work."""
+    topo = make_linear_topology()
+    demands = [Demand(id=i, src=0, dst=4, bitrate_gbps=400.0) for i in range(3)]
+    kept, excluded = preflight_filter(
+        topo, demands,
+        qot_model=_ConstantQoT(25.0),
+        segment_combiner=SegmentCombiner(),
+        modulation_config=_two_format_mod_config(),
+        margin_db=0.5,
+    )
+    assert len(kept) == 3
+    assert excluded == []
