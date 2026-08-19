@@ -36,12 +36,13 @@ def main() -> None:
     regen = ctx.regen_placement
 
     p_cfg = cfg["pipeline"]
+    c_cfg = cfg["constraint"]
     t_cfg = cfg["training"]
 
     n_cand = len(ctx.regen_candidates)
     print(f"nodes={topology.num_nodes}  edges={len(ctx.edges)}  "
           f"regen_candidates(deg>=3)={n_cand}")
-    print(f"lambda_regen={p_cfg['lambda_regen']}  lambda_infeasible={p_cfg['lambda_infeasible']}  "
+    print(f"lambda_regen={p_cfg['lambda_regen']}  dual_init={c_cfg['dual_init']} margin_db={c_cfg['margin_db']}  "
           f"lambda_cost={p_cfg['lambda_cost']}  lr_regen={t_cfg['lr_regen']}\n")
 
     for epoch in [int(x) for x in args.epochs.split(",")]:
@@ -79,7 +80,10 @@ def main() -> None:
             if sf.item() > 0:
                 infeasible_ids.append(d.id)
 
-        L_feas = p_cfg["lambda_infeasible"] * feas.squeeze()
+        # At epoch 0 every per-demand dual equals dual_init (they diverge
+        # only after update_duals starts adjusting them per demand), so this
+        # single-scalar substitution is only valid at epoch 0.
+        L_feas = c_cfg["dual_init"] * feas.squeeze()
         L_regen = p_cfg["lambda_regen"] * regen_probs.sum()
         L_cost = p_cfg["lambda_cost"] * sum(path_noise_costs.values())
 

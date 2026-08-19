@@ -90,6 +90,7 @@ def main() -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     t_cfg, p_cfg = cfg["training"], cfg["pipeline"]
+    c_cfg = cfg["constraint"]
 
     # ---- untrained context (training's actual starting point) --------------
     # build_context seeds with cfg.get("seed", 42) before any module
@@ -108,7 +109,7 @@ def main() -> None:
     print(f"config={args.config}")
     print(f"checkpoint={ckpt_path} (epoch {ctx.ckpt['epoch']}, loss={ctx.ckpt['total_loss']:.4f})")
     print(f"nodes={topo.num_nodes} edges={n_edges}  "
-          f"lambda_cost={p_cfg['lambda_cost']} lambda_infeasible={p_cfg['lambda_infeasible']} "
+          f"lambda_cost={p_cfg['lambda_cost']} dual_init={c_cfg['dual_init']} margin_db={c_cfg['margin_db']} "
           f"lambda_regen={p_cfg['lambda_regen']}\n")
 
     final_epoch = t_cfg["epochs_e2e"]
@@ -219,7 +220,10 @@ def main() -> None:
             if sf.item() > 0:
                 n_infeas += 1
 
-        L_feas = p_cfg["lambda_infeasible"] * feas.squeeze()
+        # At epoch 0 every per-demand dual equals dual_init (they diverge
+        # only after update_duals starts adjusting them per demand), so this
+        # single-scalar substitution is only valid at epoch 0.
+        L_feas = c_cfg["dual_init"] * feas.squeeze()
         L_regen = p_cfg["lambda_regen"] * regen_probs.sum()
         L_cost = p_cfg["lambda_cost"] * sum(path_noise_costs.values())
 

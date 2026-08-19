@@ -113,7 +113,8 @@ def main() -> None:
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
         lambda_regen=cfg["pipeline"]["lambda_regen"],
-        lambda_infeasible=cfg["pipeline"]["lambda_infeasible"],
+        duals=torch.full((len(demands),), cfg["constraint"]["dual_init"]),
+        margin_db=cfg["constraint"]["margin_db"],
         lambda_cost=lambda_cost,
     )
     loss.backward()

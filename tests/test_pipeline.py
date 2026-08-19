@@ -172,6 +172,7 @@ def test_gradient_flow_edge_weight_net():
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
+        duals=torch.ones(len(demands)),
     )
     loss.backward()
 
@@ -200,6 +201,7 @@ def test_gradient_flow_regen_logits():
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
+        duals=torch.ones(len(demands)),
     )
     loss.backward()
 
@@ -226,6 +228,7 @@ def test_qot_frozen():
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
+        duals=torch.ones(len(demands)),
     )
     loss.backward()
 
@@ -305,6 +308,7 @@ def test_loss_backward_no_nan():
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
+        duals=torch.ones(len(demands)),
     )
     loss.backward()
 
@@ -387,6 +391,7 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
         regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
+        duals=torch.ones(1),
     )
     loss.backward()
 
@@ -424,6 +429,7 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
         loss, _ = compute_loss(
             gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
             regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
+            duals=torch.ones(1),
         )
         loss.backward()
         return torch.cat([p.grad.flatten() for p in pipeline.edge_weight_net.parameters()])
@@ -660,6 +666,7 @@ def test_scale_direction_gradient_is_zero():
         demands=demands,
         regen_probs=regen_probs,
         modulation_config=mod_cfg,
+        duals=torch.ones(len(demands)),
     )
     loss.backward()
 
@@ -705,6 +712,7 @@ def test_total_loss_invariant_to_edge_weight_scale():
                 demands=demands,
                 regen_probs=regen_probs,
                 modulation_config=mod_cfg,
+                duals=torch.ones(len(demands)),
             )
             return loss.item(), path_indicators[0].detach().clone()
         finally:
@@ -871,6 +879,7 @@ def test_edge_weights_do_not_collapse_over_training():
             demands=demands,
             regen_probs=regen_probs,
             modulation_config=mod_cfg,
+            duals=torch.ones(len(demands)),
         )
         loss.backward()
         optimizer.step()
