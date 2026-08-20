@@ -1,10 +1,19 @@
 """
 Differentiable segment combiner for end-to-end GSNR estimation.
 
-Physics: noise accumulates additively along a transparent path.
-A regenerator at a boundary resets accumulated noise (only the worse
-segment's noise propagates). The regenerator probability p ∈ (0,1)
-interpolates between the two regimes with a soft-max approximation.
+Physics: noise accumulates additively along a transparent path. A
+regenerator at a boundary splits the path into independent chunks — it
+rebuilds the signal, so noise does not carry across it. The end-to-end
+noise is the max over these chunks (the whole path must clear its
+threshold at its worst chunk, not its sum). Regenerator boundaries are
+probabilistic (p ∈ (0,1) per boundary): the fold generalizes the max over
+chunks to a probability-weighted soft max over *every* possible chunking of
+the path into contiguous segments, where each chunking's weight is its
+exact probability under independent Bernoulli(p_i) boundary decisions. This
+is exact at every p ∈ {0,1} boundary configuration (every chunking other
+than the one realized by that hard assignment gets weight exactly 0) and
+reduces to the existing 2-way `soft_max` helper below for a single
+boundary. See docs/investigations/regen_over_provisioning.md.
 """
 
 from __future__ import annotations
@@ -128,20 +137,70 @@ class SegmentCombiner(nn.Module):
             # Use float64 for accumulation precision
             return db_to_linear_noise(g_clamped.double())
 
-        accumulated_noise = _safe_noise(segment_gsnrs_db[0])
+        n = torch.stack([_safe_noise(g) for g in segment_gsnrs_db])  # (N,) float64
+        num_segments = n.shape[0]
+        device = n.device
+        dtype = n.dtype
 
-        for i in range(1, len(segment_gsnrs_db)):
-            p = regen_probs_at_boundaries[i - 1].double()
-            next_noise = _safe_noise(segment_gsnrs_db[i])
+        if num_segments == 1:
+            return linear_noise_to_db(n[0]).float()
 
-            # Passthrough (no regen): noises add
-            noise_no_regen = accumulated_noise + next_noise
+        p = torch.stack([pr.double() for pr in regen_probs_at_boundaries])  # (N-1,)
 
-            # Regenerator: only the worse (larger noise) segment matters
-            noise_regen = soft_max(accumulated_noise, next_noise, temperature=temperature)
+        # Every contiguous chunk [s, e] (0 <= s <= e < N) is a candidate
+        # realized chunk. chunk_noise(s, e) is deterministic (segments
+        # inside a chunk always sum); w(s, e) is the exact probability that
+        # [s, e] is the chunk actually realized under independent
+        # Bernoulli(p_i) boundary decisions: the boundary immediately
+        # before s and immediately after e must both cut (or be the path's
+        # own start/end), and every boundary strictly inside must not cut.
+        prefix = torch.cat([torch.zeros(1, dtype=dtype, device=device), torch.cumsum(n, dim=0)])
 
-            # Soft interpolation
-            accumulated_noise = (1.0 - p) * noise_no_regen + p * noise_regen
+        # log(1-p) prefix sums for inner(s,e) = prod_{k=s}^{e-1} (1-p[k])
+        log1mp = torch.log((1.0 - p).clamp_min(1e-300))
+        log1mp_prefix = torch.cat(
+            [torch.zeros(1, dtype=dtype, device=device), torch.cumsum(log1mp, dim=0)]
+        )
+        logp = torch.log(p.clamp_min(1e-300))
 
-        result_db = linear_noise_to_db(accumulated_noise)
-        return result_db.float()
+        # L(s) = logp[s-1] if s>0 else 0 (log 1); R(e) = logp[e] if e<N-1 else 0
+        logL = torch.cat([torch.zeros(1, dtype=dtype, device=device), logp])
+        logR = torch.cat([logp, torch.zeros(1, dtype=dtype, device=device)])
+
+        idx = torch.arange(num_segments, device=device)
+        s_idx = idx.unsqueeze(1).expand(num_segments, num_segments)
+        e_idx = idx.unsqueeze(0).expand(num_segments, num_segments)
+        valid = e_idx >= s_idx  # only s <= e are valid chunks
+
+        chunk_noise = prefix[e_idx + 1] - prefix[s_idx]
+        log_inner = log1mp_prefix[e_idx] - log1mp_prefix[s_idx]
+        log_w = logL.unsqueeze(1) + logR.unsqueeze(0) + log_inner
+
+        neg_inf = torch.tensor(float("-inf"), dtype=dtype, device=device)
+        log_w = torch.where(valid, log_w, neg_inf)
+        chunk_noise = torch.where(valid, chunk_noise, torch.zeros_like(chunk_noise))
+
+        flat_noise = chunk_noise.reshape(-1)
+        flat_logw = log_w.reshape(-1)
+
+        # Scale normalizer `m` (same role as soft_max's own detached `m`)
+        # must only consider candidates with non-negligible weight. A
+        # candidate that is essentially impossible (log-weight far below
+        # any float64-representable probability) can still have a LARGE raw
+        # chunk_noise -- e.g. the full-path chunk when interior boundaries
+        # are near-certainly cut. Including it in an unconditional
+        # max(chunk_noise) dilutes the scale for every genuinely relevant
+        # candidate and reintroduces the absolute-overshoot problem
+        # m-normalization exists to avoid (see
+        # docs/investigations/regen_over_provisioning.md). -30 matches this
+        # codebase's existing regen_logits saturation convention
+        # (scripts/diagnose_regen_ablation.py's +/-30 clamp); exp(-30) ~
+        # 9e-14, well below anything that could matter at float64 precision.
+        active = flat_logw > -30.0
+        active_noise = torch.where(active, flat_noise, torch.zeros_like(flat_noise))
+        m = active_noise.max().detach().clamp_min(1e-30)
+
+        terms = flat_logw + flat_noise / m / temperature
+        effective_noise = m * temperature * torch.logsumexp(terms, dim=0)
+
+        return linear_noise_to_db(effective_noise).float()

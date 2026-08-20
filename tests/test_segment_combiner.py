@@ -9,6 +9,11 @@ Test IDs:
   5. Gradient: ∂gsnr/∂p > 0 when regen helps
   6. Three segments, two boundaries → brute-force check
   7. Numerical stability: extreme GSNR values, no NaN/Inf
+  8. Accumulation precision: float64 internal, float32 return
+  9. GSNR clamp: inputs outside [-5, 35] dB behave as clamped
+  10-13. Multi-segment chunking (docs/investigations/regen_over_provisioning.md):
+      max-over-chunks physics, chunk completion before re-accumulation,
+      zero marginal value of a redundant regenerator, exact sum at p=0
 """
 
 import math
@@ -336,3 +341,141 @@ def test_gsnr_inputs_are_clamped_to_the_documented_range():
         temperature=0.01,
     )
     assert wild.item() == pytest.approx(clamped.item(), abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Tests 10-13: multi-segment chunking — docs/investigations/
+# regen_over_provisioning.md. A regenerator rebuilds the signal, so the
+# path splits into independent CHUNKS at regenerated boundaries, and
+# end-to-end noise is the max over chunks (not a running accumulator that a
+# max is occasionally applied to, which is only correct when every
+# post-regenerator chunk happens to be a single segment — exactly the blind
+# spot the tests below were added to close). All five segments below carry
+# identical noise, 0.005 linear (-10*log10(0.005) = 23.0103 dB), so a
+# chunk's noise is exactly (segment count in chunk) * 0.005 and the
+# analytically-derived expected values below follow directly from that.
+# ---------------------------------------------------------------------------
+
+FIVE_SEG_NOISE = 0.005
+FIVE_SEG_DB = -10.0 * math.log10(FIVE_SEG_NOISE)  # 23.0103 dB
+
+
+def five_equal_segments():
+    return [t(FIVE_SEG_DB) for _ in range(5)]
+
+
+def test_multi_segment_chunks_equal_max_over_chunks():
+    """p=1 at boundaries 0 and 2 (regen after segment 0 and after segment
+    2), p=0 elsewhere -> chunks {0}, {1,2}, {3,4}. The largest chunk has 2
+    segments, so effective noise is 2*0.005 and GSNR = -10*log10(0.01) =
+    20.000 dB.
+
+    Under the pre-fix single-accumulator fold this measured 18.229 dB (a
+    1.771 dB error) because the accumulator kept adding to a stale running
+    max instead of restarting a fresh chunk at each regenerated boundary.
+    Tolerance is loosened to 0.05 dB (vs. the 5-segment fixture's own
+    verified soft-max chunk-tie overshoot of ~0.03 dB, see
+    docs/investigations/regen_over_provisioning.md) rather than the
+    single-boundary soft_max's tighter bound, since this fixture ties two
+    boundaries at hard p=1 simultaneously.
+    """
+    combiner = SegmentCombiner()
+    gsnrs = five_equal_segments()
+    probs = [t(1.0), t(0.0), t(1.0), t(0.0)]  # cut after seg 0, cut after seg 2
+
+    result = combiner(gsnrs, probs, temperature=0.01).item()
+    expected = -10.0 * math.log10(2 * FIVE_SEG_NOISE)  # 20.000 dB
+
+    assert result == pytest.approx(expected, abs=0.05), (
+        f"chunks {{0}},{{1,2}},{{3,4}}: expected ~{expected:.4f} dB "
+        f"(max chunk = 2 segments), got {result:.4f} dB"
+    )
+
+
+def test_chunk_completes_before_next_accumulates():
+    """p=1 at boundary 1 only (regen after segment 1), p=0 elsewhere ->
+    chunks {0,1}, {2,3,4}. The larger chunk has 3 segments, so effective
+    noise is 3*0.005 and GSNR = -10*log10(0.015) = 18.2391 dB.
+
+    Under the pre-fix single-accumulator fold this measured 16.990 dB (a
+    1.249 dB error): the accumulator applied a max at the boundary but then
+    kept ADDING segments 2-4 onto that max instead of starting a fresh
+    chunk, so it never saw that {2,3,4} accumulates to 3 segments' worth of
+    noise before being compared to {0,1}.
+    """
+    combiner = SegmentCombiner()
+    gsnrs = five_equal_segments()
+    probs = [t(0.0), t(1.0), t(0.0), t(0.0)]  # cut after seg 1 only
+
+    result = combiner(gsnrs, probs, temperature=0.01).item()
+    expected = -10.0 * math.log10(3 * FIVE_SEG_NOISE)  # 18.2391 dB
+
+    assert result == pytest.approx(expected, abs=1e-3), (
+        f"chunks {{0,1}},{{2,3,4}}: expected ~{expected:.4f} dB "
+        f"(max chunk = 3 segments), got {result:.4f} dB"
+    )
+
+
+def test_redundant_regenerator_has_zero_marginal_value():
+    """This is the property that encodes *why* the pre-fix fold caused
+    over-provisioning (docs/investigations/regen_over_provisioning.md):
+    under correct chunk-max physics, adding a regenerator on top of one
+    that already makes the max-chunk no bigger is worth exactly 0 dB, so
+    any positive lambda_regen evicts a redundant node immediately. The
+    pre-fix fold reported this redundant regenerator as worth +1.233 dB
+    (16.990 -> 18.223), giving it a fake positive marginal value that only
+    a large enough price could overcome.
+
+    Boundary 1 alone -> chunks {0,1},{2,3,4}, max chunk = 3 segments.
+    Boundaries 0 and 1 -> chunks {0},{1},{2,3,4}, max chunk is STILL 3
+    segments (the extra cut at boundary 0 only shrinks the already-smaller
+    chunk), so the two configurations must be equal.
+    """
+    combiner = SegmentCombiner()
+    gsnrs = five_equal_segments()
+
+    boundary_1_alone = combiner(
+        gsnrs, [t(0.0), t(1.0), t(0.0), t(0.0)], temperature=0.01
+    ).item()
+    boundary_0_and_1 = combiner(
+        gsnrs, [t(1.0), t(1.0), t(0.0), t(0.0)], temperature=0.01
+    ).item()
+
+    delta = abs(boundary_0_and_1 - boundary_1_alone)
+    assert delta < 0.02, (
+        f"redundant regenerator should add ~0 dB, got {boundary_1_alone:.4f} "
+        f"-> {boundary_0_and_1:.4f} dB (delta {delta:.4f} dB)"
+    )
+
+
+def test_zero_regen_probability_is_exact_sum_at_loose_temperature():
+    """All boundary probabilities exactly 0, at the loose t=0.5 default
+    temperature (epochs 1-10, and segment_combiner's own default): the
+    fold must reduce to a plain sum of segment noise, exactly, with no
+    residual soft-max contribution from the zero sentinel.
+
+    This guards the `any_regen`-style sentinel problem the original
+    two-state design in docs/investigations/regen_over_provisioning.md
+    called out explicitly: any construction where a "nothing happened yet"
+    zero is blended through soft_max at loose temperature picks up a
+    ~6% scale-normalised excess (soft_max(0, C, t=0.5) = C*1.0635 != C).
+    This N-way weighted log-sum-exp fold has no such sentinel -- at p=0
+    every chunk other than the full path has weight exactly 0 (log-weight
+    -inf via clamp_min(1e-300)), so the sum degenerates to the single
+    active exp() term and cancels exactly against the temperature*log()
+    outside -- but the test is kept as a standing regression guard.
+    """
+    combiner = SegmentCombiner()
+    gsnrs = [t(15.0), t(9.0), t(20.0), t(12.5)]
+    n_segments = len(gsnrs)
+    probs = [t(0.0)] * (n_segments - 1)
+
+    result = combiner(gsnrs, probs, temperature=0.5).item()
+
+    total_noise = sum(10 ** (-g.item() / 10) for g in gsnrs)
+    expected = -10.0 * math.log10(total_noise)
+
+    assert result == pytest.approx(expected, abs=1e-4), (
+        f"all p=0 at t=0.5: expected exact sum {expected:.4f} dB, "
+        f"got {result:.4f} dB"
+    )
