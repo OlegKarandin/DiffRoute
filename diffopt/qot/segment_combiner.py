@@ -207,16 +207,17 @@ class SegmentCombiner(nn.Module):
             # combination, never blended through a shared-temperature
             # nonlinear op (that structural mistake is what the module
             # docstring's "first attempt" paragraph describes). Real
-            # topology paths measured up to 14 segments
-            # (scripts/diagnose_fold_error.py); this is O(2^(N-1)),
-            # intractable well before N=8000 -- fail loudly rather than hang
-            # if that assumption is ever violated.
+            # topology paths measured up to 18 boundaries (ind_132's
+            # km-shortest paths -- see
+            # docs/investigations/fold_formula_scalability.md); this is
+            # O(2^(N-1)), intractable well before N=8000 -- fail loudly
+            # rather than hang if that assumption is ever violated.
             if num_boundaries > 20:
                 raise ValueError(
                     f"SegmentCombiner's exact fractional-probability fold is "
                     f"O(2^{num_boundaries}) and intractable at this length "
-                    f"(real topology paths measured <=14 segments, see "
-                    f"docs/investigations/regen_over_provisioning.md). If "
+                    f"(real topology paths measured <=18 boundaries, see "
+                    f"docs/investigations/fold_formula_scalability.md). If "
                     f"this is a real path, something upstream changed; if "
                     f"intentional, this fold needs a different algorithm "
                     f"for this regime."
@@ -255,13 +256,21 @@ class SegmentCombiner(nn.Module):
             partition_noise = (m.squeeze(1) * temperature) * torch.logsumexp(terms, dim=1)
 
             # Each partition's TRUE probability, entirely outside any
-            # exponential: log-space product of p at cut boundaries and
-            # (1-p) at uncut ones, exponentiated once per partition.
-            logp = torch.log(p.clamp_min(1e-300))
-            log1mp = torch.log((1.0 - p).clamp_min(1e-300))
-            bits_f = bits.to(dtype)
-            log_partition_prob = bits_f @ logp + (1.0 - bits_f) @ log1mp
-            partition_prob = torch.exp(log_partition_prob)
+            # exponential: a direct product of p at cut boundaries and
+            # (1-p) at uncut ones -- no log/clamp_min needed, so there is
+            # no clamped region to zero a gradient in. A prior log-space
+            # formulation (logp/log1mp via clamp_min(1e-300), then
+            # exp(bits_f @ logp + (1-bits_f) @ log1mp)) was bit-identical
+            # in forward value but wrong in gradient: when a boundary p
+            # saturates to exactly 1.0 (reachable in float32 well within
+            # production logit range), (1-p)=0.0 got clamped to 1e-300,
+            # and clamp_min's gradient is zero in the clamped region -- so
+            # d(log1mp)/dp came out as 0 instead of the true (very large)
+            # value, flipping the sign of the gradient on regen_logits at
+            # that boundary. `1.0 - p_expanded` has gradient -1 everywhere,
+            # unclamped, so the direct product is correct at the vertex too.
+            p_expanded = p.unsqueeze(0).expand(num_partitions, num_boundaries)
+            partition_prob = torch.where(bits.bool(), p_expanded, 1.0 - p_expanded).prod(dim=1)
 
             effective_noise = (partition_prob * partition_noise).sum()
 

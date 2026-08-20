@@ -16,6 +16,13 @@ Test IDs:
       zero marginal value of a redundant regenerator, exact sum at p=0
   14. Fractional p at production temperature vs a hand-derived expectation
       (round-2 regression guard, docs/investigations/regen_over_provisioning.md)
+  15. Gradient regression: wrong-sign gradient when a boundary probability
+      saturates to exactly 1.0 alongside a fractional boundary (final-review
+      fix wave Fix 1)
+  16. Fractional fold with 3+ boundaries (8 partitions) vs brute-force
+      enumeration (final-review fix wave Fix 5.1)
+  17. num_boundaries > 20 guard actually raises ValueError (final-review fix
+      wave Fix 5.2)
 """
 
 import math
@@ -540,3 +547,138 @@ def test_zero_regen_probability_is_exact_sum_at_loose_temperature():
         f"all p=0 at t=0.5: expected exact sum {expected:.4f} dB, "
         f"got {result:.4f} dB"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 15: gradient regression — wrong-sign gradient when a boundary
+# probability saturates to exactly 1.0 alongside a fractional boundary
+# (final-review fix wave Fix 1)
+# ---------------------------------------------------------------------------
+
+def test_gradient_correct_sign_when_one_boundary_saturates_to_one():
+    """Regression guard for the wrong-sign gradient bug: the fractional
+    branch used to compute each partition's probability via
+    `logp = log(p.clamp_min(1e-300))`, `log1mp = log((1-p).clamp_min(1e-300))`.
+    When a boundary p is exactly 1.0 (reachable: sigmoid(logit/tau)
+    saturates to exactly 1.0 in float32 well within the production logit
+    range), `(1-p)=0.0` got clamped to 1e-300, and `clamp_min`'s gradient
+    is zero in the clamped region -- so `d(log1mp)/dp` came out as 0
+    instead of the true (very large) value, flipping the sign of the
+    gradient on `regen_logits` at that boundary.
+
+    This exact mixed configuration -- one boundary exactly hard (p=1.0),
+    another fractional (p=0.4) -- is what hides the bug: the forward
+    computation was already correct at these inputs (a value-only test
+    passes both before and after this fix), so only `.backward()` exposes
+    it. Pre-fix this measured a gradient of exactly -10/ln(10) =
+    -4.342944... (independent of segment values or the other boundary's
+    p -- a structural artifact of the clamp, not real physics, since the
+    missing term is exactly the gradient contribution from the
+    now-clamped-away uncut-at-this-boundary partitions). Post-fix it
+    matches finite-difference truth.
+    """
+    combiner = SegmentCombiner()
+    gsnr = [t(26.0), t(26.0), t(26.0)]  # production segment-length noise scale
+    p0 = t(1.0, requires_grad=True)  # saturated boundary -- the vertex where the bug fires
+    p1 = t(0.4)  # fractional boundary
+
+    result = combiner(gsnr, [p0, p1], temperature=0.01)
+    result.backward()
+    grad = p0.grad.item()
+
+    assert grad > 0.0, (
+        f"Expected positive gradient (regen should never look harmful), "
+        f"got {grad:.6f} -- this is the same class of bug (wrong-sign "
+        f"gradient on regen placement) this entire investigation exists "
+        f"to eliminate"
+    )
+
+    # Finite-difference truth via a 2nd-order one-sided (backward) stencil
+    # -- p0 cannot exceed 1.0 physically, so a one-sided estimator is used:
+    # f'(x) ~= (3f(x) - 4f(x-h) + f(x-2h)) / (2h)
+    eps = 1e-2
+    with torch.no_grad():
+        r0 = combiner(gsnr, [t(1.0), p1], temperature=0.01).item()
+        r1 = combiner(gsnr, [t(1.0 - eps), p1], temperature=0.01).item()
+        r2 = combiner(gsnr, [t(1.0 - 2 * eps), p1], temperature=0.01).item()
+    fd = (3 * r0 - 4 * r1 + r2) / (2 * eps)
+
+    assert grad == pytest.approx(fd, abs=1e-3), (
+        f"autograd gradient {grad:.6f} does not match finite-difference "
+        f"truth {fd:.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 16: fractional fold with 3+ boundary probabilities (8 partitions),
+# vs brute-force enumeration (final-review fix wave Fix 5.1). The existing
+# fractional-probability tests only exercise 1-2 boundaries (2 or 4
+# partitions); this exercises the partition-enumeration machinery at a
+# wider fan-out.
+# ---------------------------------------------------------------------------
+
+def test_fractional_fold_with_three_boundaries_matches_brute_force():
+    """4 segments, 3 fractional boundary probabilities -> 8 hard partitions.
+    Compares against brute-force enumeration of all 8 regen-decision
+    configs, each weighted by its true realization probability, each
+    config's noise computed as the TRUE max over the chunks its cuts
+    produce (mirrors test_three_segments_two_boundaries's brute-force
+    reference, generalized to 3 boundaries).
+    """
+    gsnr_vals = [12.0, 22.0, 9.0, 18.0]
+    p_vals = [0.2, 0.6, 0.4]
+    temperature = 0.01  # small so soft_max ~= hard max within each partition
+
+    combiner = SegmentCombiner()
+    g = [t(v) for v in gsnr_vals]
+    p = [t(v) for v in p_vals]
+
+    result = combiner(g, p, temperature=temperature).item()
+
+    def combine_hard(g_list, regens):
+        noises = [10 ** (-v / 10) for v in g_list]
+        chunks = []
+        current = noises[0]
+        for i, r in enumerate(regens):
+            n_next = noises[i + 1]
+            if r == 1:
+                chunks.append(current)
+                current = n_next
+            else:
+                current += n_next
+        chunks.append(current)
+        return max(chunks)
+
+    weighted_noise = 0.0
+    for mask in range(8):  # 2**3 partitions
+        regens = [(mask >> i) & 1 for i in range(3)]
+        prob = 1.0
+        for r, pv in zip(regens, p_vals):
+            prob *= pv if r == 1 else (1.0 - pv)
+        weighted_noise += prob * combine_hard(gsnr_vals, regens)
+
+    expected = -10 * math.log10(weighted_noise)
+
+    assert result == pytest.approx(expected, abs=1e-3), (
+        f"4-segment/3-boundary check: expected {expected:.6f} dB, "
+        f"got {result:.6f} dB"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 17: num_boundaries > 20 guard actually raises ValueError (final-review
+# fix wave Fix 5.2) -- the guard exists in the code but was previously
+# untested.
+# ---------------------------------------------------------------------------
+
+def test_too_many_boundaries_raises_value_error():
+    """A 22-segment path (21 boundaries, > the 20-boundary tractability
+    guard) with all-fractional boundary probabilities must raise
+    ValueError, not silently attempt an O(2^21) enumeration."""
+    combiner = SegmentCombiner()
+    n_segments = 22
+    gsnrs = [t(15.0) for _ in range(n_segments)]
+    probs = [t(0.3) for _ in range(n_segments - 1)]
+
+    with pytest.raises(ValueError, match="21"):
+        combiner(gsnrs, probs, temperature=0.01)
