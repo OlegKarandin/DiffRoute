@@ -6,14 +6,21 @@ regenerator at a boundary splits the path into independent chunks — it
 rebuilds the signal, so noise does not carry across it. The end-to-end
 noise is the max over these chunks (the whole path must clear its
 threshold at its worst chunk, not its sum). Regenerator boundaries are
-probabilistic (p ∈ (0,1) per boundary): the fold generalizes the max over
-chunks to a probability-weighted soft max over *every* possible chunking of
-the path into contiguous segments, where each chunking's weight is its
-exact probability under independent Bernoulli(p_i) boundary decisions. This
-is exact at every p ∈ {0,1} boundary configuration (every chunking other
-than the one realized by that hard assignment gets weight exactly 0) and
-reduces to the existing 2-way `soft_max` helper below for a single
-boundary. See docs/investigations/regen_over_provisioning.md.
+probabilistic (p ∈ (0,1) per boundary): the fold is the exact expectation,
+over every hard partition of the path into chunks (2^(N-1) of them, one per
+subset of boundaries that cuts), of that partition's own soft-max-over-its-
+chunks noise, weighted *linearly* by the partition's true realization
+probability under independent Bernoulli(p_i) boundary decisions — never
+blended through a shared-temperature exponential across partitions, only
+smoothed *within* one partition's own fixed chunk set. This is exact at
+every p ∈ {0,1} boundary configuration and reduces exactly to the existing
+2-way `soft_max` helper below for a single boundary (2 partitions: "no
+cut" weighted (1-p), "cut" weighted p). A first attempt at generalizing
+`soft_max` put probability *inside* the shared exponential instead; that
+swamped the probability term against the noise term's much larger dynamic
+range at production temperature and silently reintroduced a shaped version
+of the bug this fold exists to fix. See
+docs/investigations/regen_over_provisioning.md.
 """
 
 from __future__ import annotations
@@ -67,6 +74,19 @@ def soft_max(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.5) -> torc
     m = torch.maximum(a, b).detach().clamp_min(1e-30)
     stacked = torch.stack([a / m / t, b / m / t], dim=0)
     return m * t * torch.logsumexp(stacked, dim=0)
+
+
+def _soft_max_over(noises: torch.Tensor, temperature: float) -> torch.Tensor:
+    """N-way generalization of `soft_max` above: scale-normalized log-sum-exp
+    over an arbitrary number of already-deterministic (not probability-
+    weighted) chunk noises. Used only *within* one hard partition's own
+    fixed chunk set — never across partitions, which is precisely the
+    distinction the module docstring's "first attempt" paragraph is about.
+    """
+    if noises.shape[0] == 1:
+        return noises[0]
+    m = noises.max().detach().clamp_min(1e-30)
+    return m * temperature * torch.logsumexp(noises / m / temperature, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -146,61 +166,103 @@ class SegmentCombiner(nn.Module):
             return linear_noise_to_db(n[0]).float()
 
         p = torch.stack([pr.double() for pr in regen_probs_at_boundaries])  # (N-1,)
+        num_boundaries = num_segments - 1
 
-        # Every contiguous chunk [s, e] (0 <= s <= e < N) is a candidate
-        # realized chunk. chunk_noise(s, e) is deterministic (segments
-        # inside a chunk always sum); w(s, e) is the exact probability that
-        # [s, e] is the chunk actually realized under independent
-        # Bernoulli(p_i) boundary decisions: the boundary immediately
-        # before s and immediately after e must both cut (or be the path's
-        # own start/end), and every boundary strictly inside must not cut.
-        prefix = torch.cat([torch.zeros(1, dtype=dtype, device=device), torch.cumsum(n, dim=0)])
+        is_hard = bool(((p == 0.0) | (p == 1.0)).all().item())
 
-        # log(1-p) prefix sums for inner(s,e) = prod_{k=s}^{e-1} (1-p[k])
-        log1mp = torch.log((1.0 - p).clamp_min(1e-300))
-        log1mp_prefix = torch.cat(
-            [torch.zeros(1, dtype=dtype, device=device), torch.cumsum(log1mp, dim=0)]
-        )
-        logp = torch.log(p.clamp_min(1e-300))
+        if is_hard:
+            # No real randomness: exactly one partition has nonzero
+            # probability. Cut deterministically at p==1 boundaries and
+            # soft-max the resulting REAL chunks -- O(N), the only tractable
+            # path for very long chains (this file's own float64-precision
+            # test uses thousands of segments, all p=0). A genuinely
+            # separate code path from the fractional case below, not a
+            # special-cased tolerance on the same formula -- see
+            # docs/investigations/regen_over_provisioning.md.
+            #
+            # Reading each p via .item() to make this Python control-flow
+            # decision gives this branch an exact-zero gradient w.r.t. p,
+            # rather than the fractional branch's own (already vanishingly
+            # small, but technically nonzero) limiting gradient as p->{0,1}.
+            # Deliberate and practically inert: production probabilities
+            # come from sigmoid(logit) with logits saturating around +/-30
+            # (this codebase's convention), and sigmoid(30) != 1.0 exactly
+            # in float64, so real training never actually lands in this
+            # branch -- only this synthetic test and explicit literal-0/1
+            # diagnostic calls do.
+            chunk_sums = []
+            cur = n[0]
+            for i in range(1, num_segments):
+                if p[i - 1].item() == 1.0:
+                    chunk_sums.append(cur)
+                    cur = n[i]
+                else:
+                    cur = cur + n[i]
+            chunk_sums.append(cur)
+            effective_noise = _soft_max_over(torch.stack(chunk_sums), temperature)
+        else:
+            # Genuinely fractional boundary probabilities: exact expectation
+            # over every hard partition of the path (2^(N-1) of them), each
+            # weighted by its TRUE realization probability -- a plain linear
+            # combination, never blended through a shared-temperature
+            # nonlinear op (that structural mistake is what the module
+            # docstring's "first attempt" paragraph describes). Real
+            # topology paths measured up to 14 segments
+            # (scripts/diagnose_fold_error.py); this is O(2^(N-1)),
+            # intractable well before N=8000 -- fail loudly rather than hang
+            # if that assumption is ever violated.
+            if num_boundaries > 20:
+                raise ValueError(
+                    f"SegmentCombiner's exact fractional-probability fold is "
+                    f"O(2^{num_boundaries}) and intractable at this length "
+                    f"(real topology paths measured <=14 segments, see "
+                    f"docs/investigations/regen_over_provisioning.md). If "
+                    f"this is a real path, something upstream changed; if "
+                    f"intentional, this fold needs a different algorithm "
+                    f"for this regime."
+                )
+            num_partitions = 2 ** num_boundaries
+            k_idx = torch.arange(num_partitions, device=device, dtype=torch.int64)
+            shifts = torch.arange(num_boundaries, device=device, dtype=torch.int64)
+            # bit b of partition k: whether boundary b is cut in that partition
+            bits = (k_idx.unsqueeze(1) >> shifts.unsqueeze(0)) & 1  # (K, N-1)
 
-        # L(s) = logp[s-1] if s>0 else 0 (log 1); R(e) = logp[e] if e<N-1 else 0
-        logL = torch.cat([torch.zeros(1, dtype=dtype, device=device), logp])
-        logR = torch.cat([logp, torch.zeros(1, dtype=dtype, device=device)])
+            # chunk_id[k, i] = index (within partition k) of the chunk
+            # segment i belongs to -- one more than the number of cuts
+            # strictly before segment i.
+            cum_bits = torch.cumsum(bits, dim=1)
+            chunk_id = torch.cat(
+                [torch.zeros(num_partitions, 1, device=device, dtype=torch.int64), cum_bits],
+                dim=1,
+            )  # (K, N)
 
-        idx = torch.arange(num_segments, device=device)
-        s_idx = idx.unsqueeze(1).expand(num_segments, num_segments)
-        e_idx = idx.unsqueeze(0).expand(num_segments, num_segments)
-        valid = e_idx >= s_idx  # only s <= e are valid chunks
+            n_expand = n.unsqueeze(0).expand(num_partitions, num_segments).to(dtype)
+            chunk_sum = torch.zeros(num_partitions, num_segments, device=device, dtype=dtype)
+            chunk_sum.scatter_add_(1, chunk_id, n_expand)
 
-        chunk_noise = prefix[e_idx + 1] - prefix[s_idx]
-        log_inner = log1mp_prefix[e_idx] - log1mp_prefix[s_idx]
-        log_w = logL.unsqueeze(1) + logR.unsqueeze(0) + log_inner
+            num_chunks = cum_bits[:, -1] + 1
+            idx_range = torch.arange(num_segments, device=device, dtype=torch.int64).unsqueeze(0)
+            valid = idx_range < num_chunks.unsqueeze(1)  # (K, N): real chunk slots per partition
 
-        neg_inf = torch.tensor(float("-inf"), dtype=dtype, device=device)
-        log_w = torch.where(valid, log_w, neg_inf)
-        chunk_noise = torch.where(valid, chunk_noise, torch.zeros_like(chunk_noise))
+            neg_inf = torch.tensor(float("-inf"), dtype=dtype, device=device)
+            masked_sum = torch.where(valid, chunk_sum, torch.zeros_like(chunk_sum))
+            m = masked_sum.max(dim=1, keepdim=True).values.detach().clamp_min(1e-30)
+            # Unlike an earlier attempt, `valid` gates the actual logsumexp
+            # sum itself (literal -inf for every non-chunk slot), not just
+            # the scale normalizer m -- so a partition's soft-max never sees
+            # noise from a chunk slot it doesn't have.
+            terms = torch.where(valid, chunk_sum / m / temperature, neg_inf)
+            partition_noise = (m.squeeze(1) * temperature) * torch.logsumexp(terms, dim=1)
 
-        flat_noise = chunk_noise.reshape(-1)
-        flat_logw = log_w.reshape(-1)
+            # Each partition's TRUE probability, entirely outside any
+            # exponential: log-space product of p at cut boundaries and
+            # (1-p) at uncut ones, exponentiated once per partition.
+            logp = torch.log(p.clamp_min(1e-300))
+            log1mp = torch.log((1.0 - p).clamp_min(1e-300))
+            bits_f = bits.to(dtype)
+            log_partition_prob = bits_f @ logp + (1.0 - bits_f) @ log1mp
+            partition_prob = torch.exp(log_partition_prob)
 
-        # Scale normalizer `m` (same role as soft_max's own detached `m`)
-        # must only consider candidates with non-negligible weight. A
-        # candidate that is essentially impossible (log-weight far below
-        # any float64-representable probability) can still have a LARGE raw
-        # chunk_noise -- e.g. the full-path chunk when interior boundaries
-        # are near-certainly cut. Including it in an unconditional
-        # max(chunk_noise) dilutes the scale for every genuinely relevant
-        # candidate and reintroduces the absolute-overshoot problem
-        # m-normalization exists to avoid (see
-        # docs/investigations/regen_over_provisioning.md). -30 matches this
-        # codebase's existing regen_logits saturation convention
-        # (scripts/diagnose_regen_ablation.py's +/-30 clamp); exp(-30) ~
-        # 9e-14, well below anything that could matter at float64 precision.
-        active = flat_logw > -30.0
-        active_noise = torch.where(active, flat_noise, torch.zeros_like(flat_noise))
-        m = active_noise.max().detach().clamp_min(1e-30)
-
-        terms = flat_logw + flat_noise / m / temperature
-        effective_noise = m * temperature * torch.logsumexp(terms, dim=0)
+            effective_noise = (partition_prob * partition_noise).sum()
 
         return linear_noise_to_db(effective_noise).float()

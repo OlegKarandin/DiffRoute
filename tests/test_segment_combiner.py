@@ -14,6 +14,8 @@ Test IDs:
   10-13. Multi-segment chunking (docs/investigations/regen_over_provisioning.md):
       max-over-chunks physics, chunk completion before re-accumulation,
       zero marginal value of a redundant regenerator, exact sum at p=0
+  14. Fractional p at production temperature vs a hand-derived expectation
+      (round-2 regression guard, docs/investigations/regen_over_provisioning.md)
 """
 
 import math
@@ -209,7 +211,27 @@ def test_regen_never_increases_noise_across_noise_scales():
 def test_three_segments_two_boundaries():
     """
     With 2 boundaries each with probability p, compare against brute-force
-    enumeration of 4 binary configs weighted by (p^k * (1-p)^(2-k)).
+    enumeration of 4 binary configs weighted by (p^k * (1-p)^(2-k)), each
+    config's noise computed as the TRUE max over the chunks that
+    configuration's cuts produce (docs/investigations/
+    regen_over_provisioning.md) — i.e. partition at every regen=1 boundary,
+    sum noise within each resulting chunk, then take the max chunk. That is
+    NOT the same as a single accumulator that takes a max at a cut boundary
+    and keeps adding to it afterwards (config (1,0) here — cut at boundary
+    0 only — is exactly the case where those two disagree: the correct
+    chunks are {0},{1,2}, giving max noise 0.1, not the accumulate-then-max
+    recurrence's 0.1316).
+
+    This test previously used that buggy accumulator as its own brute-force
+    reference and passed only on a 0.5 dB tolerance (actual deviation
+    ~0.37-0.5 dB depending on the fold under test) rather than genuine
+    accuracy — the review that caught the exact-partition fold's own
+    structural bug (round 2 of this fix, see the module's docstring) also
+    caught this latent bug in the test's reference. With the reference
+    fixed to true chunk-max physics, this fold matches to double precision
+    (< 1e-6 dB) at t=0.01, since each partition's within-chunk soft-max
+    has a negligible overshoot at this fixture's noise scale and this
+    temperature — hence the correspondingly tight tolerance below.
     """
     gsnr_vals = [10.0, 20.0, 15.0]
     p_val = 0.3
@@ -221,32 +243,71 @@ def test_three_segments_two_boundaries():
 
     result = combiner(g, p, temperature=temperature).item()
 
-    # Brute force: enumerate regen decisions (0=passthrough, 1=regen) at each boundary
-    # Config (r1, r2): prob = p^(r1+r2) * (1-p)^(2-r1-r2)
+    # Brute force: enumerate regen decisions (0=passthrough, 1=regen) at each
+    # boundary. Config (r1, r2): prob = p^(r1+r2) * (1-p)^(2-r1-r2). Noise for
+    # a config is the TRUE max over the chunks its cuts produce.
     def combine_hard(g_list, regens):
         noises = [10 ** (-v / 10) for v in g_list]
-        acc = noises[0]
+        chunks = []
+        current = noises[0]
         for i, r in enumerate(regens):
             n_next = noises[i + 1]
-            if r == 0:  # no regen
-                acc = acc + n_next
-            else:       # regen: worst segment
-                acc = max(acc, n_next)
-        return -10 * math.log10(acc)
+            if r == 1:  # regen: this boundary cuts -- current chunk completes
+                chunks.append(current)
+                current = n_next
+            else:       # passthrough: extends the current chunk
+                current += n_next
+        chunks.append(current)
+        return max(chunks)
 
     configs = [(0, 0), (0, 1), (1, 0), (1, 1)]
     weighted_noise = 0.0
     for r1, r2 in configs:
         prob = (p_val ** (r1 + r2)) * ((1 - p_val) ** (2 - r1 - r2))
-        gsnr_config = combine_hard(gsnr_vals, [r1, r2])
-        noise_config = 10 ** (-gsnr_config / 10)
-        weighted_noise += prob * noise_config
+        weighted_noise += prob * combine_hard(gsnr_vals, [r1, r2])
 
     expected = -10 * math.log10(weighted_noise)
 
-    # Soft-max introduces approximation error; allow 0.5 dB tolerance
-    assert abs(result - expected) < 0.5, (
-        f"3-segment check: expected ~{expected:.3f} dB, got {result:.3f} dB"
+    assert result == pytest.approx(expected, abs=1e-3), (
+        f"3-segment check: expected {expected:.6f} dB, got {result:.6f} dB"
+    )
+
+
+def test_fractional_p_matches_hand_derived_expectation_at_production_temperature():
+    """Round-2 regression guard, docs/investigations/regen_over_provisioning.md:
+    a first attempt at generalizing soft_max to N-way chunking put each
+    chunk's realization probability INSIDE a shared-temperature exponential.
+    Since chunk noise differences scale as O(1/t) (~50-100 at production
+    t=0.01) while log-probability differences are O(1), probability got
+    swamped and the fold silently collapsed toward the no-regen value
+    regardless of p -- reintroducing a shaped version of the original bug.
+
+    Reviewer's exact counterexample: two 26 dB segments (the ~180-210 km
+    real-topology segment length), p=0.5, t=0.01. That first attempt gave
+    23.02 dB; hand-derived truth (this is a single boundary, so it must
+    equal the established, already-correct N=2 formula
+    `(1-p)*(n1+n2) + p*soft_max(n1,n2,t)`) is 24.229065 dB.
+    """
+    combiner = SegmentCombiner()
+    gsnr_1 = t(26.0)
+    gsnr_2 = t(26.0)
+    p = t(0.5)
+    temperature = 0.01
+
+    result = combiner([gsnr_1, gsnr_2], [p], temperature=temperature).item()
+
+    n = 10 ** (-26.0 / 10)
+    sm = soft_max(
+        torch.tensor(n, dtype=torch.float64), torch.tensor(n, dtype=torch.float64),
+        temperature=temperature,
+    ).item()
+    expected_noise = 0.5 * (2 * n) + 0.5 * sm
+    expected = -10.0 * math.log10(expected_noise)  # 24.229065 dB
+
+    assert result == pytest.approx(expected, abs=1e-3), (
+        f"fractional p at production temperature: expected {expected:.6f} dB, "
+        f"got {result:.6f} dB (a ~1 dB-scale gap here is exactly the shape of "
+        f"the round-2 regression this test guards against)"
     )
 
 
