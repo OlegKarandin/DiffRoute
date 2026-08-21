@@ -32,10 +32,11 @@ import torch
 from diffopt.qot.segment_combiner import (
     MAX_EXACT_FOLD_SEGMENTS,
     SegmentCombiner,
+    _expected_max_chunk_noise,
     db_to_linear_noise,
     linear_noise_to_db,
-    soft_max,
 )
+from tests._fold_reference import exact_expectation_by_enumeration, hard_chunk_max
 
 
 def t(val: float, requires_grad: bool = False) -> torch.Tensor:
@@ -248,27 +249,11 @@ def test_three_segments_two_boundaries():
     result = combiner(g, p).item()
 
     # Brute force: enumerate regen decisions (0=passthrough, 1=regen) at each
-    # boundary. Config (r1, r2): prob = p^(r1+r2) * (1-p)^(2-r1-r2). Noise for
-    # a config is the TRUE max over the chunks its cuts produce.
-    def combine_hard(g_list, regens):
-        noises = [10 ** (-v / 10) for v in g_list]
-        chunks = []
-        current = noises[0]
-        for i, r in enumerate(regens):
-            n_next = noises[i + 1]
-            if r == 1:  # regen: this boundary cuts -- current chunk completes
-                chunks.append(current)
-                current = n_next
-            else:       # passthrough: extends the current chunk
-                current += n_next
-        chunks.append(current)
-        return max(chunks)
-
-    configs = [(0, 0), (0, 1), (1, 0), (1, 1)]
-    weighted_noise = 0.0
-    for r1, r2 in configs:
-        prob = (p_val ** (r1 + r2)) * ((1 - p_val) ** (2 - r1 - r2))
-        weighted_noise += prob * combine_hard(gsnr_vals, [r1, r2])
+    # boundary via the shared oracle (tests/_fold_reference.py), weighting
+    # each config by its true realization probability, using the TRUE max
+    # over the chunks its cuts produce.
+    noises = [10 ** (-v / 10) for v in gsnr_vals]
+    weighted_noise = exact_expectation_by_enumeration(noises, [p_val, p_val])
 
     expected = -10 * math.log10(weighted_noise)
 
@@ -615,27 +600,8 @@ def test_fractional_fold_with_three_boundaries_matches_brute_force():
 
     result = combiner(g, p).item()
 
-    def combine_hard(g_list, regens):
-        noises = [10 ** (-v / 10) for v in g_list]
-        chunks = []
-        current = noises[0]
-        for i, r in enumerate(regens):
-            n_next = noises[i + 1]
-            if r == 1:
-                chunks.append(current)
-                current = n_next
-            else:
-                current += n_next
-        chunks.append(current)
-        return max(chunks)
-
-    weighted_noise = 0.0
-    for mask in range(8):  # 2**3 partitions
-        regens = [(mask >> i) & 1 for i in range(3)]
-        prob = 1.0
-        for r, pv in zip(regens, p_vals):
-            prob *= pv if r == 1 else (1.0 - pv)
-        weighted_noise += prob * combine_hard(gsnr_vals, regens)
+    noises = [10 ** (-v / 10) for v in gsnr_vals]
+    weighted_noise = exact_expectation_by_enumeration(noises, p_vals)
 
     expected = -10 * math.log10(weighted_noise)
 
@@ -664,3 +630,206 @@ def test_too_many_segments_raises_value_error():
 
     with pytest.raises(ValueError, match="capped at"):
         combiner(gsnrs, probs)
+
+
+# ---------------------------------------------------------------------------
+# Tests 18-22: DP-vs-oracle validation using the shared brute-force reference
+# (tests/_fold_reference.py), gradcheck, the raised segment-count cap, and
+# location-aware gradients. Added alongside the oracle extraction above.
+# ---------------------------------------------------------------------------
+
+def _dp_expected_noise(gsnr_db_vals, p_vals):
+    """Call directly into `_expected_max_chunk_noise` -- the float64 core
+    `SegmentCombiner.forward`'s fractional branch calls -- bypassing
+    `forward`'s final `.float()` return cast.
+
+    That cast is fine for production (float32 GSNR is plenty for the
+    physics), but it caps the public API's relative precision at ~1e-7,
+    which is far too loose to check the DP's own arithmetic against the
+    brute-force oracle at the ~1e-12 relative floor float64 rounding
+    actually leaves. Comparing the pre-cast linear-domain value instead of
+    the post-cast dB value is what makes the tight tolerance below
+    meaningful rather than trivially satisfied by the cast's rounding.
+    """
+    n = torch.tensor([10 ** (-v / 10) for v in gsnr_db_vals], dtype=torch.float64)
+    p = torch.tensor(p_vals, dtype=torch.float64)
+    return _expected_max_chunk_noise(n, p).item()
+
+
+def _fractional_fold_double(gsnr_db: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """Reproduce `SegmentCombiner.forward`'s fractional branch (clamp ->
+    dB-to-linear -> `_expected_max_chunk_noise` -> linear-to-dB) entirely in
+    float64, without the final `.float()` cast, so `torch.autograd.gradcheck`'s
+    numerical Jacobian has the precision it needs. `gsnr_db` and `p` are
+    vector tensors (shape (N,) and (N-1,)) rather than `forward`'s lists of
+    scalar tensors, since gradcheck needs single tensors to perturb.
+    """
+    g_clamped = gsnr_db.clamp(-5.0, 35.0)
+    n = db_to_linear_noise(g_clamped.double())
+    effective_noise = _expected_max_chunk_noise(n, p.double())
+    return linear_noise_to_db(effective_noise)
+
+
+def test_dp_matches_oracle_across_probability_regimes():
+    """DP (`_expected_max_chunk_noise`) vs. the brute-force oracle
+    (`exact_expectation_by_enumeration`) across four probability regimes,
+    each with a handful of cases up to N=10 segments. Compared in the
+    linear-domain float64 expectation both sides compute internally (see
+    `_dp_expected_noise`'s docstring for why: the public dB API's float32
+    cast is too lossy for a 1e-12 relative check), at 1e-12 RELATIVE
+    tolerance -- tight because this is a genuine double-precision arithmetic
+    check, not a physics-tolerance one; nothing here is soft-maxed or
+    annealed anymore (see module docstring of segment_combiner.py).
+    """
+    regimes = {
+        "near-tied": [
+            ([10.0, 10.0, 10.05], [0.5, 0.5]),
+            ([12.0, 12.0, 12.0, 12.03, 8.0], [0.4, 0.5, 0.5, 0.6]),
+            (
+                [15.0, 15.01, 14.99, 15.02, 14.98, 15.0, 15.01, 14.99, 15.0, 15.03],
+                [0.5] * 9,
+            ),
+        ],
+        "lopsided": [
+            ([0.0, 30.0, 30.0, 30.0], [0.5, 0.3, 0.7]),
+            ([-5.0, 34.0, 33.0, 32.0, 31.0, 30.0], [0.2, 0.9, 0.1, 0.5, 0.4]),
+            ([0.0] + [30.0] * 9, [0.5] * 9),
+        ],
+        "saturated-p": [
+            ([15.0, 20.0, 10.0, 25.0], [1.0, 0.4, 0.0]),
+            ([9.0, 18.0, 27.0, 14.0, 22.0], [0.0, 1.0, 0.5, 1.0]),
+            ([10.0, 20.0, 15.0, 25.0, 12.0, 18.0], [1.0, 0.0, 0.5, 1.0, 0.3]),
+        ],
+        "exactly-tied": [
+            ([15.0, 15.0, 15.0, 15.0], [0.5, 0.5, 0.5]),
+            ([20.0, 20.0, 20.0, 20.0, 20.0], [0.3, 0.3, 0.3, 0.3]),
+            ([20.0] * 10, [0.4] * 9),
+        ],
+    }
+    for regime_name, cases in regimes.items():
+        for gsnr_vals, p_vals in cases:
+            noises = [10 ** (-v / 10) for v in gsnr_vals]
+            dp = _dp_expected_noise(gsnr_vals, p_vals)
+            oracle = exact_expectation_by_enumeration(noises, p_vals)
+            assert dp == pytest.approx(oracle, rel=1e-12), (
+                f"[{regime_name}] DP {dp!r} vs oracle {oracle!r} "
+                f"(N={len(gsnr_vals)}, gsnr={gsnr_vals}, p={p_vals})"
+            )
+
+
+def test_gradcheck_fractional_branch_wrt_boundary_probabilities():
+    """`torch.autograd.gradcheck` on the fractional branch's float64 core
+    (`_fractional_fold_double`) w.r.t. the boundary probabilities `p`. Small
+    N (5 segments / 4 boundaries) since gradcheck's numerical Jacobian costs
+    one forward/backward pass per input element."""
+    gsnr_db = torch.tensor([10.0, 22.0, 15.0, 28.0, 9.0], dtype=torch.float64)
+    p = torch.tensor([0.3, 0.6, 0.45, 0.8], dtype=torch.float64, requires_grad=True)
+
+    def f(p_):
+        return _fractional_fold_double(gsnr_db, p_)
+
+    assert torch.autograd.gradcheck(f, (p,), eps=1e-6, atol=1e-4)
+
+
+def test_gradcheck_fractional_branch_wrt_segment_gsnr():
+    """Same as `test_gradcheck_fractional_branch_wrt_boundary_probabilities`,
+    w.r.t. the segment GSNR values instead of the boundary probabilities."""
+    gsnr_db = torch.tensor(
+        [10.0, 22.0, 15.0, 28.0, 9.0], dtype=torch.float64, requires_grad=True
+    )
+    p = torch.tensor([0.3, 0.6, 0.45, 0.8], dtype=torch.float64)
+
+    def f(g_):
+        return _fractional_fold_double(g_, p)
+
+    assert torch.autograd.gradcheck(f, (gsnr_db,), eps=1e-6, atol=1e-4)
+
+
+def test_long_path_beyond_old_boundary_cap_now_succeeds():
+    """Before Task 1's exact DP, the fractional fold was exponential and
+    guarded by `num_boundaries > 20` (see 6110f83's diff to this module's
+    docstring); a 25-boundary / 26-segment path used to raise ValueError.
+    The DP is polynomial-time, and Task 1 replaced that guard with
+    `MAX_EXACT_FOLD_SEGMENTS = 128`, so the same path must now succeed --
+    and still respect 'regen helps': pushing one boundary's p toward 1.0
+    must not make the result worse (module docstring: cutting a boundary
+    splits a chunk into two no-larger pieces, so E[max] can never rise as
+    any single p increases).
+    """
+    combiner = SegmentCombiner()
+    n_segments = 26
+    assert n_segments - 1 > 20, "this case must exceed the OLD 20-boundary cap"
+    gsnrs = [t(15.0 + (i % 3)) for i in range(n_segments)]  # mild variation
+    probs = [t(0.4) for _ in range(n_segments - 1)]
+
+    result = combiner(gsnrs, probs)
+    assert torch.isfinite(result), f"expected a finite result, got {result.item()}"
+
+    probs_boosted = list(probs)
+    probs_boosted[10] = t(0.999)  # push one boundary toward full regen
+    result_boosted = combiner(gsnrs, probs_boosted)
+
+    assert result_boosted.item() >= result.item() - 1e-6, (
+        f"pushing a boundary's p toward regen should never make the path "
+        f"worse: {result.item():.4f} -> {result_boosted.item():.4f} dB"
+    )
+
+
+def test_exact_ties_need_no_special_casing_against_oracle():
+    """Construct chunk sums that are EXACTLY tied (symmetric noise +
+    symmetric p), so `torch.sort`'s duplicate thresholds inside
+    `_expected_max_chunk_noise` are actually exercised (module docstring:
+    'a duplicated threshold contributes F(tau_r) - F(tau_{r-1}) = 0 --
+    exactly zero'). DP-vs-oracle agreement here is checked at the SAME
+    tight 1e-12 relative tolerance as the untied regimes above -- no fudge
+    factor needed for duplicate thresholds.
+    """
+    gsnr_vals = [18.0, 18.0, 18.0, 18.0, 18.0]
+    p_vals = [0.5, 0.5, 0.5, 0.5]
+    noises = [10 ** (-v / 10) for v in gsnr_vals]
+
+    # Confirm the construction actually produces a tie, concretely, via the
+    # shared oracle's own chunking primitive: two different cut patterns,
+    # both giving a length-2 max chunk over equal per-segment noise, so
+    # their hard chunk-max values are identical by construction.
+    tie_a = hard_chunk_max(noises, [1, 0, 1, 0])  # chunks {0},{1,2},{3,4}
+    tie_b = hard_chunk_max(noises, [0, 1, 0, 1])  # chunks {0,1},{2},{3,4}
+    assert tie_a == pytest.approx(tie_b), (
+        "construction should produce an exactly tied largest chunk by "
+        "symmetry -- otherwise this isn't testing what it claims to"
+    )
+
+    dp = _dp_expected_noise(gsnr_vals, p_vals)
+    oracle = exact_expectation_by_enumeration(noises, p_vals)
+
+    assert dp == pytest.approx(oracle, rel=1e-12), (
+        f"tied-chunk DP {dp!r} vs oracle {oracle!r} (gsnr={gsnr_vals}, p={p_vals})"
+    )
+
+
+def test_gradients_are_location_aware_not_shared_across_boundaries():
+    """Two boundaries with the SAME marginal p but structurally different
+    surrounding noise must get numerically DISTINCT gradients w.r.t. their
+    own p. This is exactly the property round 2's shared-temperature fold
+    destroyed (docs/investigations/regen_over_provisioning.md and the module
+    docstring: probability entered a shared exponential and collapsed
+    location information); the exact DP has no shared knob, so distinct
+    boundaries with equal p should not get equal gradients here.
+    """
+    gsnr_db = torch.tensor([5.0, 25.0, 25.0, 5.0, 20.0], dtype=torch.float64)
+    p = torch.tensor([0.4, 0.5, 0.5, 0.4], dtype=torch.float64, requires_grad=True)
+
+    result = _fractional_fold_double(gsnr_db, p)
+    result.backward()
+
+    grad_b0 = p.grad[0].item()  # boundary right after the bad (5 dB) segment 0
+    grad_b3 = p.grad[3].item()  # boundary right after the bad (5 dB) segment 3
+
+    assert grad_b0 != 0.0 and grad_b3 != 0.0, (
+        f"expected nonzero gradients at both boundaries, got {p.grad.tolist()}"
+    )
+    assert grad_b0 != pytest.approx(grad_b3, rel=1e-6), (
+        f"boundaries at different structural positions should get distinct "
+        f"gradients even though both have p=0.4: got {grad_b0:.8f} vs "
+        f"{grad_b3:.8f}"
+    )
