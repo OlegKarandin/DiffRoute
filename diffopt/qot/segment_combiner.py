@@ -76,11 +76,21 @@ import torch.nn as nn
 
 
 # Cost of the exact fold is O(N^4) elementwise work over an (R, N) float64
-# working set of about 4*N^3 bytes; at this cap that is ~8 MB. Real topology
-# paths reach 16-19 segments (ind_132's km-shortest paths — see
-# docs/investigations/fold_formula_scalability.md), so this leaves ~7x
-# headroom while still failing loudly if something upstream ever hands the
-# combiner a path orders of magnitude longer than a real one.
+# working set. The forward-pass tensor itself is only ~4*N^3 bytes (~8 MB at
+# this cap) — but that figure describes just the final output, not what
+# autograd actually retains. Because the boundary loop runs in Python, every
+# one of the ~N-1 loop iterations' intermediates (U, g_b, and the concat
+# result) stays live in the graph until `.backward()` is called, so the
+# retained graph is roughly 2*N^4 bytes per call — about 1.1 GB at the
+# 128-segment cap, not 8 MB. `diffopt/train.py` calls `.backward()` once per
+# demand, so exactly one such graph is held at a time per demand during
+# training (not accumulated across the batch). At real topology path
+# lengths — 16-19 segments (ind_132's km-shortest paths — see
+# docs/investigations/fold_formula_scalability.md) — 2*N^4 is a few hundred
+# KB, so a few hundred demands' worth totals well under 100 MB: not a
+# problem in practice. But before raising MAX_EXACT_FOLD_SEGMENTS, redo this
+# estimate — the O(N^4) retained-graph cost, not the O(N^3) output size, is
+# what will actually bite.
 MAX_EXACT_FOLD_SEGMENTS = 128
 
 

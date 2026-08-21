@@ -416,6 +416,14 @@ def test_multi_segment_chunks_equal_max_over_chunks():
     overshoot on this fixture's tied chunks (~0.03 dB, see
     docs/investigations/regen_over_provisioning.md); the fold takes an exact
     max now, ties included, so the answer is exact.
+
+    The fold is exact, so the only residual here is the float32 return cast:
+    one ulp at ~20.0 dB is ~1.9e-6, matching the same quantization floor
+    `test_chunk_completes_before_next_accumulates` documents. The 1e-5
+    tolerance sits just above that floor -- anything larger would be real
+    fold error, not rounding. (This still meaningfully checks the fold: the
+    historical single-accumulator bug this fixture guards against was off
+    by ~1.771 dB, five orders of magnitude above this tolerance.)
     """
     combiner = SegmentCombiner()
     gsnrs = five_equal_segments()
@@ -424,7 +432,7 @@ def test_multi_segment_chunks_equal_max_over_chunks():
     result = combiner(gsnrs, probs).item()
     expected = -10.0 * math.log10(2 * FIVE_SEG_NOISE)  # 20.000 dB
 
-    assert result == pytest.approx(expected, abs=1e-9), (
+    assert result == pytest.approx(expected, abs=1e-5), (
         f"chunks {{0}},{{1,2}},{{3,4}}: expected ~{expected:.4f} dB "
         f"(max chunk = 2 segments), got {result:.4f} dB"
     )
@@ -728,7 +736,7 @@ def test_gradcheck_fractional_branch_wrt_boundary_probabilities():
     def f(p_):
         return _fractional_fold_double(gsnr_db, p_)
 
-    assert torch.autograd.gradcheck(f, (p,), eps=1e-6, atol=1e-4)
+    assert torch.autograd.gradcheck(f, (p,), eps=1e-6)
 
 
 def test_gradcheck_fractional_branch_wrt_segment_gsnr():
@@ -742,7 +750,7 @@ def test_gradcheck_fractional_branch_wrt_segment_gsnr():
     def f(g_):
         return _fractional_fold_double(g_, p)
 
-    assert torch.autograd.gradcheck(f, (gsnr_db,), eps=1e-6, atol=1e-4)
+    assert torch.autograd.gradcheck(f, (gsnr_db,), eps=1e-6)
 
 
 def test_long_path_beyond_old_boundary_cap_now_succeeds():
@@ -815,6 +823,23 @@ def test_gradients_are_location_aware_not_shared_across_boundaries():
     docstring: probability entered a shared exponential and collapsed
     location information); the exact DP has no shared knob, so distinct
     boundaries with equal p should not get equal gradients here.
+
+    The GSNR fixture is deliberately asymmetric, not just distinct-valued:
+    boundary 0 sits after segment 0, which has no segment to its left at
+    all (it's the path start), while boundary 3 sits after segment 3, which
+    has a real segment on both sides (25 dB segment 2 to its left, 20 dB
+    segment 4 to its right) -- and segment 4's value is deliberately *not*
+    equal to segment 1's (25 dB), so boundary 3's right-hand context doesn't
+    mirror boundary 0's. A path that were symmetric around its center (e.g.
+    [5, 25, 25, 5] with matching boundary p's) would make grad_b0 == grad_b3
+    a structural certainty by reflection symmetry, which would pass this
+    assertion for the wrong reason -- it would prove the DP respects
+    symmetry, not that it is location-aware. This fixture rules that out:
+    the two boundaries have no symmetry relating them, so equal gradients
+    here could only happen by coincidence, and the DP producing distinct
+    ones is real evidence that it tracks each boundary's actual structural
+    position rather than collapsing all p=0.4 boundaries onto one shared
+    gradient.
     """
     gsnr_db = torch.tensor([5.0, 25.0, 25.0, 5.0, 20.0], dtype=torch.float64)
     p = torch.tensor([0.4, 0.5, 0.5, 0.4], dtype=torch.float64, requires_grad=True)

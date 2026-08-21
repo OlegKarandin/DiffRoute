@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 
 import torch
 import yaml
@@ -145,5 +146,6 @@ if failures:
     print("\nFAILED — the 'regen helps' invariant is broken:")
     for f in failures:
         print(f"  - {f}")
+    sys.exit(1)
 else:
     print("\nOK — 'regen helps' holds in value and in gradient at every point checked.")

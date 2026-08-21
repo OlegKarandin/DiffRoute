@@ -48,6 +48,7 @@ from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.topology import Edge, Topology, load_topology
+from diffopt.traffic import build_traffic_matrix, preflight_filter, scenario_alpha
 from diffopt.train import linear_anneal, load_qot_model
 
 
@@ -235,6 +236,34 @@ def demands_for(ctx: DiagContext, *, seed: int, num_demands: Optional[int] = Non
     `ctx.cfg["num_demands"]`."""
     n = ctx.cfg["num_demands"] if num_demands is None else num_demands
     return generate_demands(ctx.topology, n, ctx.cfg["bitrate_options"], seed=seed)
+
+
+def fixed_traffic_demands(ctx: DiagContext) -> Tuple[List[Demand], List[Tuple[Demand, float]]]:
+    """Build the same fixed demand set `train.py` builds from `ctx.cfg["traffic"]`
+    and `ctx.cfg["constraint"]`: one `build_traffic_matrix` draw, screened by
+    `preflight_filter`. Deterministic (no --seed/--num-demands) because the
+    matrix is fully determined by `cfg["traffic"]["seed"]` — this is the
+    demand set a checkpoint trained on this config actually saw, unlike
+    `demands_for`'s unrelated ad hoc draw."""
+    tr_cfg = ctx.cfg["traffic"]
+    c_cfg = ctx.cfg["constraint"]
+    raw_matrix = build_traffic_matrix(
+        ctx.topology,
+        seed=tr_cfg["seed"],
+        scale=tr_cfg["scale"],
+        alpha=scenario_alpha(tr_cfg["scenario"]),
+        bitrate_options=ctx.cfg["bitrate_options"],
+    )
+    return preflight_filter(
+        ctx.topology,
+        raw_matrix,
+        qot_model=ctx.qot_model,
+        segment_combiner=SegmentCombiner(),
+        modulation_config=ctx.mod_cfg,
+        margin_db=c_cfg["margin_db"],
+        channel_loading_fraction=ctx.cfg["pipeline"]["channel_loading_fraction"],
+        max_spans=ctx.cfg.get("max_spans_per_segment", 60),
+    )
 
 
 # ---------------------------------------------------------------------------

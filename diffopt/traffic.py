@@ -240,8 +240,9 @@ def preflight_filter(
     Those surface later as duals pinned at `dual_max` in
     `diffopt/train.py`'s end-of-run report, not here.
 
-    The screen is non-conservative by construction. `SegmentCombiner` folds
-    chunks with an exact max (invariants.md, "Segment combiner"), so the GSNR
+    The screen is exact, with no approximation margin in either direction.
+    `SegmentCombiner` folds chunks with an exact max (invariants.md, "Segment
+    combiner"), so the GSNR
     it reports here is exactly the one production arithmetic computes for this
     route and placement — the screen can neither over- nor under-state a
     demand's best case by an approximation margin. It used to over-estimate
