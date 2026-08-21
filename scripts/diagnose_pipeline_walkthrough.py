@@ -78,9 +78,8 @@ with torch.no_grad():
     gs = [pipe.qot_model(*pipe._extract_span_features(s, ctx.device))[0] for s in segs]
     bp = [rp[n] for n in bnodes]
     print(f"\nSTAGE 4f  SegmentCombiner(segment_gsnrs, boundary_probs={[f'{p:.2f}' for p in bp]})")
-    for t in [0.5, 0.01]:
-        out = pipe.segment_combiner(gs, bp, temperature=t)
-        print(f"    temperature={t:<5} -> path GSNR = {out.item():6.2f} dB")
+    out = pipe.segment_combiner(gs, bp)
+    print(f"    -> path GSNR = {out.item():6.2f} dB")
     print(f"\n  span features fed to QoT are 5 cols: "
           f"[span_len, fiber_idx, amp_nf, load_frac, accum_dist]")
     sf, pm = pipe._extract_span_features(segs[-1], ctx.device)

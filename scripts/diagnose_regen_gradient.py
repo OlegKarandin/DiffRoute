@@ -54,10 +54,9 @@ def main() -> None:
         # (diffopt/routing/surrogate.py's c_target = w + lambda_*grad_output),
         # and regen_logits' gradient flows through regen_probs -> edge_feats
         # -> edge_weights -> that surrogate, so this is a SECOND source of
-        # cross-epoch gradient-magnitude change here, independent of tau/
-        # t_softmax annealing. Printed alongside them below for exactly that
-        # reason.
-        tau, tsm, vlastelica_lambda = schedule_at(cfg, epoch=epoch)
+        # cross-epoch gradient-magnitude change here, independent of the tau
+        # anneal. Printed alongside it below for exactly that reason.
+        tau, vlastelica_lambda = schedule_at(cfg, epoch=epoch)
 
         # seed=epoch: this script's own per-epoch demand draw for gradient
         # decomposition; train.py no longer reseeds demands per epoch (Task 4
@@ -65,12 +64,12 @@ def main() -> None:
         # before the loop).
         demands = demands_for(ctx, seed=epoch)
 
-        # fresh logits at 0 each time: isolates the temperature effect
+        # fresh logits at 0 each time: isolates the tau/lambda effect
         with torch.no_grad():
             regen.regen_logits.zero_()
 
         path_noise_costs, gsnr_preds, _, regen_probs = pipeline(
-            demands, tau=tau, lambda_=vlastelica_lambda, soft_max_temperature=tsm)
+            demands, tau=tau, lambda_=vlastelica_lambda)
 
         feas = torch.zeros(1)
         infeasible_ids = []
@@ -100,7 +99,7 @@ def main() -> None:
         # descent moves logit by -grad; negative total grad == prob climbs
         climbing = int((g_tot < 0).sum())
 
-        print(f"--- epoch {epoch:2d}  tau={tau:.3f}  t_softmax={tsm:.4f}  "
+        print(f"--- epoch {epoch:2d}  tau={tau:.3f}  "
               f"lambda={vlastelica_lambda:.3f} ---")
         print(f"  infeasible demands: {len(infeasible_ids)}/{len(demands)}   "
               f"feasibility_loss={feas.item():.2f}")

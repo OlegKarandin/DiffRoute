@@ -1,21 +1,32 @@
-"""Diagnostic: per-segment noise scale vs the soft_max approximation error.
+"""Diagnostic: per-segment noise scale, and the live "regen helps" check.
 
 SegmentCombiner does its max in LINEAR NOISE space, where a good segment is
 a very small number (~0.0025 for the ~26 dB segments the pipeline actually
-produces). Regen "helps" only if soft_max(a, b) < a + b; for a ~= b = n that
-requires the soft_max overshoot to stay below n.
+produces). Regen "helps" only if the combined noise of a cut path is below
+that of an uncut one; for two equal segments of noise n that means the fold
+must return something strictly below 2n.
 
 The historical bug (see docs/investigations/regen_placement_not_concentrating.md)
-was that the naive form `t * logsumexp([a/t, b/t])` overshoots by `t*ln2` —
-ABSOLUTE, so it does not shrink with the operands. At the schedule's sharpest
-temperature (0.01) that floor is 0.0069, larger than the segment noise itself,
-which inverted the sign of every gradient reaching regen_logits.
+was that the fold approximated the max with `t * logsumexp([a/t, b/t])`, which
+overshoots by `t*ln2` — ABSOLUTE, so it does not shrink with the operands. At
+the schedule's sharpest temperature (0.01) that floor is 0.0069, larger than
+the segment noise itself, which inverted the sign of every gradient reaching
+regen_logits. Scale-normalising the soft max made the overshoot relative
+(`max(a,b)*t*ln2`) and bounded the damage; the fold is now an exact max over
+chunks, with no overshoot at all and no temperature to schedule.
 
-soft_max is now scale-normalised, so the overshoot is `max(a,b)*t*ln2` and the
-invariant holds at any magnitude for t < 1/ln2 ~= 1.44. This script keeps
-measuring the segment noise distribution (it is the quantity the whole
-combiner operates on, and worth watching per topology) and reports both the
-current relative headroom and what the old absolute floor would have been.
+So this script has two jobs:
+
+  1. Measure the per-segment noise distribution the combiner actually
+     operates on. That is worth watching per topology regardless of which
+     fold is shipped, and it sets the scale for everything below.
+  2. Assert, live against the shipped code at that measured scale, that
+     regenerating never hurts: value-wise (a fully regenerated path is
+     never worse than a transparent one) and gradient-wise
+     (`d(path_gsnr)/dp > 0`). Under an exact max both are provable — cutting
+     a boundary splits a chunk into two no-larger pieces — but this is the
+     cheapest standing check that the shipped code still has the property,
+     which is exactly the invariant the whole investigation exists to hold.
 
 Usage:
     conda activate diffopt
@@ -32,7 +43,7 @@ import yaml
 from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.pipeline import segment_path
 from diffopt.routing.surrogate import surrogate_shortest_path
-from _common import add_common_args, build_context, demands_for, edge_weights_of, schedule_at
+from _common import add_common_args, build_context, demands_for, edge_weights_of
 
 ap = argparse.ArgumentParser()
 add_common_args(ap, with_checkpoint=False, with_demands=False)
@@ -72,37 +83,67 @@ print("per-segment GSNR  dB quantiles: " +
 print("per-segment noise    quantiles: " +
       "  ".join(f"p{int(q*100)}={torch.quantile(noise, q):.5f}" for q in qs))
 
-print("\nWhat the OLD absolute floor (t*ln2) would have done on this workload:")
-print("epoch  t_sm     floor=t*ln2   frac of segments with noise < floor")
-print("                              (= fraction where 'regen helps' was INVERTED)")
-t_cfg, sc = cfg["training"], cfg["segment_combiner"]
-n_epochs = t_cfg["epochs_e2e"]
-step = max(1, n_epochs // 20)
-for ep in range(1, n_epochs + 1, step):
-    _, t, _ = schedule_at(cfg, epoch=ep)
+# The historical schedule's endpoints, pinned as literals: they are gone from
+# the config and from the code, and this table is about what the OLD fold
+# would have done on THIS workload, so it must not track a current value.
+print("\nWhat the OLD absolute soft_max floor (t*ln2) would have done here:")
+print("t_sm     floor=t*ln2   frac of segments with noise < floor")
+print("                       (= fraction where 'regen helps' was INVERTED)")
+for t in (0.5, 0.1, 0.01):
     floor = t * math.log(2.0)
     frac = (noise < floor).float().mean().item()
     gsnr_at_floor = -10.0 * math.log10(floor)
-    print(f"{ep:5d}  {t:.4f}   {floor:.5f}      {frac*100:5.1f}%   "
+    print(f"{t:.4f}   {floor:.5f}      {frac*100:5.1f}%   "
           f"(would cap regenerated path at {gsnr_at_floor:.1f} dB)")
-
-print("\nWith the CURRENT scale-normalised soft_max the overshoot is")
-print("max(a,b)*t*ln2, i.e. a fixed FRACTION of the operands, so the")
-print("'regen helps' invariant holds for any t < 1/ln2 = 1.443 at every")
-print("noise magnitude above. Schedule max t = "
-      f"{sc['soft_max_temperature']} -> headroom factor "
-      f"{1.0 / math.log(2.0) / sc['soft_max_temperature']:.2f}x.")
+print("The shipped fold takes an EXACT max, so its overshoot is 0 at every")
+print("noise magnitude and there is no temperature left to get wrong.")
 
 # Live regression check against the real segment scale: every row must say
 # HELPS. Any INVERTED row means the combiner is telling the optimiser that
 # regenerators degrade the path, and regen_logits will be driven to zero.
-print("\nLIVE CHECK: 2-segment path, both segments at the median measured GSNR")
-med = float(torch.quantile(g, 0.5))
 comb = SegmentCombiner()
-for t in [0.5, 0.3115, 0.1231, 0.0477, 0.01, 0.001]:
+failures = []
+
+print("\nLIVE CHECK A: value + gradient on a 2-segment path, both segments at")
+print("the measured GSNR quantile. Exact fold => path noise is")
+print("(1-p)*(n1+n2) + p*max(n1,n2), so d(gsnr)/dp > 0 whenever max < sum.")
+print("  quantile  seg_gsnr   path_gsnr@p=0.5   d(gsnr)/dp   |value err|   verdict")
+for q in qs:
+    seg_db = float(torch.quantile(g, q))
     p = torch.tensor(0.5, requires_grad=True)
-    out = comb([torch.tensor(med), torch.tensor(med)], [p], temperature=t)
+    out = comb([torch.tensor(seg_db), torch.tensor(seg_db)], [p])
     out.backward()
-    verdict = "regen HELPS" if p.grad.item() > 0 else "regen HURTS (INVERTED)"
-    print(f"  t={t:<7.4f} path_gsnr={out.item():7.2f} dB   d(gsnr)/dp={p.grad.item():+8.3f}"
-          f"   -> {verdict}")
+
+    n_lin = 10.0 ** (-min(max(seg_db, -5.0), 35.0) / 10.0)
+    expected = -10.0 * math.log10(0.5 * 2 * n_lin + 0.5 * n_lin)
+    err = abs(out.item() - expected)
+
+    ok = p.grad.item() > 0.0 and err < 1e-3
+    verdict = "regen HELPS" if ok else "FAIL"
+    if not ok:
+        failures.append(f"2-segment path at p{int(q * 100)} ({seg_db:.2f} dB): "
+                        f"d(gsnr)/dp={p.grad.item():+.4f}, value err={err:.2e}")
+    print(f"  p{int(q*100):<8} {seg_db:7.2f}   {out.item():13.2f}   "
+          f"{p.grad.item():+10.3f}   {err:11.2e}   -> {verdict}")
+
+print("\nLIVE CHECK B: a fully regenerated path is never worse than a")
+print("transparent one, over path lengths this topology actually produces.")
+med = float(torch.quantile(g, 0.5))
+print("  n_segs   transparent   regenerated   delta")
+for k in range(2, int(ns.max().item()) + 1):
+    gsnrs = [torch.tensor(med) for _ in range(k)]
+    with torch.no_grad():
+        transparent = comb(gsnrs, [torch.tensor(0.0)] * (k - 1)).item()
+        regenerated = comb(gsnrs, [torch.tensor(1.0)] * (k - 1)).item()
+    delta = regenerated - transparent
+    if delta < 0.0:
+        failures.append(f"{k}-segment path at the median GSNR: regenerating "
+                        f"costs {delta:.4f} dB")
+    print(f"  {k:>6}   {transparent:11.4f}   {regenerated:11.4f}   {delta:+7.4f}")
+
+if failures:
+    print("\nFAILED — the 'regen helps' invariant is broken:")
+    for f in failures:
+        print(f"  - {f}")
+else:
+    print("\nOK — 'regen helps' holds in value and in gradient at every point checked.")

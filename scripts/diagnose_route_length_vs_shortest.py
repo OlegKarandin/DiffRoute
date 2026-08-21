@@ -65,12 +65,11 @@ demands = demands_for(ctx, seed=final_epoch)
 print(f"{len(demands)} demands (seed={final_epoch}, matching training's final epoch)\n")
 
 tau_end = t_cfg["regen_tau_end"]
-t_sm_end = cfg["segment_combiner"]["soft_max_temperature_min"]
 vlastelica_lambda = ctx.ckpt["vlastelica_lambda"]
 
 with torch.no_grad():
     _, _, path_indicators, _ = pipe(
-        demands, tau=tau_end, lambda_=vlastelica_lambda, soft_max_temperature=t_sm_end
+        demands, tau=tau_end, lambda_=vlastelica_lambda
     )
 
 rows = []

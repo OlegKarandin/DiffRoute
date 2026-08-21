@@ -247,7 +247,6 @@ class DiffONetPipeline(nn.Module):
         demands: List[Demand],
         tau: float = 1.0,
         lambda_: float = 10.0,
-        soft_max_temperature: float = 0.5,
     ) -> Tuple[
         Dict[int, torch.Tensor],   # path_noise_costs
         Dict[int, torch.Tensor],   # gsnr_preds
@@ -260,13 +259,6 @@ class DiffONetPipeline(nn.Module):
             demands:  List of Demand namedtuples (id, src, dst, bitrate_gbps).
             tau:      Regen placement temperature. Passed per-call, never stored.
             lambda_:  Vlastelica perturbation strength. Passed per-call.
-            soft_max_temperature: SegmentCombiner's soft-max sharpness for
-                this call. Passed per-call, never stored — same reasoning
-                as tau/lambda_. Real training should anneal this toward
-                0.01 (see SegmentCombiner's docstring); the 0.5 default
-                here is only a safety net for callers that don't care
-                (e.g. ad-hoc/test calls), not a value real e2e training
-                should hold fixed.
 
         Returns:
             path_noise_costs: demand_id → scalar accumulated-ASE-noise tensor, live in autograd graph.
@@ -302,10 +294,10 @@ class DiffONetPipeline(nn.Module):
         # ind_132 while Spearman rank-corr with init stayed at +0.999. See
         # docs/investigations/edge_weight_scale_collapse.md.
         #
-        # NOTE: this is the OPPOSITE choice from soft_max's scale
-        # normalisation in qot/segment_combiner.py, which detaches on purpose
-        # (there the goal is to rescale an error term without adding a
-        # gradient path). The two lines look nearly identical and mean
+        # NOTE: this is the OPPOSITE choice from the `soft_max` helper's
+        # scale normalisation in qot/segment_combiner.py, which detaches on
+        # purpose (there the goal is to rescale an error term without adding
+        # a gradient path). The two lines look nearly identical and mean
         # opposite things. Do not "make them consistent".
         raw_edge_weights = self.edge_weight_net(edge_feats).squeeze(-1)
         edge_weights = raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)
@@ -442,7 +434,7 @@ class DiffONetPipeline(nn.Module):
 
             # Combine segments with soft boundary probabilities
             boundary_probs = [regen_probs[n] for n in demand_boundary_nodes[demand.id]]
-            path_gsnr = self.segment_combiner(segment_gsnrs, boundary_probs, temperature=soft_max_temperature)
+            path_gsnr = self.segment_combiner(segment_gsnrs, boundary_probs)
 
             path_noise_costs[demand.id] = demand_path_noise_costs[demand.id]
             gsnr_preds[demand.id] = path_gsnr

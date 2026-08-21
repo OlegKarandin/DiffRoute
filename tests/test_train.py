@@ -1,11 +1,11 @@
 """Unit tests for diffopt/train.py's pure annealing helper.
 
-`linear_anneal` (renamed/generalized from `compute_regen_tau`) now drives
-both RegenPlacement's `tau` and SegmentCombiner's `soft_max_temperature` —
-the fix for the bug where soft_max_temperature was hardcoded at a fixed
-0.5 and never annealed (see docs/investigations/CHANGELOG.md's Phase 1c
-corrections, and diffopt/qot/segment_combiner.py's docstring, for the
-physics diagnosis).
+`linear_anneal` (renamed/generalized from `compute_regen_tau`) drives
+RegenPlacement's `tau`. It stays generic — nothing in it is tau-specific —
+because it also used to drive SegmentCombiner's `soft_max_temperature`,
+before that fold became exact and lost its temperature entirely (see
+docs/investigations/CHANGELOG.md's Phase 1c corrections, and
+diffopt/qot/segment_combiner.py's docstring, for that history).
 """
 from __future__ import annotations
 
@@ -52,18 +52,17 @@ def test_monotonic_decrease_across_the_anneal_window():
 
 
 def test_generic_across_different_schedules():
-    """The same function must correctly drive both tau (1.0->0.1) and
-    soft_max_temperature (0.5->0.01) schedules independently — this is the
-    whole point of generalizing it rather than keeping two near-duplicate
-    functions."""
+    """The same function must drive two different start/end schedules
+    independently — this is the whole point of generalizing it rather than
+    keeping a near-duplicate function per annealed scalar."""
     tau = linear_anneal(epoch=10, start=1.0, end=0.1, anneal_start=5, anneal_end=15)
-    soft_max_temp = linear_anneal(epoch=10, start=0.5, end=0.01, anneal_start=5, anneal_end=15)
+    other = linear_anneal(epoch=10, start=0.5, end=0.01, anneal_start=5, anneal_end=15)
 
     # Same fractional progress (epoch 10 is 50% through [5,15]) but
     # different start/end -> different absolute values, same fraction.
     tau_frac = (tau - 0.1) / (1.0 - 0.1)
-    temp_frac = (soft_max_temp - 0.01) / (0.5 - 0.01)
-    assert tau_frac == pytest.approx(temp_frac)
+    other_frac = (other - 0.01) / (0.5 - 0.01)
+    assert tau_frac == pytest.approx(other_frac)
     assert tau_frac == pytest.approx(0.5)
 
 
@@ -92,7 +91,7 @@ class _DummyPipeline:
     """Stand-in for DiffONetPipeline. Its physics forward pass is irrelevant
     to checkpoint selection and to the inert-placement count, so it is
     replaced with a cheap no-op that satisfies main()'s call shape:
-    `pipeline(demands, tau=..., lambda_=..., soft_max_temperature=...)` ->
+    `pipeline(demands, tau=..., lambda_=...)` ->
     (path_noise_costs, gsnr_preds, path_indicators, regen_probs).
 
     `regen_probs_value` is a class attribute rather than a constructor
@@ -108,7 +107,7 @@ class _DummyPipeline:
     def to(self, device):
         return self
 
-    def __call__(self, demands, tau=None, lambda_=None, soft_max_temperature=None):
+    def __call__(self, demands, tau=None, lambda_=None):
         return {}, {}, {}, _DummyPipeline.regen_probs_value
 
 
@@ -137,10 +136,6 @@ def _write_config(tmp_path, *, epochs: int) -> Path:
             "lambda_regen": 1.0,
             "lambda_cost": 0.01,
             "channel_loading_fraction": 0.5,
-        },
-        "segment_combiner": {
-            "soft_max_temperature": 0.5,
-            "soft_max_temperature_min": 0.01,
         },
         "training": {
             "lr_edge_net": 1.0e-3,

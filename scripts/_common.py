@@ -187,20 +187,19 @@ def build_context(
 # Schedule replay
 # ---------------------------------------------------------------------------
 
-def schedule_at(cfg: dict, epoch: Optional[int] = None) -> Tuple[float, float, float]:
-    """(tau, soft_max_temperature, vlastelica_lambda) at a given epoch,
-    replaying diffopt/train.py's per-epoch computation exactly.
+def schedule_at(cfg: dict, epoch: Optional[int] = None) -> Tuple[float, float]:
+    """(tau, vlastelica_lambda) at a given epoch, replaying
+    diffopt/train.py's per-epoch computation exactly.
 
     `epoch=None` defaults to 1 — the values used for training's first
-    optimizer step (regen_tau_start, the segment_combiner's starting
-    soft_max_temperature, and the raw undecayed vlastelica_lambda). This
-    matches what diagnose_surrogate.py reports when run without
-    --checkpoint (train.py's epoch-0 state).
+    optimizer step (regen_tau_start and the raw undecayed
+    vlastelica_lambda). This matches what diagnose_surrogate.py reports
+    when run without --checkpoint (train.py's epoch-0 state).
 
     `vlastelica_lambda` decays multiplicatively and is clamped to
     `vlastelica_lambda_min` *after* being used each epoch in train.py's
-    loop — it is not a `linear_anneal` schedule like tau/soft_max_temperature
-    — so this replays that loop rather than using a closed form.
+    loop — it is not a `linear_anneal` schedule like tau — so this
+    replays that loop rather than using a closed form.
 
     A loaded e2e checkpoint's own `vlastelica_lambda` field is the ground
     truth for whatever epoch it was actually saved at (train.py saves on
@@ -209,17 +208,11 @@ def schedule_at(cfg: dict, epoch: Optional[int] = None) -> Tuple[float, float, f
     epoch when a checkpoint is available.
     """
     t_cfg = cfg["training"]
-    sc_cfg = cfg.get("segment_combiner", {})
     e = 1 if epoch is None else epoch
 
     tau = linear_anneal(
         e,
         t_cfg["regen_tau_start"], t_cfg["regen_tau_end"],
-        t_cfg["regen_tau_anneal_start_epoch"], t_cfg["regen_tau_anneal_end_epoch"],
-    )
-    soft_max_temperature = linear_anneal(
-        e,
-        sc_cfg.get("soft_max_temperature", 0.5), sc_cfg.get("soft_max_temperature_min", 0.01),
         t_cfg["regen_tau_anneal_start_epoch"], t_cfg["regen_tau_anneal_end_epoch"],
     )
 
@@ -229,7 +222,7 @@ def schedule_at(cfg: dict, epoch: Optional[int] = None) -> Tuple[float, float, f
             t_cfg["vlastelica_lambda_min"], vlastelica_lambda * t_cfg["vlastelica_lambda_decay"]
         )
 
-    return tau, soft_max_temperature, vlastelica_lambda
+    return tau, vlastelica_lambda
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +243,8 @@ def demands_for(ctx: DiagContext, *, seed: int, num_demands: Optional[int] = Non
 
 def edge_weights_of(ctx: DiagContext, tau: float, *, normalised: bool = True) -> torch.Tensor:
     """The (E,) edge-weight tensor for the current pipeline state at
-    temperature `tau`, mirroring `pipeline.forward`'s steps 1-3 exactly:
+    regen-decision temperature `tau`, mirroring `pipeline.forward`'s steps
+    1-3 exactly:
     regen probabilities -> concatenated edge features -> EdgeWeightNet ->
     unit-mean renormalisation.
 

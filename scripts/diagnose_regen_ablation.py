@@ -55,7 +55,6 @@ regen_placement = ctx.regen_placement
 t_cfg = cfg["training"]
 
 tau_end = t_cfg["regen_tau_end"]
-t_sm_end = cfg["segment_combiner"]["soft_max_temperature_min"]
 vlastelica_lambda = ctx.ckpt["vlastelica_lambda"]
 
 learned_logits = regen_placement.regen_logits.detach().clone()
@@ -80,7 +79,7 @@ def infeasible_set(active):
             torch.tensor([30.0 if n in active else -30.0 for n in range(topo.num_nodes)])
         )
         _, gsnr_preds, _, _ = pipe(
-            demands, tau=tau_end, lambda_=vlastelica_lambda, soft_max_temperature=t_sm_end
+            demands, tau=tau_end, lambda_=vlastelica_lambda
         )
     return {d.id for d in demands if gsnr_preds[d.id].item() < thresholds[d.id]}
 

@@ -67,10 +67,6 @@ constraint:
   dual_lr: 1.0            # eta — a 1 dB shortfall moves a dual 10% of lambda_0
   dual_max: 1000.0        # lambda_max — 100x lambda_0; a diagnostic cap
 
-segment_combiner:
-  soft_max_temperature: 0.5
-  soft_max_temperature_min: 0.01
-
 training:
   lr_edge_net: 1.0e-3
   # Adam's step is ~lr regardless of gradient magnitude, so a logit moves at

@@ -16,11 +16,17 @@ then re-folded three different ways and compared:
      a regenerated boundary but keeps ADDING to it afterwards, instead of
      starting a fresh chunk). Kept here as the exact historical form, so
      this script both reproduces the write-up's numbers now and would
-     catch a future regression back to it.
-  2. The shipped fold — SegmentCombiner.forward as it exists today.
+     catch a future regression back to it. It needs a soft_max temperature,
+     which the shipped code no longer has anywhere; `_LEGACY_TEMPERATURE`
+     below pins it to the value the historical anneal ended at.
+  2. The shipped fold — SegmentCombiner.forward as it exists today. Now an
+     exact expectation of the max chunk noise over the fractional boundary
+     probabilities, so its delta below is no longer an approximation error:
+     it is the (real, physical) gap between averaging over soft placements
+     and committing to the hard-rounded one.
   3. `_exact_hard_chunk_fold` — the true -10*log10(max over chunks) at
-     hard-rounded p (p >= 0.5 -> cut), i.e. the ground truth every soft
-     relaxation is approximating.
+     hard-rounded p (p >= 0.5 -> cut), i.e. the reference both of the above
+     are measured against.
 
 Only demands whose route crosses at least one placed (hard-rounded p=1)
 regenerator are scored: when no boundary on a route ever cuts, chunking is
@@ -68,8 +74,15 @@ topo = ctx.topology
 regen_placement = ctx.regen_placement
 t_cfg = cfg["training"]
 
-tau, t_sm, vlastelica_lambda = schedule_at(cfg, t_cfg["epochs_e2e"])
+tau, vlastelica_lambda = schedule_at(cfg, t_cfg["epochs_e2e"])
 tau_end = t_cfg["regen_tau_end"]
+
+# The soft_max temperature the historical anneal ended at. Pinned as a
+# literal because it no longer exists in the config or the schedule -- the
+# shipped fold is exact and takes no temperature. Only
+# `_legacy_single_accumulator_fold` below needs it, and it needs the
+# historical value, not a current one.
+_LEGACY_TEMPERATURE = 0.01
 
 # Hard-saturate the learned placement to +/-30, same convention as
 # diagnose_regen_ablation.py, so "placed" vs "not placed" is unambiguous
@@ -90,7 +103,7 @@ tr_cfg = cfg["traffic"]
 print(
     f"{len(demands)} demands ({tr_cfg['scenario']}, seed={tr_cfg['seed']}), "
     f"{len(excluded)} excluded by preflight, schedule epoch={t_cfg['epochs_e2e']} "
-    f"(tau={tau:.4f}, soft_max_temperature={t_sm:.4f})\n"
+    f"(tau={tau:.4f}, legacy fold replayed at t={_LEGACY_TEMPERATURE})\n"
 )
 
 
@@ -100,29 +113,27 @@ print(
 
 class _RecordingCombiner(nn.Module):
     """Wraps the real SegmentCombiner and records every
-    (segment_gsnrs_db, regen_probs_at_boundaries, temperature) it is
-    handed during a forward pass, so the same calls train.py's own
-    pipeline.forward would make can be re-folded three ways after the
-    fact."""
+    (segment_gsnrs_db, regen_probs_at_boundaries) pair it is handed during
+    a forward pass, so the same calls train.py's own pipeline.forward would
+    make can be re-folded three ways after the fact."""
 
     def __init__(self, inner: SegmentCombiner):
         super().__init__()
         self.inner = inner
-        self.calls: List[Tuple[List[torch.Tensor], List[torch.Tensor], float]] = []
+        self.calls: List[Tuple[List[torch.Tensor], List[torch.Tensor]]] = []
 
-    def forward(self, segment_gsnrs_db, regen_probs_at_boundaries, temperature):
+    def forward(self, segment_gsnrs_db, regen_probs_at_boundaries):
         self.calls.append((
             [g.detach().clone() for g in segment_gsnrs_db],
             [p.detach().clone() for p in regen_probs_at_boundaries],
-            temperature,
         ))
-        return self.inner(segment_gsnrs_db, regen_probs_at_boundaries, temperature=temperature)
+        return self.inner(segment_gsnrs_db, regen_probs_at_boundaries)
 
 
 recorder = _RecordingCombiner(pipe.segment_combiner)
 pipe.segment_combiner = recorder
 with torch.no_grad():
-    pipe(demands, tau=tau, lambda_=vlastelica_lambda, soft_max_temperature=t_sm)
+    pipe(demands, tau=tau, lambda_=vlastelica_lambda)
 pipe.segment_combiner = recorder.inner  # restore the real module
 
 assert len(recorder.calls) == len(demands), (
@@ -186,14 +197,14 @@ legacy_deltas: List[float] = []
 shipped_deltas: List[float] = []
 rows = []  # (demand_id, n_segments, n_cuts, max_chunk_len, legacy_delta, shipped_delta)
 
-for demand, (gsnrs, probs, temperature) in zip(demands, recorder.calls):
+for demand, (gsnrs, probs) in zip(demands, recorder.calls):
     hard_cuts = [p.item() >= 0.5 for p in probs]
     if not any(hard_cuts):
         continue  # route never crosses a placed regenerator; folds agree trivially
 
     exact_db = _exact_hard_chunk_fold(gsnrs, hard_cuts)
-    legacy_db = _legacy_single_accumulator_fold(gsnrs, probs, temperature)
-    shipped_db = recorder.inner(gsnrs, probs, temperature=temperature).item()
+    legacy_db = _legacy_single_accumulator_fold(gsnrs, probs, _LEGACY_TEMPERATURE)
+    shipped_db = recorder.inner(gsnrs, probs).item()
 
     legacy_delta = legacy_db - exact_db
     shipped_delta = shipped_db - exact_db

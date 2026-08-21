@@ -6,9 +6,10 @@ fixed t makes the pre-fix absolute soft_max floor safe across topologies,
 because per-segment noise itself varies by topology. This script measures
 that per-topology noise scale directly, and reports what the old absolute
 floor (t*ln2) would have inverted at a couple of reference temperatures, for
-comparison against the current scale-normalised soft_max (see
-scripts/diagnose_segment_noise_scale.py, which does the identical
-old-floor-vs-current comparison for a single topology in more detail).
+comparison against the current exact max-over-chunks fold, which has no
+floor at any noise scale (see scripts/diagnose_segment_noise_scale.py, which
+does the identical old-floor-vs-current comparison for a single topology in
+more detail).
 
 Every other config key (QoT checkpoint, pipeline params, seed, ...) comes
 from --config; only `topology` is overridden per iteration, since comparing

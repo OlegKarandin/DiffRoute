@@ -47,7 +47,7 @@ print(f"{'ep':>3} {'tau':>6} {'logit':>8} {'p_pred':>7} | "
 errs = []
 for r in rows:
     e = int(r["epoch"])
-    tau, _, _ = schedule_at(cfg, epoch=e)
+    tau, _ = schedule_at(cfg, epoch=e)
     logit = -LR * e
     p = 1.0 / (1.0 + math.exp(-logit / tau))
     pred = N * p
@@ -60,7 +60,7 @@ print(f"\nmean relative error of the pure-drift prediction: {100*sum(errs)/len(e
 
 last = rows[-1]
 n_ep = int(last["epoch"])
-tau_end, _, _ = schedule_at(cfg, epoch=n_ep)
+tau_end, _ = schedule_at(cfg, epoch=n_ep)
 
 if "regen_logit_min" in last:
     lo, hi = float(last["regen_logit_min"]), float(last["regen_logit_max"])

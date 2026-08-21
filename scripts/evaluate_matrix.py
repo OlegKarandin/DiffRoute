@@ -118,13 +118,11 @@ def main() -> None:
     print(f"\nPlacement (hard-saturated): {len(placed_nodes)} nodes, "
           f"{len(placed_candidates)} of them regen candidates: {placed_candidates}")
 
-    _, _, vlastelica_lambda = schedule_at(cfg, cfg["training"]["epochs_e2e"])
-    soft_max_temp = cfg.get("segment_combiner", {}).get("soft_max_temperature_min", 0.01)
+    _, vlastelica_lambda = schedule_at(cfg, cfg["training"]["epochs_e2e"])
 
     with torch.no_grad():
         _, gsnr_preds, _, _ = ctx.pipeline(
             demands, tau=1.0, lambda_=vlastelica_lambda,
-            soft_max_temperature=soft_max_temp,
         )
 
     margins = []

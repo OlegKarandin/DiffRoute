@@ -85,14 +85,14 @@ with torch.no_grad():
 
         # (ii) pipeline behaviour: accum_dist resets each segment
         gs = [pipe.qot_model(*feats(s)[:2])[0] for s in segs]
-        got_reset = comb(gs, [zero] * (len(segs) - 1), temperature=0.01)
+        got_reset = comb(gs, [zero] * (len(segs) - 1))
 
         # (iii) same, but accum_dist carried across boundaries
         gs2, acc = [], 0.0
         for s in segs:
             sf2, pm2, acc = feats(s, acc)
             gs2.append(pipe.qot_model(sf2, pm2)[0])
-        got_carry = comb(gs2, [zero] * (len(segs) - 1), temperature=0.01)
+        got_carry = comb(gs2, [zero] * (len(segs) - 1))
 
         rows_reset.append((truth.item(), got_reset.item()))
         rows_carry.append((truth.item(), got_carry.item()))

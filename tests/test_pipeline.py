@@ -105,7 +105,7 @@ def make_hub_topology() -> Topology:
 
 def make_pipeline(topology: Topology) -> DiffONetPipeline:
     qot_model = SpanAttentionQoT(max_spans=60)
-    segment_combiner = SegmentCombiner()  # stateless — temperature is now a forward()-time arg
+    segment_combiner = SegmentCombiner()  # stateless and parameter-free
     edge_weight_net = EdgeWeightNet()
     regen_placement = RegenPlacement(topology.num_nodes)
     return DiffONetPipeline(
@@ -245,8 +245,7 @@ def test_single_segment_identity():
     topo = make_linear_topology()
     # Linear topology has no regen candidates → every path is one segment
     # → SegmentCombiner just passes the single GSNR through unchanged
-    # (temperature is irrelevant here: with one segment, SegmentCombiner
-    # never reaches the soft_max branch at all)
+    # (with one segment it never reaches the fold at all)
     pipeline = make_pipeline(topo)
 
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
@@ -330,10 +329,9 @@ def test_ste_preserves_forward_value():
     a real regen-candidate boundary (hub topology, node 3)."""
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
-    temperature = 0.01  # sharp, so soft_max ≈ true max — must match both calls below
 
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
-    _, gsnr_preds, path_indicators, regen_probs = pipeline([demand], soft_max_temperature=temperature)
+    _, gsnr_preds, path_indicators, regen_probs = pipeline([demand])
 
     indicator = path_indicators[0].detach()
     active_eids = [e for e in range(indicator.shape[0]) if indicator[e].item() > 0.5]
@@ -349,7 +347,7 @@ def test_ste_preserves_forward_value():
             direct_gsnrs.append(pipeline.qot_model(span_feats, padding_mask)[0])
 
     boundary_probs = [regen_probs[n].detach() for n in boundary_nodes]
-    expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs, temperature=temperature)
+    expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs)
 
     assert abs(gsnr_preds[0].item() - expected_gsnr.item()) < 1e-4, (
         f"STE-blended GSNR {gsnr_preds[0].item():.6f} dB != "
@@ -535,15 +533,12 @@ def test_batched_qot_matches_per_segment_direct_calls():
     demands or segments."""
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
-    temperature = 0.01  # sharp, so soft_max ~= true max
 
     demands = [
         Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
         Demand(id=1, src=1, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
     ]
-    _, gsnr_preds, path_indicators, regen_probs = pipeline(
-        demands, soft_max_temperature=temperature
-    )
+    _, gsnr_preds, path_indicators, regen_probs = pipeline(demands)
 
     for demand in demands:
         indicator = path_indicators[demand.id].detach()
@@ -561,7 +556,7 @@ def test_batched_qot_matches_per_segment_direct_calls():
                 direct_gsnrs.append(pipeline.qot_model(span_feats, padding_mask)[0])
 
         boundary_probs = [regen_probs[n].detach() for n in boundary_nodes]
-        expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs, temperature=temperature)
+        expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs)
 
         assert abs(gsnr_preds[demand.id].item() - expected_gsnr.item()) < 1e-4, (
             f"demand {demand.id}: batched GSNR {gsnr_preds[demand.id].item():.6f} dB != "
@@ -691,8 +686,8 @@ def test_total_loss_invariant_to_edge_weight_scale():
     Includes 1e-11 — the magnitude weights actually collapsed to in the
     ind_132 run — applying the lesson from
     docs/investigations/CHANGELOG.md#correction-1c-8, where the
-    original soft_max tests passed only because they never covered the
-    production scale.
+    original segment-combiner tests passed only because they never covered
+    the production scale.
     """
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)

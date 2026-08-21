@@ -113,7 +113,7 @@ def main() -> None:
           f"lambda_regen={p_cfg['lambda_regen']}\n")
 
     final_epoch = t_cfg["epochs_e2e"]
-    tau, t_sm, _ = schedule_at(cfg, epoch=final_epoch)
+    tau, _ = schedule_at(cfg, epoch=final_epoch)
     vl = ctx.ckpt["vlastelica_lambda"]  # checkpoint's own value -- see schedule_at's docstring
     demands = demands_for(ctx, seed=final_epoch)
 
@@ -173,10 +173,10 @@ def main() -> None:
     # through. A live register_forward_hook during an actual pipeline(...)
     # call is the only way to get that.
     # =====================================================================
-    for label, ctx_i, tau_i, t_sm_i, vl_i, dem_i in [
+    for label, ctx_i, tau_i, vl_i, dem_i in [
         ("UNTRAINED (epoch 0)", ctx_init, *schedule_at(cfg, epoch=1),
          demands_for(ctx_init, seed=1)),
-        ("TRAINED (epoch %d)" % ctx.ckpt["epoch"], ctx, tau, t_sm, vl, demands),
+        ("TRAINED (epoch %d)" % ctx.ckpt["epoch"], ctx, tau, vl, demands),
     ]:
         pl = ctx_i.pipeline
         print("=" * 78)
@@ -202,7 +202,7 @@ def main() -> None:
 
         h = pl.edge_weight_net.register_forward_hook(hook)
         path_noise_costs, gsnr_preds, path_inds, regen_probs = pl(
-            dem_i, tau=tau_i, lambda_=vl_i, soft_max_temperature=t_sm_i)
+            dem_i, tau=tau_i, lambda_=vl_i)
         h.remove()
         w_t = captured["w"]
         # Mirror edge_weights_of's unit-mean renormalisation: the raw hook
@@ -244,7 +244,7 @@ def main() -> None:
         g_cost_surrogate = g_cost - g_cost_direct
 
         print(f"  demands={len(dem_i)}  infeasible={n_infeas}  tau={tau_i:.3f} "
-              f"t_sm={t_sm_i:.4f} vlastelica_lambda={vl_i:.3f}")
+              f"vlastelica_lambda={vl_i:.3f}")
         print(f"  L_feas={L_feas.item():.4f}  L_regen={L_regen.item():.4f}  "
               f"L_cost={L_cost.item():.6f}\n")
 

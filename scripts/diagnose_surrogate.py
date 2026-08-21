@@ -70,9 +70,9 @@ def main() -> None:
 
     lambda_cost = cfg["pipeline"]["lambda_cost"]
     # Start-of-training values (epoch 1): matches this script's own
-    # historical tau=regen_tau_start / soft_max_temperature start /
-    # undecayed vlastelica_lambda when no --checkpoint overrides them.
-    tau, soft_max_temp, lambda_ = schedule_at(cfg, epoch=1)
+    # historical tau=regen_tau_start / undecayed vlastelica_lambda when no
+    # --checkpoint overrides them.
+    tau, lambda_ = schedule_at(cfg, epoch=1)
 
     demands = demands_for(ctx, seed=args.seed)
 
@@ -87,9 +87,9 @@ def main() -> None:
 
     original_forward = pipeline.forward
 
-    def instrumented_forward(demands, tau=1.0, lambda_=10.0, soft_max_temperature=0.5):
+    def instrumented_forward(demands, tau=1.0, lambda_=10.0):
         path_noise_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out = \
-            original_forward(demands, tau=tau, lambda_=lambda_, soft_max_temperature=soft_max_temperature)
+            original_forward(demands, tau=tau, lambda_=lambda_)
 
         for did, pi in path_inds_out.items():
             def make_hook(demand_id):
@@ -104,7 +104,7 @@ def main() -> None:
 
     # --------------------------------------------------------- forward + backward
     path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
-        demands, tau=tau, lambda_=lambda_, soft_max_temperature=soft_max_temp
+        demands, tau=tau, lambda_=lambda_
     )
     loss, metrics = compute_loss(
         gsnr_preds=gsnr_preds,

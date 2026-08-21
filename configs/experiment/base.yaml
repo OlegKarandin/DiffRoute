@@ -96,30 +96,6 @@ constraint:
   dual_lr: 1.0            # eta — a 1 dB shortfall moves a dual 10% of lambda_0
   dual_max: 1000.0        # lambda_max — 100x lambda_0; a diagnostic cap
 
-# Annealed per-epoch alongside regen_tau (same anneal_start/anneal_end_epoch
-# window below). Two separate bugs lived here; both are fixed, and the
-# history matters because it explains why these values are safe now:
-#
-#  1) The temperature used to be hardcoded at construction and never annealed
-#     at all (docs/investigations/CHANGELOG.md#correction-1c-7).
-#  2) More fundamentally, soft_max's approximation error used to be ABSOLUTE
-#     in linear-noise units (t*ln2), so it did not shrink with its operands.
-#     Real per-segment noise is ~0.0025 (segments run ~180-210 km, ~26 dB),
-#     while even t=0.01 has a floor of 0.0069 — 2.6x larger than the signal.
-#     Every temperature in this range therefore reported that regenerating
-#     makes a path WORSE, inverting the sign of every gradient into
-#     regen_logits (docs/investigations/CHANGELOG.md#correction-1c-8).
-#
-# soft_max is now scale-normalised, so the error is max(a,b)*t*ln2 — a fixed
-# fraction of the operands — and the "regen helps" invariant holds for any
-# temperature < 1/ln2 = 1.443 at ANY noise magnitude. These values are
-# comfortably inside that, and no longer encode a hidden assumption about
-# the topology's noise scale. Verify with:
-#   python scripts/diagnose_segment_noise_scale.py --config <this file>
-segment_combiner:
-  soft_max_temperature: 0.5
-  soft_max_temperature_min: 0.01
-
 training:
   lr_edge_net: 1.0e-3  # NOTE: EdgeWeightNet grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
   # Adam's step size is ~lr whenever the gradient sign is steady, independent

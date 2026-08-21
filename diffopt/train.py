@@ -53,13 +53,12 @@ def linear_anneal(
 ) -> float:
     """Linearly anneal a scalar from `start` to `end` over [anneal_start, anneal_end].
 
-    Generic — used for both RegenPlacement's `tau` (decision sharpness) and
-    SegmentCombiner's `soft_max_temperature` (noise-combination accuracy).
-    Both represent "how sharp should this continuous relaxation be," and
-    annealing them on the same epoch window is deliberate: as regen
-    decisions sharpen, the physics evaluation backing them sharpens too, at
-    the same pace (see SegmentCombiner's docstring for why an un-annealed
-    soft_max_temperature silently broke the "regen helps" invariant).
+    Generic — currently drives RegenPlacement's `tau` (decision sharpness).
+    It also used to drive SegmentCombiner's `soft_max_temperature` on the
+    same epoch window, so that the physics evaluation sharpened at the same
+    pace as the regen decisions it backed; SegmentCombiner's fold is exact
+    now and has no such knob, but the helper stays generic — nothing about
+    it is tau-specific.
     """
     if epoch <= anneal_start:
         return start
@@ -180,10 +179,6 @@ def main() -> None:
 
     t_cfg = cfg["training"]
     p_cfg = cfg["pipeline"]
-    sc_cfg = cfg.get("segment_combiner", {})
-    soft_max_temp_start: float = sc_cfg.get("soft_max_temperature", 0.5)
-    soft_max_temp_end: float = sc_cfg.get("soft_max_temperature_min", 0.01)
-
     vlastelica_lambda: float = t_cfg["vlastelica_lambda"]
     lambda_min: float = t_cfg["vlastelica_lambda_min"]
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
@@ -224,7 +219,7 @@ def main() -> None:
             "regen_loss", "path_noise_loss", "num_regen_soft", "num_regen_noncand",
             "num_infeasible", "num_violated", "worst_margin_db",
             "lambda_max_observed", "num_at_cap",
-            "tau", "soft_max_temperature", "vlastelica_lambda",
+            "tau", "vlastelica_lambda",
             "regen_logit_mean", "regen_logit_min", "regen_logit_max",
             "regen_prob_max",
         ])
@@ -237,25 +232,12 @@ def main() -> None:
                 t_cfg["regen_tau_anneal_start_epoch"],
                 t_cfg["regen_tau_anneal_end_epoch"],
             )
-            # Annealed on the same epoch window as tau — see linear_anneal's
-            # docstring for why. Un-annealed soft_max_temperature (fixed at
-            # 0.5) previously made the "regen helps" invariant backwards;
-            # see SegmentCombiner's docstring and
-            # docs/investigations/CHANGELOG.md's Phase 1c corrections for
-            # the diagnosis.
-            soft_max_temp = linear_anneal(
-                epoch,
-                soft_max_temp_start,
-                soft_max_temp_end,
-                t_cfg["regen_tau_anneal_start_epoch"],
-                t_cfg["regen_tau_anneal_end_epoch"],
-            )
 
             opt_edge.zero_grad()
             opt_regen.zero_grad()
 
             path_noise_costs, gsnr_preds, _, regen_probs = pipeline(
-                demands, tau=tau, lambda_=vlastelica_lambda, soft_max_temperature=soft_max_temp
+                demands, tau=tau, lambda_=vlastelica_lambda
             )
             loss, metrics = compute_loss(
                 gsnr_preds=gsnr_preds,
@@ -331,7 +313,6 @@ def main() -> None:
                 f"{lambda_max_observed:.4f}",
                 num_at_cap,
                 f"{tau:.4f}",
-                f"{soft_max_temp:.4f}",
                 f"{vlastelica_lambda:.4f}",
                 f"{logits.mean().item():.6f}",
                 f"{logits.min().item():.6f}",
@@ -350,7 +331,7 @@ def main() -> None:
                     f"({num_regen_noncand} inert) "
                     f"| lambda_max={lambda_max_observed:.1f} at_cap={num_at_cap} "
                     f"| logit[{logits.min().item():+.3f},{logits.max().item():+.3f}] "
-                    f"| tau={tau:.3f} | t_sm={soft_max_temp:.3f} | λ={vlastelica_lambda:.3f}"
+                    f"| tau={tau:.3f} | λ={vlastelica_lambda:.3f}"
                 )
 
             selection_key = (

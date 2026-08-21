@@ -70,10 +70,6 @@ constraint:
   dual_lr: 1.0            # eta — a 1 dB shortfall moves a dual 10% of lambda_0
   dual_max: 1000.0        # lambda_max — 100x lambda_0; a diagnostic cap
 
-segment_combiner:
-  soft_max_temperature: 0.5
-  soft_max_temperature_min: 0.01
-
 training:
   lr_edge_net: 1.0e-3
   # Adam's step is ~lr regardless of gradient magnitude, so a logit moves at
@@ -91,8 +87,7 @@ training:
   regen_tau_end: 0.1
   # Window is proportional to epochs_e2e above (60) — mirrors the validated
   # small_test_ind132.yaml window (10/40, anneal ends at 67% of training).
-  # soft_max_temperature (segment_combiner, above) is annealed over this same
-  # window per docs/investigations/CHANGELOG.md#correction-1c-7: if epochs_e2e changes again,
-  # update both together rather than leaving this pair stale relative to it.
+  # If epochs_e2e changes again, update this pair rather than leaving it
+  # stale relative to it.
   regen_tau_anneal_start_epoch: 10
   regen_tau_anneal_end_epoch: 40

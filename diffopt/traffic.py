@@ -227,7 +227,6 @@ def preflight_filter(
     margin_db: float,
     channel_loading_fraction: float = 0.5,
     max_spans: int = 60,
-    soft_max_temperature: float = 0.01,
 ) -> Tuple[List[Demand], List[Tuple[Demand, float]]]:
     """Drop demands that are infeasible under the most favourable conditions.
 
@@ -241,12 +240,14 @@ def preflight_filter(
     Those surface later as duals pinned at `dual_max` in
     `diffopt/train.py`'s end-of-run report, not here.
 
-    The screen is very slightly conservative. `SegmentCombiner`'s `soft_max`
-    over-estimates a hard max by a *relative* `t*ln2` (invariants.md, "Segment
-    combiner"), so at `soft_max_temperature=0.01` a demand within ~0.03 dB of
-    the bar could be excluded when exact-max arithmetic would keep it. That is
-    the safe direction: the alternative is a demand whose dual runs to the cap
-    forever.
+    The screen is non-conservative by construction. `SegmentCombiner` folds
+    chunks with an exact max (invariants.md, "Segment combiner"), so the GSNR
+    it reports here is exactly the one production arithmetic computes for this
+    route and placement — the screen can neither over- nor under-state a
+    demand's best case by an approximation margin. It used to over-estimate
+    noise by the soft-max's relative `t*ln2` (~0.03 dB at t=0.01), which could
+    exclude a demand sitting that close to the bar; the exact fold removes
+    that margin entirely.
 
     Args:
         margin_db: The same delta the constrained loss adds inside the hinge.
@@ -333,11 +334,7 @@ def preflight_filter(
                 batched_gsnr[flat_idx + i] for i in range(len(segments))
             ]
             flat_idx += len(segments)
-            path_gsnr = segment_combiner(
-                segment_gsnrs,
-                [one for _ in boundary_nodes],
-                temperature=soft_max_temperature,
-            )
+            path_gsnr = segment_combiner(segment_gsnrs, [one for _ in boundary_nodes])
             shortfall = threshold + margin_db - float(path_gsnr.item())
             if shortfall > 0.0:
                 excluded.append((demand, shortfall))

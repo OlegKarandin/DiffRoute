@@ -68,7 +68,7 @@ with torch.no_grad():
         out = {}
         for name, p in [("p0", 0.0), ("p05", 0.5), ("p1", 1.0)]:
             bp = [torch.tensor(p)] * (len(segs) - 1)
-            out[name] = comb(gs, bp, temperature=0.01).item()
+            out[name] = comb(gs, bp).item()
         rows.append((km, nsp, len(segs), d.bitrate_gbps, thr,
                      out["p0"], out["p05"], out["p1"]))
 

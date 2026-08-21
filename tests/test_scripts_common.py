@@ -141,23 +141,18 @@ def test_edge_weights_of_defaults_to_normalised():
 # ---------------------------------------------------------------------------
 
 def test_schedule_at_matches_train_py_annealing():
-    """tau / soft_max_temperature / lambda at a given epoch must equal what
-    train.py would compute for that epoch. Independently replays train.py's
-    loop (tau/soft_max via linear_anneal, vlastelica_lambda via the
-    multiplicative-decay-then-clamp update applied epoch-1 times) rather
-    than calling schedule_at for the "expected" side, so a regression in
-    schedule_at's own arithmetic is actually caught."""
+    """tau / lambda at a given epoch must equal what train.py would compute
+    for that epoch. Independently replays train.py's loop (tau via
+    linear_anneal, vlastelica_lambda via the multiplicative-decay-then-clamp
+    update applied epoch-1 times) rather than calling schedule_at for the
+    "expected" side, so a regression in schedule_at's own arithmetic is
+    actually caught."""
     cfg = yaml.safe_load(_SMALL_TEST_IND132.read_text())
     t_cfg = cfg["training"]
-    sc_cfg = cfg["segment_combiner"]
 
     for epoch in [1, 5, 10, 25, 40, 60, 61]:
         expected_tau = linear_anneal(
             epoch, t_cfg["regen_tau_start"], t_cfg["regen_tau_end"],
-            t_cfg["regen_tau_anneal_start_epoch"], t_cfg["regen_tau_anneal_end_epoch"],
-        )
-        expected_tsm = linear_anneal(
-            epoch, sc_cfg["soft_max_temperature"], sc_cfg["soft_max_temperature_min"],
             t_cfg["regen_tau_anneal_start_epoch"], t_cfg["regen_tau_anneal_end_epoch"],
         )
         # Replicate train.py's per-epoch update loop literally: lambda starts
@@ -171,10 +166,9 @@ def test_schedule_at_matches_train_py_annealing():
                 expected_lambda * t_cfg["vlastelica_lambda_decay"],
             )
 
-        tau, tsm, lam = schedule_at(cfg, epoch=epoch)
+        tau, lam = schedule_at(cfg, epoch=epoch)
 
         assert tau == pytest.approx(expected_tau), f"epoch {epoch}: tau mismatch"
-        assert tsm == pytest.approx(expected_tsm), f"epoch {epoch}: soft_max_temperature mismatch"
         assert lam == pytest.approx(expected_lambda), f"epoch {epoch}: vlastelica_lambda mismatch"
 
 
@@ -186,8 +180,8 @@ def test_schedule_at_none_defaults_to_epoch_one():
 def test_schedule_at_lambda_decays_and_clamps():
     cfg = yaml.safe_load(_SMALL_TEST_IND132.read_text())
     t_cfg = cfg["training"]
-    _, _, lam_start = schedule_at(cfg, epoch=1)
-    _, _, lam_later = schedule_at(cfg, epoch=30)
+    _, lam_start = schedule_at(cfg, epoch=1)
+    _, lam_later = schedule_at(cfg, epoch=30)
     assert lam_start == pytest.approx(t_cfg["vlastelica_lambda"])
     assert lam_later < lam_start
     assert lam_later >= t_cfg["vlastelica_lambda_min"]
