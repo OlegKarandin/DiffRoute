@@ -480,14 +480,39 @@ def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch)
 
 def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
     """Written every epoch, not only on checkpoint improvements — the whole
-    point is to see the oscillation between the epochs that got saved."""
+    point is to see the oscillation between the epochs that got saved.
+
+    Epoch 1 and 3 improve (lower loss), but epoch 2 is worse (same violations,
+    higher loss), proving a row is written every epoch regardless of whether
+    it improves. Monkeypatched masks ensure hard_placement_mask() returns
+    different placements per epoch to exercise the multi-node formatting.
+    """
     import csv as csv_mod
 
-    probs = torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0])
+    # Script masks independently: epoch 1 empty, epochs 2&3 have nodes placed.
+    # hard_placement_mask() is called once per epoch regardless of hard_eval.
+    masks = [
+        torch.zeros(_DummyTopology.num_nodes, dtype=torch.bool),      # epoch 1: empty
+        torch.tensor([False, True, False, True, False]),              # epoch 2: nodes 1,3
+        torch.tensor([False, False, True, False, False]),             # epoch 3: node 2
+    ]
+    call_count = {"n": 0}
+
+    def fake_hard_placement_mask(self):
+        idx = min(call_count["n"], len(masks) - 1)
+        call_count["n"] += 1
+        return masks[idx]
+
+    monkeypatch.setattr(RegenPlacement, "hard_placement_mask", fake_hard_placement_mask)
+
+    # Epoch 1: loss=3.0, violations=1, regens=2 (best so far)
+    # Epoch 2: loss=5.0, violations=1, regens=2 (WORSE on loss, doesn't improve)
+    # Epoch 3: loss=1.0, violations=1, regens=2 (best overall)
+    # This proves rows are written EVERY epoch, not just on improvements.
     _run_main(
         tmp_path, monkeypatch,
-        scripted=[(3.0, 1, 2), (2.0, 1, 2), (1.0, 1, 2)],
-        regen_probs=probs,
+        scripted=[(3.0, 1, 2), (5.0, 1, 2), (1.0, 1, 2)],
+        hard_eval=True,
     )
 
     path = tmp_path / "logs" / "placement_trajectory.csv"
@@ -495,8 +520,15 @@ def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
         rows = list(csv_mod.DictReader(f))
 
     assert [r["epoch"] for r in rows] == ["1", "2", "3"]
-    assert all(r["num_placed"] == r["placed_nodes"].count(" ") + 1
-               for r in rows if r["placed_nodes"])
+    # num_placed is a string from CSV, count of spaces + 1 gives node count.
+    # Epoch 1: empty (0 nodes), epoch 2: 2 nodes (1 space), epoch 3: 1 node (0 spaces)
+    assert int(rows[0]["num_placed"]) == 0  # epoch 1 empty
+    assert int(rows[1]["num_placed"]) == 2  # epoch 2: nodes 1,3
+    assert int(rows[2]["num_placed"]) == 1  # epoch 3: node 2
+    # Verify num_placed matches actual node count for non-empty rows.
+    for r in rows:
+        if r["placed_nodes"]:
+            assert int(r["num_placed"]) == r["placed_nodes"].count(" ") + 1
 
 
 def test_placement_trajectory_records_an_empty_set_without_crashing(
