@@ -10,7 +10,7 @@ the feasible optimum):
   dropout_0.3        sigmoid, dropout 0.3     — toy: 11 -> 6, feasible, nodes
                                                 {3,4,7,9,11,12}
   l0_lambda1         hard_concrete            — toy: 7 placed, 1 VIOLATED
-  l0_lambda3         hard_concrete, lr 3.0    — toy: 3 placed, 2 VIOLATED
+  l0_lambda3         hard_concrete, lambda_regen=3.0 — toy: 3 placed, 2 VIOLATED
   l0_dropout_0.3     hard_concrete + dropout  — untested; see rationale below
   dropout_0.3_decay  dropout 0.3 + dual_decay — contingency, see below
 
@@ -51,13 +51,15 @@ manufactured on purpose — so that refutation does not carry over.
 
 --- Implementation notes (not part of the plan's docstring text) ---
 
-`l0_lambda3`'s "lr 3.0" is read literally as `training.lr_regen: 3.0`
-(constrained_stress.yaml's base value is 2.0e-2) — the toy replica's own
-`--lambda-regen` CLI flag is a different, already-named knob
-(`pipeline.lambda_regen`, held fixed across every arm per the paragraph
-above), so "lr" here can only mean the regen parameter's optimizer learning
-rate. `dropout_0.3_decay` uses `constraint.dual_decay: 0.05`, the same value
-`open_followups.md` item #3's `_dual_decay.yaml` hypothesis test used.
+`l0_lambda3` is the plan's one stated exception to "lambda_regen held at
+1.0": `pipeline.lambda_regen: 3.0`, per the design spec
+(`docs/superpowers/specs/2026-08-21-placement-signal-design.md:262`) and
+the plan's own Global Constraints section. The brief's table shorthand
+"lr 3.0" refers to this `lambda_regen` value, NOT `training.lr_regen`
+(Adam's step size for the regen parameter, unrelated and left at the base
+config's 2.0e-2 for every arm). `dropout_0.3_decay` uses
+`constraint.dual_decay: 0.05`, the same value `open_followups.md` item #3's
+`_dual_decay.yaml` hypothesis test used.
 
 `score()`'s greedy-drop `order_key` for the `hard_concrete` gate uses each
 node's `P(gate open) = sigmoid(log_alpha - beta*log(-gamma/zeta))` — exactly
@@ -105,7 +107,7 @@ ARMS: List[dict] = [
         "name": "l0_lambda3",
         "overrides": {
             "placement": {"gate": "hard_concrete"},
-            "training": {"lr_regen": 3.0},
+            "pipeline": {"lambda_regen": 3.0},
         },
     },
     {
