@@ -135,7 +135,7 @@ def _mod_config():
     return ModulationConfig.from_yaml(str(_MODULATION_FORMATS_PATH))
 
 
-def _write_config(tmp_path, *, epochs: int, hard_eval: bool = False) -> Path:
+def _write_config(tmp_path, *, epochs: int, hard_eval: bool = False, gate: str = None) -> Path:
     config = {
         "topology": "unused",
         "modulation_formats": str(_MODULATION_FORMATS_PATH),
@@ -177,12 +177,15 @@ def _write_config(tmp_path, *, epochs: int, hard_eval: bool = False) -> Path:
         "checkpoint_dir": str(tmp_path / "checkpoints"),
         "selection": {"hard_eval": hard_eval},
     }
+    if gate is not None:
+        config["placement"] = {"gate": gate}
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.dump(config))
     return config_path
 
 
-def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: bool = False):
+def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: bool = False,
+               gate: str = None):
     """Drive the real diffopt.train.main() epoch loop with a scripted
     per-epoch (total_loss, num_violated, num_regen_soft) sequence.
 
@@ -194,6 +197,14 @@ def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: b
     `regen_probs` overrides what the stub pipeline returns, so a test can
     place probability mass on a specific node. Restored afterwards because it
     is class state on _DummyPipeline.
+
+    `gate` is threaded into the written config's `placement.gate` key
+    (`None`, the default, omits the key entirely so main() falls back to
+    "sigmoid" the same way an old config with no `placement` section does).
+    RegenPlacement and its `count_penalty`/`hard_placement_mask` are the
+    REAL implementation here, not stubbed — only DiffONetPipeline and
+    compute_loss are — so this exercises the real gate-dispatch logic in
+    both.
     """
     call_count = {"n": 0}
     if regen_probs is not None:
@@ -244,7 +255,7 @@ def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: b
     monkeypatch.setattr(train_mod, "DiffONetPipeline", _DummyPipeline)
     monkeypatch.setattr(train_mod, "compute_loss", fake_compute_loss)
 
-    config_path = _write_config(tmp_path, epochs=len(scripted), hard_eval=hard_eval)
+    config_path = _write_config(tmp_path, epochs=len(scripted), hard_eval=hard_eval, gate=gate)
     monkeypatch.setattr(sys, "argv", ["train.py", "--config", str(config_path)])
     train_mod.main()
     return torch.load(tmp_path / "checkpoints" / "best_e2e.pt", weights_only=False)
@@ -568,3 +579,16 @@ def test_checkpoint_records_the_active_gate(tmp_path, monkeypatch):
     ckpt = _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 0)])
     assert ckpt["gate"] == "sigmoid"
     assert "regen_logits" in ckpt
+
+
+def test_hard_concrete_checkpoint_uses_log_alpha_key(tmp_path, monkeypatch):
+    """Under gate="hard_concrete" the checkpoint must record the parameter
+    under "regen_log_alpha" and must NOT save a "regen_logits" key at all —
+    reloading a hard_concrete checkpoint's log_alpha values as sigmoid
+    logits (or vice versa) would silently reinterpret them as a different
+    quantity. See scripts/_common.py's build_context gate-mismatch guard,
+    which depends on this key being genuinely absent rather than stale."""
+    ckpt = _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 0)], gate="hard_concrete")
+    assert ckpt["gate"] == "hard_concrete"
+    assert "regen_log_alpha" in ckpt
+    assert "regen_logits" not in ckpt

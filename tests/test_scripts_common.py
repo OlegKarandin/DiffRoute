@@ -273,6 +273,50 @@ def test_build_context_loads_checkpoint_into_pipeline():
     assert torch.equal(ctx.regen_placement.regen_logits, ctx.ckpt["regen_logits"])
 
 
+def test_build_context_raises_on_gate_mismatch(monkeypatch, tmp_path):
+    """build_context reads the CHECKPOINT's own gate, not the config's, and
+    must refuse to load when they disagree — reinterpreting a hard_concrete
+    checkpoint's log_alpha values as sigmoid logits (or vice versa) would be
+    silently wrong, not merely different. `_SMALL_TEST_IND132` has no
+    `placement` section, so its RegenPlacement defaults to "sigmoid"; a
+    checkpoint claiming "hard_concrete" must be rejected against it.
+
+    Stubs load_qot_model the same way test_build_context_seeds_before_
+    module_construction does, so this doesn't require a real QoT checkpoint
+    on a clean clone. The e2e checkpoint itself is a hand-built fake — this
+    test only needs its "gate" and matching parameter key to be self
+    consistent, not a real trained placement.
+    """
+    import scripts._common as common_mod
+    from diffopt.qot.model import SpanAttentionQoT
+    from diffopt.routing.edge_weight_net import EdgeWeightNet
+    from diffopt.topology import load_topology
+
+    def fake_load_qot_model(checkpoint_path, cfg, device):
+        return SpanAttentionQoT(max_spans=cfg.get("max_spans_per_segment", 60))
+
+    monkeypatch.setattr(common_mod, "load_qot_model", fake_load_qot_model)
+
+    cfg = yaml.safe_load(_SMALL_TEST_IND132.read_text())
+    assert "placement" not in cfg, "fixture must default build_context's gate to sigmoid"
+
+    topology = load_topology(cfg["topology"], cfg["modulation_formats"])
+    fake_ckpt = {
+        "edge_weight_net_state": EdgeWeightNet().state_dict(),
+        "gate": "hard_concrete",
+        "regen_log_alpha": torch.zeros(topology.num_nodes),
+    }
+    ckpt_path = tmp_path / "fake_hard_concrete_ckpt.pt"
+    torch.save(fake_ckpt, ckpt_path)
+
+    with pytest.raises(ValueError) as exc_info:
+        build_context(cfg, load_e2e_checkpoint=True, checkpoint_path=str(ckpt_path))
+
+    message = str(exc_info.value)
+    assert "hard_concrete" in message
+    assert "sigmoid" in message
+
+
 def test_build_context_max_spans_from_config_not_hardcoded(monkeypatch):
     """pipeline.max_spans must come from cfg, never a bare literal — several
     scripts hardcoded 60 (docs/architecture/invariants.md's own max_spans_per_segment default)
