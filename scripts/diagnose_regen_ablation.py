@@ -2,8 +2,11 @@
 placed regenerators actually load-bearing?
 
 Loads a trained e2e checkpoint, thresholds the learned probabilities into a
-hard placement set R = {n : sigmoid(logit_n / tau_end) > 0.5}, then on a
-FIXED demand set (not the per-epoch-reseeded set train.py uses):
+hard placement set R = {n : sigmoid(logit_n / tau_end) > 0.5}, then on the
+SAME fixed traffic matrix `train.py` actually trained/constrained this
+checkpoint against (`_common.fixed_traffic_demands` — `build_traffic_matrix`
++ `preflight_filter` over `cfg["traffic"]`/`cfg["constraint"]`, not an ad
+hoc `generate_demands` draw unrelated to the checkpoint's training set):
 
   1. Confirms the baseline: with all of R active (hard p=1 on R, p=0
      elsewhere), num_infeasible over the fixed set.
@@ -19,9 +22,9 @@ FIXED demand set (not the per-epoch-reseeded set train.py uses):
 
 All evaluations reuse the pipeline's own routing (trained EdgeWeightNet) —
 this is deliberately about the deployed system, not a physical-baseline
-question. "Hard" placement is implemented by saturating regen_logits to
-+/-30 for the relevant nodes so sigmoid(logit/tau) rounds to exactly 0/1 for
-any reasonable tau, then reusing DiffONetPipeline.forward() unmodified.
+question. "Hard" placement is implemented via DiffONetPipeline.forward's
+regen_probs_override — an explicit 0/1 tensor passed per call — rather than
+saturating regen_logits to +/-30 in place and restoring them afterwards.
 
 Usage:
     conda activate diffopt
@@ -32,13 +35,12 @@ import argparse
 import torch
 import yaml
 
-from _common import add_common_args, build_context, demands_for
+from _common import add_common_args, build_context, fixed_traffic_demands
 
 ap = argparse.ArgumentParser()
-add_common_args(ap)
-# This script's own historical default: 400 demands (not cfg["num_demands"]),
-# fixed seed=7 (matches diagnose_regen_necessity.py's own fixed seed).
-ap.set_defaults(num_demands=400, seed=7)
+# No --num-demands/--seed: the fixed traffic matrix is fully determined by
+# cfg["traffic"]["seed"], not a CLI-chosen draw.
+add_common_args(ap, with_demands=False)
 args = ap.parse_args()
 
 with open(args.config) as f:
@@ -59,27 +61,45 @@ vlastelica_lambda = ctx.ckpt["vlastelica_lambda"]
 
 learned_logits = regen_placement.regen_logits.detach().clone()
 learned_probs = torch.sigmoid(learned_logits / tau_end)
-R = set((learned_probs > 0.5).nonzero(as_tuple=True)[0].tolist())
+# The deployed placement, from the one gate-agnostic definition. Prefer the
+# checkpoint's own recorded mask when present (train.py writes it since
+# 2026-08-21); fall back to recomputing for older checkpoints.
+if ctx.ckpt is not None and "placement_mask" in ctx.ckpt:
+    R = set(ctx.ckpt["placement_mask"].nonzero(as_tuple=True)[0].tolist())
+else:
+    R = set(regen_placement.hard_placement_mask().nonzero(as_tuple=True)[0].tolist())
 cands = ctx.regen_candidates
 ckpt_label = args.checkpoint or f"{cfg['checkpoint_dir']}/best_e2e.pt"
 print(f"Checkpoint {ckpt_label} "
       f"(epoch {ctx.ckpt['epoch']}): |R|={len(R)} nodes "
       f"({sorted(R)}), all regen candidates: {R <= cands}")
 
-demands = demands_for(ctx, seed=args.seed, num_demands=args.num_demands)
+demands, excluded = fixed_traffic_demands(ctx)
 thresholds = {d.id: ctx.mod_cfg.required_snr_threshold(d.bitrate_gbps) for d in demands}
-print(f"{len(demands)} demands (seed={args.seed}, fixed across all evaluations)\n")
+tr_cfg = cfg["traffic"]
+print(
+    f"{len(demands)} demands ({tr_cfg['scenario']}, seed={tr_cfg['seed']}, "
+    f"scale={tr_cfg['scale']:.3g}) — train.py's own fixed matrix, "
+    f"{len(excluded)} excluded by preflight, fixed across all evaluations\n"
+)
 
 
 def infeasible_set(active):
-    """Hard-saturate regen_logits to active/inactive, forward, return the
-    set of demand_ids with gsnr_pred below threshold."""
+    """Forward on an explicit hard placement and return the set of demand_ids
+    below threshold.
+
+    Previously this saturated regen_logits to +/-30 in place and restored
+    them at the end of the script. pipeline.forward's regen_probs_override
+    does the same thing without mutating a parameter, so an exception
+    mid-sweep can no longer leave the module holding a saturated placement
+    that was never in any checkpoint.
+    """
+    override = torch.zeros(topo.num_nodes)
+    override[list(active)] = 1.0
     with torch.no_grad():
-        regen_placement.regen_logits.copy_(
-            torch.tensor([30.0 if n in active else -30.0 for n in range(topo.num_nodes)])
-        )
         _, gsnr_preds, _, _ = pipe(
-            demands, tau=tau_end, lambda_=vlastelica_lambda
+            demands, tau=tau_end, lambda_=vlastelica_lambda,
+            regen_probs_override=override,
         )
     return {d.id for d in demands if gsnr_preds[d.id].item() < thresholds[d.id]}
 
@@ -132,7 +152,3 @@ for n in order:
         print(f"  dropped node {n:>4} (p={learned_probs[n]:.4f}) — set stays feasible, |kept|={len(kept)}")
 print(f"\nMinimal load-bearing set: {len(kept)}/{len(R)} nodes ({sorted(kept)})")
 print(f"Dropped as redundant: {sorted(dropped)}")
-
-# Restore the checkpoint's learned (soft) logits, not the hard-saturated ones.
-with torch.no_grad():
-    regen_placement.regen_logits.copy_(learned_logits)
