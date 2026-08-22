@@ -92,7 +92,7 @@ class _DummyPipeline:
     """Stand-in for DiffONetPipeline. Its physics forward pass is irrelevant
     to checkpoint selection and to the inert-placement count, so it is
     replaced with a cheap no-op that satisfies main()'s call shape:
-    `pipeline(demands, tau=..., lambda_=...)` ->
+    `pipeline(demands, tau=..., lambda_=..., gate_dropout_p=...)` ->
     (path_noise_costs, gsnr_preds, path_indicators, regen_probs).
 
     `regen_probs_value` is a class attribute rather than a constructor
@@ -118,7 +118,8 @@ class _DummyPipeline:
     def to(self, device):
         return self
 
-    def __call__(self, demands, tau=None, lambda_=None, regen_probs_override=None):
+    def __call__(self, demands, tau=None, lambda_=None, regen_probs_override=None,
+                 gate_dropout_p=0.0):
         probs = (_DummyPipeline.regen_probs_value
                  if regen_probs_override is None else regen_probs_override)
         if regen_probs_override is None:

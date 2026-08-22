@@ -248,6 +248,7 @@ class DiffONetPipeline(nn.Module):
         tau: float = 1.0,
         lambda_: float = 10.0,
         regen_probs_override: Optional[torch.Tensor] = None,
+        gate_dropout_p: float = 0.0,
     ) -> Tuple[
         Dict[int, torch.Tensor],   # path_noise_costs
         Dict[int, torch.Tensor],   # gsnr_preds
@@ -269,6 +270,12 @@ class DiffONetPipeline(nn.Module):
                       and boundary probabilities) and is echoed back as the
                       fourth return value, so `regen_probs` always describes
                       what the forward pass actually used.
+            gate_dropout_p: Training-only probability of zeroing each node's
+                      gate in the PHYSICS path. The returned regen_probs are
+                      always undropped, so `lambda_regen`'s penalty is priced
+                      on the real probabilities — otherwise the price per
+                      regenerator fluctuates with the mask. Ignored under
+                      .eval() and whenever regen_probs_override is given.
 
         Returns:
             path_noise_costs: demand_id → scalar accumulated-ASE-noise tensor, live in autograd graph.
@@ -279,18 +286,39 @@ class DiffONetPipeline(nn.Module):
         device = self._topo_edge_features.device
 
         # 1. Regen probabilities — shape (num_nodes,), requires_grad=True
-        # unless overridden (an override is normally a detached hard mask).
-        regen_probs = (
-            self.regen_placement.get_regen_probs(tau)
-            if regen_probs_override is None
-            else regen_probs_override
-        )
+        # unless overridden.
+        if regen_probs_override is not None:
+            # An explicit placement the caller wants evaluated (hard-eval
+            # selection, leave-one-out ablation). Dropout must NOT touch it:
+            # masking a placement someone asked to measure would make the
+            # measurement random.
+            regen_probs = regen_probs_override
+            regen_probs_physics = regen_probs_override
+        else:
+            regen_probs = self.regen_placement.get_regen_probs(tau)
+            if self.training and gate_dropout_p > 0.0:
+                # Gate dropout. Once every demand clears threshold + margin,
+                # relu(bar - gsnr) is flat and d(feasibility)/d(logit) is
+                # exactly 0 on every node — the only surviving force is
+                # lambda_regen's L1 push, which is identical on every node by
+                # construction, and identical pressure cannot sort a
+                # load-bearing node from a redundant one. Dropping gates
+                # manufactures violations on purpose, putting demands back in
+                # the hinge's ACTIVE region, the only region that produces
+                # node-discriminating gradient. See
+                # docs/investigations/regen_over_provisioning.md Finding 2.
+                keep = (torch.rand_like(regen_probs) >= gate_dropout_p).to(
+                    regen_probs.dtype
+                )
+                regen_probs_physics = regen_probs * keep
+            else:
+                regen_probs_physics = regen_probs
 
         # 2. Build (E, 7) edge features: topology cols + regen probs at endpoints
         edge_feats = torch.cat([
             self._topo_edge_features,
-            regen_probs[self._edge_src_ids].unsqueeze(1),
-            regen_probs[self._edge_dst_ids].unsqueeze(1),
+            regen_probs_physics[self._edge_src_ids].unsqueeze(1),
+            regen_probs_physics[self._edge_dst_ids].unsqueeze(1),
         ], dim=1)
 
         # 3. Edge weights via EdgeWeightNet — (E,), strictly positive via
@@ -448,7 +476,7 @@ class DiffONetPipeline(nn.Module):
                 segment_gsnrs.append(segment_gsnr)
 
             # Combine segments with soft boundary probabilities
-            boundary_probs = [regen_probs[n] for n in demand_boundary_nodes[demand.id]]
+            boundary_probs = [regen_probs_physics[n] for n in demand_boundary_nodes[demand.id]]
             path_gsnr = self.segment_combiner(segment_gsnrs, boundary_probs)
 
             path_noise_costs[demand.id] = demand_path_noise_costs[demand.id]

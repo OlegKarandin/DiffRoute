@@ -926,3 +926,71 @@ def test_regen_probs_override_none_is_a_no_op():
     expected = pipeline.regen_placement.get_regen_probs(0.7)
 
     assert torch.equal(probs, expected)
+
+
+# ---------------------------------------------------------------------------
+# Test: gate dropout
+# ---------------------------------------------------------------------------
+
+def test_gate_dropout_leaves_the_returned_probs_undropped():
+    """The lambda_regen penalty is computed from the RETURNED probs. If the
+    mask reached them, the price per regenerator would fluctuate with the
+    mask — adding noise exactly where signal is wanted."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    pipeline.train()
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    torch.manual_seed(0)
+    _, _, _, probs = pipeline(demands, tau=1.0, gate_dropout_p=0.9)
+
+    assert torch.allclose(probs, pipeline.regen_placement.get_regen_probs(1.0))
+
+
+def test_gate_dropout_changes_the_physics():
+    """Dropping 100% of gates must give the same GSNR as no regenerators."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    pipeline.train()
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+    with torch.no_grad():
+        pipeline.regen_placement.regen_logits.fill_(10.0)
+
+    _, dropped, _, _ = pipeline(demands, tau=1.0, gate_dropout_p=1.0)
+    zeros = torch.zeros(topology.num_nodes)
+    _, none_placed, _, _ = pipeline(demands, tau=1.0, regen_probs_override=zeros)
+
+    assert abs(dropped[0].item() - none_placed[0].item()) < 1e-4
+
+
+def test_gate_dropout_is_inactive_in_eval_mode():
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    pipeline.eval()
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+    with torch.no_grad():
+        pipeline.regen_placement.regen_logits.fill_(10.0)
+
+    _, a, _, _ = pipeline(demands, tau=1.0, gate_dropout_p=1.0)
+    _, b, _, _ = pipeline(demands, tau=1.0, gate_dropout_p=0.0)
+
+    assert abs(a[0].item() - b[0].item()) < 1e-6
+
+
+def test_gate_dropout_does_not_apply_to_an_override():
+    """An override is an explicit placement the caller wants evaluated —
+    the hard-eval selection pass. Masking it would make selection random."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    pipeline.train()
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+    ones = torch.ones(topology.num_nodes)
+
+    _, with_dropout, _, _ = pipeline(
+        demands, tau=1.0, regen_probs_override=ones, gate_dropout_p=1.0
+    )
+    _, without, _, _ = pipeline(
+        demands, tau=1.0, regen_probs_override=ones, gate_dropout_p=0.0
+    )
+
+    assert abs(with_dropout[0].item() - without[0].item()) < 1e-6

@@ -238,6 +238,11 @@ def main() -> None:
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
     epochs: int = t_cfg["epochs_e2e"]
 
+    # Training-only masking of the physics-path regen probabilities. See
+    # DiffONetPipeline.forward's gate_dropout_p docstring and
+    # docs/investigations/regen_over_provisioning.md Finding 2.
+    gate_dropout_p: float = cfg.get("placement", {}).get("gate_dropout_p", 0.0)
+
     hard_eval_enabled = cfg.get("selection", {}).get("hard_eval", True)
 
     log_dir = Path(cfg.get("log_dir", "logs"))
@@ -291,7 +296,7 @@ def main() -> None:
             "lambda_max_observed", "num_at_cap",
             "tau", "vlastelica_lambda",
             "regen_logit_mean", "regen_logit_min", "regen_logit_max",
-            "regen_prob_max",
+            "regen_prob_max", "gate_dropout_p",
         ])
 
         for epoch in range(1, epochs + 1):
@@ -307,7 +312,8 @@ def main() -> None:
             opt_regen.zero_grad()
 
             path_noise_costs, gsnr_preds, _, regen_probs = pipeline(
-                demands, tau=tau, lambda_=vlastelica_lambda
+                demands, tau=tau, lambda_=vlastelica_lambda,
+                gate_dropout_p=gate_dropout_p,
             )
             loss, metrics = compute_loss(
                 gsnr_preds=gsnr_preds,
@@ -428,6 +434,7 @@ def main() -> None:
                 f"{logits.min().item():.6f}",
                 f"{logits.max().item():.6f}",
                 f"{regen_probs.max().item():.6f}",
+                f"{gate_dropout_p:.3f}",
             ])
             f.flush()
 
