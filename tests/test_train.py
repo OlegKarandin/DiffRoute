@@ -482,19 +482,29 @@ def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
     """Written every epoch, not only on checkpoint improvements — the whole
     point is to see the oscillation between the epochs that got saved.
 
-    Epoch 1 and 3 improve (lower loss), but epoch 2 is worse (same violations,
-    higher loss), proving a row is written every epoch regardless of whether
-    it improves. Monkeypatched masks ensure hard_placement_mask() returns
-    different placements per epoch to exercise the multi-node formatting.
+    Uses hard_eval=True to test under the lexicographic hard-placement key
+    (hard_num_violated, hard_num_placed, -hard_worst_margin_db). The mask
+    sequence is designed so epoch 2 improves over epoch 1 and gets checkpointed,
+    but epoch 3 regresses (more placed nodes when zero violations is tied) and
+    does NOT improve — yet must still produce a placement_trajectory.csv row,
+    proving rows are written unconditionally every epoch.
     """
     import csv as csv_mod
 
-    # Script masks independently: epoch 1 empty, epochs 2&3 have nodes placed.
-    # hard_placement_mask() is called once per epoch regardless of hard_eval.
+    # Script masks to drive hard-eval selection independently of soft loss.
+    # hard_placement_mask() is called once per epoch when hard_eval=True.
+    #
+    # Epoch 1: empty → gsnr_unplaced=5.0 < 7.6 threshold → hard_num_violated=1
+    #   hard_num_placed=0 → selection_key (1, 0, X1)
+    # Epoch 2: nodes [1,3] → non-empty → gsnr_placed=100.0 → hard_num_violated=0
+    #   hard_num_placed=2 → selection_key (0, 2, X2) — improves (0 < 1) — CHECKPOINTED
+    # Epoch 3: all 5 nodes → non-empty → gsnr_placed=100.0 → hard_num_violated=0
+    #   hard_num_placed=5 → selection_key (0, 5, X3) — regresses (5 > 2, fewer is better)
+    #   Does NOT improve → must still write a trajectory row (unconditional)
     masks = [
         torch.zeros(_DummyTopology.num_nodes, dtype=torch.bool),      # epoch 1: empty
-        torch.tensor([False, True, False, True, False]),              # epoch 2: nodes 1,3
-        torch.tensor([False, False, True, False, False]),             # epoch 3: node 2
+        torch.tensor([False, True, False, True, False]),              # epoch 2: nodes 1,3 (2 total)
+        torch.tensor([True, True, True, True, True]),                 # epoch 3: all 5 nodes
     ]
     call_count = {"n": 0}
 
@@ -505,13 +515,11 @@ def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
 
     monkeypatch.setattr(RegenPlacement, "hard_placement_mask", fake_hard_placement_mask)
 
-    # Epoch 1: loss=3.0, violations=1, regens=2 (best so far)
-    # Epoch 2: loss=5.0, violations=1, regens=2 (WORSE on loss, doesn't improve)
-    # Epoch 3: loss=1.0, violations=1, regens=2 (best overall)
-    # This proves rows are written EVERY epoch, not just on improvements.
+    # Soft loss values are inert (hard_eval=True uses hard metrics for selection).
+    # Scripted just to satisfy compute_loss call signature.
     _run_main(
         tmp_path, monkeypatch,
-        scripted=[(3.0, 1, 2), (5.0, 1, 2), (1.0, 1, 2)],
+        scripted=[(1.0, 1, 0), (1.0, 0, 0), (1.0, 0, 0)],
         hard_eval=True,
     )
 
@@ -519,16 +527,25 @@ def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
     with open(path, newline="") as f:
         rows = list(csv_mod.DictReader(f))
 
+    # All three epochs must produce rows in the trajectory log.
     assert [r["epoch"] for r in rows] == ["1", "2", "3"]
-    # num_placed is a string from CSV, count of spaces + 1 gives node count.
-    # Epoch 1: empty (0 nodes), epoch 2: 2 nodes (1 space), epoch 3: 1 node (0 spaces)
+
+    # Verify num_placed counts match actual node lists.
     assert int(rows[0]["num_placed"]) == 0  # epoch 1 empty
     assert int(rows[1]["num_placed"]) == 2  # epoch 2: nodes 1,3
-    assert int(rows[2]["num_placed"]) == 1  # epoch 3: node 2
-    # Verify num_placed matches actual node count for non-empty rows.
+    assert int(rows[2]["num_placed"]) == 5  # epoch 3: all 5 nodes (didn't improve, but still logged)
+
+    # Verify num_placed matches the count of space-separated node indices.
     for r in rows:
         if r["placed_nodes"]:
             assert int(r["num_placed"]) == r["placed_nodes"].count(" ") + 1
+        else:
+            assert int(r["num_placed"]) == 0
+
+    # Verify epoch 2 was selected (best hard-eval key), not epoch 3.
+    ckpt = torch.load(tmp_path / "checkpoints" / "best_e2e.pt", weights_only=False)
+    assert ckpt["epoch"] == 2
+    assert ckpt["hard_num_placed"] == 2  # epoch 2's deployment
 
 
 def test_placement_trajectory_records_an_empty_set_without_crashing(
