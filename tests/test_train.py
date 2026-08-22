@@ -19,6 +19,7 @@ import yaml
 
 import diffopt.train as train_mod
 from diffopt.demands import Demand
+from diffopt.placement.regenerator import RegenPlacement
 from diffopt.train import linear_anneal
 
 
@@ -101,17 +102,39 @@ class _DummyPipeline:
 
     regen_probs_value = torch.zeros(_DummyTopology.num_nodes)
 
+    # Per-demand GSNR the stub reports when NO regenerators are placed, and
+    # when at least one is. Lets a test script the hard-eval pass
+    # independently of the soft one, which is the whole point of the fix.
+    # gsnr_unplaced must clear below the 400G demand's real threshold
+    # (7.1 dB, from configs/modulation_formats.yaml) plus the 0.5 dB test
+    # margin, so the empty placement is genuinely infeasible -- matching
+    # what the real bug looks like (an unplaced route failing GSNR).
+    gsnr_unplaced = 5.0
+    gsnr_placed = 100.0
+
     def __init__(self, **kwargs) -> None:
         pass
 
     def to(self, device):
         return self
 
-    def __call__(self, demands, tau=None, lambda_=None):
-        return {}, {}, {}, _DummyPipeline.regen_probs_value
+    def __call__(self, demands, tau=None, lambda_=None, regen_probs_override=None):
+        probs = (_DummyPipeline.regen_probs_value
+                 if regen_probs_override is None else regen_probs_override)
+        if regen_probs_override is None:
+            return {}, {}, {}, probs
+        value = (_DummyPipeline.gsnr_placed if probs.sum() > 0
+                 else _DummyPipeline.gsnr_unplaced)
+        gsnr = {d.id: torch.tensor(value) for d in demands}
+        return {}, gsnr, {}, probs
 
 
-def _write_config(tmp_path, *, epochs: int) -> Path:
+def _mod_config():
+    from diffopt.modulation import ModulationConfig
+    return ModulationConfig.from_yaml(str(_MODULATION_FORMATS_PATH))
+
+
+def _write_config(tmp_path, *, epochs: int, hard_eval: bool = False) -> Path:
     config = {
         "topology": "unused",
         "modulation_formats": str(_MODULATION_FORMATS_PATH),
@@ -151,13 +174,14 @@ def _write_config(tmp_path, *, epochs: int) -> Path:
         },
         "log_dir": str(tmp_path / "logs"),
         "checkpoint_dir": str(tmp_path / "checkpoints"),
+        "selection": {"hard_eval": hard_eval},
     }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.dump(config))
     return config_path
 
 
-def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None):
+def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: bool = False):
     """Drive the real diffopt.train.main() epoch loop with a scripted
     per-epoch (total_loss, num_violated, num_regen_soft) sequence.
 
@@ -219,7 +243,7 @@ def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None):
     monkeypatch.setattr(train_mod, "DiffONetPipeline", _DummyPipeline)
     monkeypatch.setattr(train_mod, "compute_loss", fake_compute_loss)
 
-    config_path = _write_config(tmp_path, epochs=len(scripted))
+    config_path = _write_config(tmp_path, epochs=len(scripted), hard_eval=hard_eval)
     monkeypatch.setattr(sys, "argv", ["train.py", "--config", str(config_path)])
     train_mod.main()
     return torch.load(tmp_path / "checkpoints" / "best_e2e.pt", weights_only=False)
@@ -274,6 +298,94 @@ def test_duals_are_saved_with_the_checkpoint(tmp_path, monkeypatch):
     ckpt = _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 3)])
     assert "duals" in ckpt
     assert isinstance(ckpt["duals"], torch.Tensor)
+
+
+def test_selection_key_comes_from_the_hard_placement_not_the_relaxation(
+    tmp_path, monkeypatch
+):
+    """The bug this fixes: at epoch 1 every logit is 0, so the soft pass
+    reports (violated=0, regens=0) — an unbeatable key — while the actual
+    deployed placement is EMPTY and infeasible. Scripting epoch 1 as the
+    soft-optimal epoch and epoch 2 as genuinely better must select epoch 2.
+
+    The dummy pipeline's stubbed loss (see _run_main's fake_compute_loss) is
+    a disconnected leaf tensor, so regen_placement.regen_logits never
+    receives a real gradient and can't move on its own within this harness.
+    Script the DEPLOYED placement directly and independently of the soft
+    `scripted` values -- exactly the independence _DummyPipeline's
+    docstring calls "the whole point of the fix" -- by driving
+    RegenPlacement.hard_placement_mask() off a call counter: it is called
+    exactly once per epoch, from hard_placement_metrics's pre-step
+    snapshot. Epoch 1 gets the empty placement the real bug ships (matching
+    every candidate logit starting at 0); epoch 2 gets one candidate node
+    placed.
+    """
+    masks = [
+        torch.zeros(_DummyTopology.num_nodes, dtype=torch.bool),
+        torch.tensor([False, True, False, False, False]),
+    ]
+    call_count = {"n": 0}
+
+    def fake_hard_placement_mask(self):
+        idx = min(call_count["n"], len(masks) - 1)
+        call_count["n"] += 1
+        return masks[idx]
+
+    monkeypatch.setattr(
+        RegenPlacement, "hard_placement_mask", fake_hard_placement_mask
+    )
+
+    ckpt = _run_main(
+        tmp_path,
+        monkeypatch,
+        # (total_loss, num_violated, num_regen_soft) from the SOFT pass
+        scripted=[(1.0, 0, 0), (99.0, 5, 4)],
+        hard_eval=True,
+    )
+    assert ckpt["epoch"] == 2
+    assert ckpt["hard_num_violated"] == 0
+    assert ckpt["hard_num_placed"] > 0
+
+
+def test_hard_placement_metrics_counts_against_threshold_plus_margin():
+    """num_violated is the margin-inclusive count, matching compute_loss."""
+    import diffopt.train as train_mod
+
+    topology = _DummyTopology()
+    placement = RegenPlacement(topology.num_nodes)
+    with torch.no_grad():
+        placement.regen_logits.copy_(torch.tensor([-1.0, 2.0, -1.0, 3.0, -1.0]))
+    demands = [Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)]
+
+    metrics = train_mod.hard_placement_metrics(
+        _DummyPipeline(), placement, demands, _mod_config(),
+        lambda_=10.0, margin_db=0.5,
+    )
+
+    assert metrics["hard_num_placed"] == 2
+    assert metrics["placement_mask"].tolist() == [False, True, False, True, False]
+    # gsnr_placed = 100.0 is far above any threshold + 0.5
+    assert metrics["hard_num_violated"] == 0
+
+
+def test_checkpoint_records_the_placement_mask(tmp_path, monkeypatch):
+    """So no consumer has to re-derive the deployed set from raw parameters."""
+    ckpt = _run_main(
+        tmp_path, monkeypatch, scripted=[(1.0, 0, 0)], hard_eval=True
+    )
+    assert "placement_mask" in ckpt
+    assert ckpt["placement_mask"].dtype == torch.bool
+    assert ckpt["placement_mask"].numel() == _DummyTopology.num_nodes
+
+
+def test_hard_eval_disabled_falls_back_to_the_soft_key(tmp_path, monkeypatch):
+    """selection.hard_eval: false must reproduce the old behaviour exactly,
+    so the refactor can be proven a no-op before any arm is measured."""
+    ckpt = _run_main(
+        tmp_path, monkeypatch, scripted=[(1.0, 0, 0), (99.0, 5, 4)],
+        hard_eval=False,
+    )
+    assert ckpt["epoch"] == 1
 
 
 def _read_log(tmp_path) -> list[dict]:

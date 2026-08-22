@@ -15,7 +15,15 @@ modulation_formats: configs/modulation_formats.yaml
 num_train_samples: 500
 num_val_samples: 100
 num_demands: 100
-bitrate_options: [300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800]
+# Narrowed to the top tiers (open_followups.md item 5): with the full
+# 300-800 range and scale=1.3e6, the volume floor (min(bitrate_options)-25)
+# is low enough that num_violated=0 from epoch 1 — the constraint never
+# binds and the dual-ascent path is never exercised. Raising the floor to
+# 600 makes every surviving demand start near its own threshold instead of
+# comfortably below it. Also feeds build_traffic_matrix's bitrate_options
+# (diffopt/train.py); QoT training is skipped for this run so the dataset-
+# generation use of this key is inert.
+bitrate_options: [600, 650, 700, 750, 800]
 k_paths: 5
 seed: 42
 
@@ -58,7 +66,11 @@ pipeline:
 traffic:
   scenario: stress        # "stress" (alpha 0.0) | "realistic" (alpha 1.0)
   seed: 0                 # matrix identity
-  scale: 1300000.0        # total offered load in Gbps
+  # 2.5e6 at the 600-800 bitrate floor lands at 346 demands / 2.9% violated
+  # rate pre-training (open_followups.md item 5), close to the design
+  # spec's own ~2.3% reference point. 1.3e6 with the old full floor gave
+  # 516 demands / 0% violated — never binding.
+  scale: 2500000.0        # total offered load in Gbps
   holdout_seed: 1         # a different matrix, for the generalisation gap
 
 # Feasibility as a constraint, not a penalty. `lambda_regen` above stays
@@ -89,3 +101,10 @@ training:
   regen_tau_end: 0.1
   regen_tau_anneal_start_epoch: 10
   regen_tau_anneal_end_epoch: 40
+
+# Checkpoint selection reads the DEPLOYED placement (RegenPlacement's
+# hard_placement_mask), not the relaxation the gradient flows through.
+# Costs one extra no-grad forward per epoch (~1.9x epoch wall clock).
+# Set false only to reproduce pre-2026-08-21 selection behaviour.
+selection:
+  hard_eval: true

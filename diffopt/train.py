@@ -68,6 +68,60 @@ def linear_anneal(
     return start + frac * (end - start)
 
 
+def hard_placement_metrics(
+    pipeline,
+    regen_placement,
+    demands: List[Demand],
+    modulation_config: ModulationConfig,
+    *,
+    lambda_: float,
+    margin_db: float,
+) -> dict:
+    """Evaluate the DEPLOYED placement — the one that would actually ship.
+
+    The training forward pass evaluates a RELAXATION: fractional
+    probabilities, over which SegmentCombiner returns a partition-weighted
+    expectation. That expectation is systematically more optimistic than any
+    single placement early in training, when every candidate sits near
+    p = 0.5. Selecting a checkpoint on it picks epochs that look good only
+    because they are fractional — most starkly at epoch 1, where the soft
+    key is (violated=0, regens=0) while the real placement is empty and
+    46/346 demands fail.
+
+    Gate dropout (configs' `placement.gate_dropout_p`) makes the soft
+    metrics stochastic and deliberately pessimistic on top of that, so once
+    it is enabled the training pass cannot serve as a selection signal at
+    all. This function is the replacement.
+
+    Runs under no_grad on a hard 0/1 override, so it neither disturbs the
+    live autograd graph nor mutates any parameter. `tau` is irrelevant to an
+    override and is passed as 1.0 for definiteness.
+    """
+    mask = regen_placement.hard_placement_mask()
+    hard_probs = mask.to(dtype=torch.float32)
+
+    with torch.no_grad():
+        _, gsnr_preds, _, _ = pipeline(
+            demands, tau=1.0, lambda_=lambda_, regen_probs_override=hard_probs
+        )
+
+    num_violated = 0
+    worst_margin_db = math.inf
+    for demand in demands:
+        threshold = modulation_config.required_snr_threshold(demand.bitrate_gbps)
+        gsnr = gsnr_preds[demand.id].item()
+        if gsnr < threshold + margin_db:
+            num_violated += 1
+        worst_margin_db = min(worst_margin_db, gsnr - threshold)
+
+    return {
+        "hard_num_violated": num_violated,
+        "hard_num_placed": int(mask.sum().item()),
+        "hard_worst_margin_db": worst_margin_db if demands else math.nan,
+        "placement_mask": mask.cpu(),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to experiment YAML config")
@@ -184,6 +238,8 @@ def main() -> None:
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
     epochs: int = t_cfg["epochs_e2e"]
 
+    hard_eval_enabled = cfg.get("selection", {}).get("hard_eval", True)
+
     log_dir = Path(cfg.get("log_dir", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = Path(cfg.get("checkpoint_dir", "checkpoints"))
@@ -217,7 +273,9 @@ def main() -> None:
         writer.writerow([
             "epoch", "total_loss", "feasibility_loss", "weighted_feasibility_loss",
             "regen_loss", "path_noise_loss", "num_regen_soft", "num_regen_noncand",
-            "num_infeasible", "num_violated", "worst_margin_db",
+            "num_infeasible", "num_violated",
+            "hard_num_violated", "hard_num_placed", "hard_worst_margin_db",
+            "worst_margin_db",
             "lambda_max_observed", "num_at_cap",
             "tau", "vlastelica_lambda",
             "regen_logit_mean", "regen_logit_min", "regen_logit_max",
@@ -251,6 +309,40 @@ def main() -> None:
                 lambda_cost=p_cfg["lambda_cost"],
             )
 
+            # Snapshot the state the forward pass above (and therefore
+            # `metrics` -- num_violated, num_regen_soft, worst_margin_db,
+            # loss.item()) actually describes, BEFORE the optimizer step
+            # mutates it. Checkpoint selection compares `metrics` across
+            # epochs, so the checkpoint must save the parameters those
+            # metrics were measured on, not next epoch's already-updated
+            # ones. Confirmed as a real (if usually small) discrepancy on
+            # the dual_decay hypothesis-test run in open_followups.md item
+            # #3: the log recorded 9 regens for the saved epoch, but the
+            # previously-saved (post-step) regen_logits had 10 nodes above
+            # threshold once reloaded.
+            edge_weight_net_state_pre_step = {
+                k: v.clone() for k, v in edge_weight_net.state_dict().items()
+            }
+            regen_logits_pre_step = regen_placement.regen_logits.detach().clone()
+
+            # Selection metrics, measured on the deployed placement rather
+            # than on the relaxation the gradient step is taken through.
+            # Pre-step, like edge_weight_net_state_pre_step above: the
+            # checkpoint must save the parameters its own key describes.
+            if hard_eval_enabled:
+                hard = hard_placement_metrics(
+                    pipeline, regen_placement, demands, mod_cfg,
+                    lambda_=vlastelica_lambda,
+                    margin_db=c_cfg["margin_db"],
+                )
+            else:
+                hard = {
+                    "hard_num_violated": metrics["num_violated"],
+                    "hard_num_placed": metrics["num_regen_soft"],
+                    "hard_worst_margin_db": metrics["worst_margin_db"],
+                    "placement_mask": regen_placement.hard_placement_mask().cpu(),
+                }
+
             loss.backward()
             opt_edge.step()
             opt_regen.step()
@@ -263,6 +355,7 @@ def main() -> None:
                 metrics["shortfalls"],
                 eta=c_cfg["dual_lr"],
                 dual_max=c_cfg["dual_max"],
+                decay=c_cfg.get("dual_decay", 0.0),
             )
             lambda_max_observed = duals.max().item()
             num_at_cap = int((duals >= c_cfg["dual_max"]).sum().item())
@@ -297,7 +390,9 @@ def main() -> None:
 
             vlastelica_lambda = max(lambda_min, vlastelica_lambda * lambda_decay)
 
-            logits = regen_placement.regen_logits.detach()
+            # Pre-step, like num_regen_soft/num_regen_noncand above -- same
+            # row, same state, not next epoch's already-updated logits.
+            logits = regen_logits_pre_step
             writer.writerow([
                 epoch,
                 f"{loss.item():.6f}",
@@ -309,6 +404,9 @@ def main() -> None:
                 num_regen_noncand,
                 metrics["num_infeasible"],
                 metrics["num_violated"],
+                hard["hard_num_violated"],
+                hard["hard_num_placed"],
+                f"{hard['hard_worst_margin_db']:.4f}",
                 f"{metrics['worst_margin_db']:.4f}",
                 f"{lambda_max_observed:.4f}",
                 num_at_cap,
@@ -334,25 +432,44 @@ def main() -> None:
                     f"| tau={tau:.3f} | λ={vlastelica_lambda:.3f}"
                 )
 
-            selection_key = (
-                metrics["num_violated"],
-                metrics["num_regen_soft"],
-                loss.item(),
-            )
+            # Lexicographic on the DEPLOYED placement: fewest violated, then
+            # fewest regenerators, then the most headroom. The third slot
+            # used to be loss.item(), which invariants.md itself calls
+            # non-comparable across epochs — the tau anneal dominates it and
+            # the duals are deliberately non-stationary. worst_margin_db is
+            # physical, tau-invariant, gate-independent, and already
+            # computed. Negated because the key is minimised and MORE
+            # headroom is better.
+            if hard_eval_enabled:
+                selection_key = (
+                    hard["hard_num_violated"],
+                    hard["hard_num_placed"],
+                    -hard["hard_worst_margin_db"],
+                )
+            else:
+                selection_key = (
+                    metrics["num_violated"],
+                    metrics["num_regen_soft"],
+                    loss.item(),
+                )
             if selection_key < best_key:
                 best_key = selection_key
                 ckpt_path = checkpoint_dir / "best_e2e.pt"
                 torch.save(
                     {
                         "epoch": epoch,
-                        "edge_weight_net_state": edge_weight_net.state_dict(),
-                        "regen_logits": regen_placement.regen_logits.detach().cpu(),
+                        "edge_weight_net_state": edge_weight_net_state_pre_step,
+                        "regen_logits": regen_logits_pre_step.cpu(),
                         "opt_edge_state": opt_edge.state_dict(),
                         "opt_regen_state": opt_regen.state_dict(),
                         "vlastelica_lambda": vlastelica_lambda,
                         "total_loss": loss.item(),
                         "num_violated": metrics["num_violated"],
                         "num_regen_soft": metrics["num_regen_soft"],
+                        "hard_num_violated": hard["hard_num_violated"],
+                        "hard_num_placed": hard["hard_num_placed"],
+                        "hard_worst_margin_db": hard["hard_worst_margin_db"],
+                        "placement_mask": hard["placement_mask"],
                         "duals": duals.detach().cpu(),
                     },
                     ckpt_path,
