@@ -317,6 +317,47 @@ def test_build_context_raises_on_gate_mismatch(monkeypatch, tmp_path):
     assert "sigmoid" in message
 
 
+def _D(i):
+    return Demand(id=i, src=0, dst=1, bitrate_gbps=400.0)
+
+
+def test_ablate_finds_the_redundant_node():
+    """A three-node placement where node 2 is a duplicate of node 1's
+    coverage must report node 2 redundant and a minimal set of two."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from diagnose_regen_ablation import ablate
+
+    # Demand 0 needs any of {1, 2}; demand 1 needs {3}.
+    covers = {0: {1, 2}, 1: {3}}
+
+    class FakePipeline:
+        def __call__(self, demands, tau=None, lambda_=None, regen_probs_override=None):
+            active = set(regen_probs_override.nonzero(as_tuple=True)[0].tolist())
+            gsnr = {
+                d: torch.tensor(20.0 if covers[d] & active else 0.0)
+                for d in covers
+            }
+            return {}, gsnr, {}, regen_probs_override
+
+    result = ablate(
+        FakePipeline(),
+        demands=[_D(0), _D(1)],
+        thresholds={0: 10.0, 1: 10.0},
+        placed={1, 2, 3},
+        candidates={1, 2, 3, 4},
+        tau=0.1, lambda_=10.0,
+        num_nodes=5,
+        order_key=lambda n: float(n),
+    )
+
+    assert result["baseline_infeasible"] == set()
+    assert 2 in result["redundant"] or 1 in result["redundant"]
+    assert len(result["minimal_set"]) == 2
+    assert 3 in result["minimal_set"]
+
+
 def test_build_context_max_spans_from_config_not_hardcoded(monkeypatch):
     """pipeline.max_spans must come from cfg, never a bare literal — several
     scripts hardcoded 60 (docs/architecture/invariants.md's own max_spans_per_segment default)
