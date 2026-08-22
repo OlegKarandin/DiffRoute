@@ -247,6 +247,7 @@ class DiffONetPipeline(nn.Module):
         demands: List[Demand],
         tau: float = 1.0,
         lambda_: float = 10.0,
+        regen_probs_override: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Dict[int, torch.Tensor],   # path_noise_costs
         Dict[int, torch.Tensor],   # gsnr_preds
@@ -259,6 +260,15 @@ class DiffONetPipeline(nn.Module):
             demands:  List of Demand namedtuples (id, src, dst, bitrate_gbps).
             tau:      Regen placement temperature. Passed per-call, never stored.
             lambda_:  Vlastelica perturbation strength. Passed per-call.
+            regen_probs_override: (num_nodes,) probabilities to use INSTEAD of
+                      RegenPlacement's. Lets a caller evaluate a specific
+                      placement — e.g. train.py's hard-placement selection
+                      pass, or diagnose_regen_ablation.py's leave-one-out
+                      sweep — without mutating regen_logits and restoring
+                      them afterwards. Flows to both consumers (edge features
+                      and boundary probabilities) and is echoed back as the
+                      fourth return value, so `regen_probs` always describes
+                      what the forward pass actually used.
 
         Returns:
             path_noise_costs: demand_id → scalar accumulated-ASE-noise tensor, live in autograd graph.
@@ -269,7 +279,12 @@ class DiffONetPipeline(nn.Module):
         device = self._topo_edge_features.device
 
         # 1. Regen probabilities — shape (num_nodes,), requires_grad=True
-        regen_probs = self.regen_placement.get_regen_probs(tau)
+        # unless overridden (an override is normally a detached hard mask).
+        regen_probs = (
+            self.regen_placement.get_regen_probs(tau)
+            if regen_probs_override is None
+            else regen_probs_override
+        )
 
         # 2. Build (E, 7) edge features: topology cols + regen probs at endpoints
         edge_feats = torch.cat([

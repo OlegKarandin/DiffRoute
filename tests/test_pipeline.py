@@ -889,3 +889,40 @@ def test_edge_weights_do_not_collapse_over_training():
     assert after < before * 2.0, (
         f"median raw edge weight exploded {before:.6e} -> {after:.6e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test: regen_probs_override parameter
+# ---------------------------------------------------------------------------
+
+def test_regen_probs_override_replaces_the_placement_module():
+    """An override must reach BOTH consumers of regen_probs: EdgeWeightNet's
+    edge features and SegmentCombiner's boundary probabilities. Comparing
+    all-zeros against all-ones is the cheapest way to prove it reaches the
+    second one — a path with a regenerator at every candidate has a strictly
+    better GSNR than the same path with none."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    zeros = torch.zeros(topology.num_nodes)
+    ones = torch.ones(topology.num_nodes)
+
+    _, gsnr_none, _, probs_none = pipeline(demands, tau=1.0, regen_probs_override=zeros)
+    _, gsnr_all, _, probs_all = pipeline(demands, tau=1.0, regen_probs_override=ones)
+
+    assert torch.equal(probs_none, zeros)
+    assert torch.equal(probs_all, ones)
+    assert gsnr_all[0].item() > gsnr_none[0].item()
+
+
+def test_regen_probs_override_none_is_a_no_op():
+    """The default path must be unchanged: same probs as get_regen_probs(tau)."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    _, _, _, probs = pipeline(demands, tau=0.7)
+    expected = pipeline.regen_placement.get_regen_probs(0.7)
+
+    assert torch.equal(probs, expected)
