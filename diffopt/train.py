@@ -246,6 +246,15 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = log_dir / "e2e_train_log.csv"
+    # One row per epoch of the DEPLOYED placement set. A checkpoint is one
+    # sample of a process that may not be converging at all; this is the
+    # process. Two things it makes measurable that no snapshot can:
+    # churn (mean Hamming distance between consecutive epochs' sets over the
+    # last N epochs — a direct read on the limit cycle described in
+    # open_followups.md item #6) and whether the final epoch agrees with the
+    # selected one. It also allows re-running selection under a different
+    # key without retraining.
+    trajectory_path = log_dir / "placement_trajectory.csv"
     # Lexicographic selection: fewest violated demands, then fewest
     # regenerators, then lowest total loss.
     #
@@ -263,8 +272,11 @@ def main() -> None:
     # legitimate cross-epoch comparison during annealing.
     best_key = (math.inf, math.inf, math.inf)
 
-    with open(log_path, "w", newline="") as f:
+    with open(log_path, "w", newline="") as f, \
+         open(trajectory_path, "w", newline="") as tf:
         writer = csv.writer(f)
+        traj_writer = csv.writer(tf)
+        traj_writer.writerow(["epoch", "num_placed", "placed_nodes"])
         # regen_logit_* are the RAW learned parameters. regen_loss alone is
         # misleading: it reports sum(sigmoid(logit/tau)) while tau is being
         # annealed, so it moves dramatically even when the logits are static
@@ -418,6 +430,12 @@ def main() -> None:
                 f"{regen_probs.max().item():.6f}",
             ])
             f.flush()
+
+            placed_ids = hard["placement_mask"].nonzero(as_tuple=True)[0].tolist()
+            traj_writer.writerow([
+                epoch, len(placed_ids), " ".join(str(n) for n in placed_ids)
+            ])
+            tf.flush()
 
             if epoch % 10 == 0 or epoch == 1:
                 print(

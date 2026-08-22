@@ -476,3 +476,39 @@ def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch)
 
     with pytest.raises(ValueError, match="Preflight excluded every demand"):
         train_mod.main()
+
+
+def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
+    """Written every epoch, not only on checkpoint improvements — the whole
+    point is to see the oscillation between the epochs that got saved."""
+    import csv as csv_mod
+
+    probs = torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0])
+    _run_main(
+        tmp_path, monkeypatch,
+        scripted=[(3.0, 1, 2), (2.0, 1, 2), (1.0, 1, 2)],
+        regen_probs=probs,
+    )
+
+    path = tmp_path / "logs" / "placement_trajectory.csv"
+    with open(path, newline="") as f:
+        rows = list(csv_mod.DictReader(f))
+
+    assert [r["epoch"] for r in rows] == ["1", "2", "3"]
+    assert all(r["num_placed"] == r["placed_nodes"].count(" ") + 1
+               for r in rows if r["placed_nodes"])
+
+
+def test_placement_trajectory_records_an_empty_set_without_crashing(
+    tmp_path, monkeypatch
+):
+    """Epoch 1 of a real run has zero placed nodes (all logits at 0)."""
+    import csv as csv_mod
+
+    _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 0)])
+
+    with open(tmp_path / "logs" / "placement_trajectory.csv", newline="") as f:
+        rows = list(csv_mod.DictReader(f))
+
+    assert rows[0]["num_placed"] == "0"
+    assert rows[0]["placed_nodes"] == ""
