@@ -562,3 +562,9 @@ def test_placement_trajectory_records_an_empty_set_without_crashing(
 
     assert rows[0]["num_placed"] == "0"
     assert rows[0]["placed_nodes"] == ""
+
+
+def test_checkpoint_records_the_active_gate(tmp_path, monkeypatch):
+    ckpt = _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 0)])
+    assert ckpt["gate"] == "sigmoid"
+    assert "regen_logits" in ckpt

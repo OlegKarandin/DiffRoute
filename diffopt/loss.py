@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ def compute_loss(
     margin_db: float = 0.5,
     lambda_regen: float = 1.0,
     lambda_cost: float = 0.01,
+    regen_count_penalty: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the constrained training loss.
 
@@ -69,6 +70,17 @@ def compute_loss(
         lambda_regen: Weight on regenerator count penalty. Fixed, not tuned.
         lambda_cost:  Weight on the ASE-denominated path-noise regulariser. Not the
                       primary routing signal -- the STE in pipeline.forward supplies that.
+        regen_count_penalty: The scalar `lambda_regen` multiplies. `None`
+                      (default) means `regen_probs.sum()` — the probability
+                      MASS, this function's original and unchanged
+                      behaviour. A hard-concrete L0 gate passes its expected
+                      COUNT instead, which is a different function of the
+                      parameters: pricing the count rather than the mass is
+                      the entire reason that gate can express "exactly three
+                      regenerators" when no value of `lambda_regen` under an
+                      L1-on-mass penalty ever could. Supplied by
+                      `RegenPlacement.count_penalty()`; compute_loss does not
+                      branch on the gate itself.
 
     Returns:
         (total_loss, metrics_dict). `metrics["shortfalls"]` is a detached
@@ -114,7 +126,9 @@ def compute_loss(
             num_infeasible += 1
         worst_margin_db = min(worst_margin_db, margin)
 
-    regen_loss = regen_probs.sum()
+    regen_loss = (
+        regen_probs.sum() if regen_count_penalty is None else regen_count_penalty
+    )
 
     # sum() over dict values — each is a scalar tensor live in the autograd graph.
     # Seed with a zero tensor so an empty demand list still yields a tensor
@@ -151,6 +165,7 @@ def update_duals(
     *,
     eta: float,
     dual_max: float,
+    decay: float = 0.0,
 ) -> torch.Tensor:
     """Dual ascent step: `lambda_d <- clamp(lambda_d + eta * shortfall_d, 0, lambda_max)`.
 
@@ -163,7 +178,19 @@ def update_duals(
     at the end of the run by `diffopt/train.py`, so a non-converging constraint
     surfaces as a named list rather than as silent oscillation.
 
+    `decay` (default 0.0, i.e. no decay — pure ratchet, the original
+    behaviour) multiplicatively relaxes a dual by `(1 - decay)` on any epoch
+    where its shortfall is exactly 0. Without this, a dual that was bid up to
+    buy feasibility during an early crisis never comes back down even once
+    its demand is comfortably feasible, which pins `lambda_regen`'s (fixed,
+    weak) downward pressure out of contention indefinitely — see
+    open_followups.md item #3's over-provisioning investigation. Only
+    satisfied demands decay; a demand still in shortfall keeps ascending,
+    undamped, same as before.
+
     No autograd here by design: duals are Lagrange multipliers updated by an
     explicit ascent rule, not parameters optimised by Adam.
     """
-    return torch.clamp(duals + eta * shortfalls, min=0.0, max=dual_max)
+    ascended = duals + eta * shortfalls
+    relaxed = torch.where(shortfalls > 0, ascended, ascended * (1.0 - decay))
+    return torch.clamp(relaxed, min=0.0, max=dual_max)

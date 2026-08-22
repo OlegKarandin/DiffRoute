@@ -145,15 +145,34 @@ def build_context(
     qot_model = load_qot_model(cfg["qot_checkpoint"], cfg, device)
 
     edge_weight_net = EdgeWeightNet().to(device)
-    regen_placement = RegenPlacement(topology.num_nodes).to(device)
+    pl_cfg = cfg.get("placement", {})
+    hc_cfg = pl_cfg.get("hard_concrete", {})
+    regen_placement = RegenPlacement(
+        topology.num_nodes,
+        gate=pl_cfg.get("gate", "sigmoid"),
+        beta=hc_cfg.get("beta", 0.5),
+        gamma=hc_cfg.get("gamma", -0.1),
+        zeta=hc_cfg.get("zeta", 1.1),
+    ).to(device)
 
     ckpt = None
     if load_e2e_checkpoint:
         ckpt_path = Path(checkpoint_path or f"{cfg.get('checkpoint_dir', 'checkpoints')}/best_e2e.pt")
         ckpt = torch.load(ckpt_path, map_location=device)
         edge_weight_net.load_state_dict(ckpt["edge_weight_net_state"])
+        # Checkpoints written before 2026-08-21 have no "gate" key and are
+        # always sigmoid. Reading the checkpoint's own gate rather than the
+        # config's guards against pointing a hard_concrete config at a
+        # sigmoid checkpoint and silently reinterpreting its parameters.
+        ckpt_gate = ckpt.get("gate", "sigmoid")
+        if ckpt_gate != regen_placement.gate:
+            raise ValueError(
+                f"Checkpoint {ckpt_path} was trained with gate {ckpt_gate!r} but "
+                f"the config asks for {regen_placement.gate!r}"
+            )
+        param_key = "regen_logits" if ckpt_gate == "sigmoid" else "regen_log_alpha"
         with torch.no_grad():
-            regen_placement.regen_logits.copy_(ckpt["regen_logits"].to(device))
+            regen_placement._parameter.copy_(ckpt[param_key].to(device))
 
     if eval_mode:
         edge_weight_net.eval()
@@ -233,7 +252,14 @@ def schedule_at(cfg: dict, epoch: Optional[int] = None) -> Tuple[float, float]:
 def demands_for(ctx: DiagContext, *, seed: int, num_demands: Optional[int] = None) -> List[Demand]:
     """Generate demands the canonical way: `generate_demands` over `ctx.topology`
     using `ctx.cfg["bitrate_options"]`, defaulting `num_demands` to
-    `ctx.cfg["num_demands"]`."""
+    `ctx.cfg["num_demands"]`.
+
+    Predates `train.py`'s fixed-traffic-matrix refactor (commit 849a339) and
+    was never updated to match it: this draws an ad hoc random demand set
+    unrelated to what any checkpoint trained under `cfg["traffic"]` was
+    actually trained or constrained against. Use `fixed_traffic_demands`
+    for anything that needs to match a real checkpoint's training set.
+    """
     n = ctx.cfg["num_demands"] if num_demands is None else num_demands
     return generate_demands(ctx.topology, n, ctx.cfg["bitrate_options"], seed=seed)
 

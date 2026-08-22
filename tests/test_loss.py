@@ -240,3 +240,49 @@ def test_update_duals_does_not_mutate_its_input():
     duals = torch.tensor([10.0])
     update_duals(duals, torch.tensor([1.0]), eta=1.0, dual_max=1000.0)
     assert duals[0].item() == pytest.approx(10.0)
+
+
+def test_dual_stationary_when_satisfied_and_decay_zero():
+    """decay defaults to 0.0 -- must reproduce the pre-decay ratchet exactly."""
+    duals = torch.tensor([10.0, 42.0])
+    updated = update_duals(duals, torch.zeros(2), eta=1.0, dual_max=1000.0, decay=0.0)
+    assert updated.tolist() == pytest.approx([10.0, 42.0])
+
+
+def test_dual_decays_only_when_satisfied():
+    duals = torch.tensor([10.0, 10.0])
+    shortfalls = torch.tensor([1.0, 0.0])
+    updated = update_duals(duals, shortfalls, eta=1.0, dual_max=1000.0, decay=0.1)
+    # index 0 still violated: ascends undamped, decay does not apply.
+    assert updated[0].item() == pytest.approx(11.0)
+    # index 1 satisfied: decays by (1 - decay).
+    assert updated[1].item() == pytest.approx(9.0)
+
+
+def test_regen_count_penalty_defaults_to_the_probability_mass(simple_loss_inputs):
+    """Regression guard: omitting the argument must reproduce the pre-2026-08-21
+    objective exactly, so every previously-measured number stays comparable."""
+    explicit = dict(simple_loss_inputs)
+    explicit["regen_count_penalty"] = simple_loss_inputs["regen_probs"].sum()
+
+    default_total, default_metrics = compute_loss(**simple_loss_inputs)
+    explicit_total, explicit_metrics = compute_loss(**explicit)
+
+    assert torch.allclose(default_total, explicit_total)
+    assert default_metrics["regen_loss"] == explicit_metrics["regen_loss"]
+
+
+def test_regen_count_penalty_overrides_the_mass(simple_loss_inputs):
+    """A hard-concrete gate prices the expected COUNT, which is a different
+    number from sum(p) — compute_loss must use what it is handed."""
+    inputs = dict(simple_loss_inputs)
+    inputs["lambda_regen"] = 1.0
+    baseline, _ = compute_loss(**inputs)
+
+    inputs["regen_count_penalty"] = simple_loss_inputs["regen_probs"].sum() + 3.0
+    bumped, metrics = compute_loss(**inputs)
+
+    assert torch.allclose(bumped - baseline, torch.tensor(3.0))
+    assert metrics["regen_loss"] == pytest.approx(
+        simple_loss_inputs["regen_probs"].sum().item() + 3.0
+    )

@@ -210,7 +210,15 @@ def main() -> None:
     warned_inert = False
 
     edge_weight_net = EdgeWeightNet().to(device)
-    regen_placement = RegenPlacement(topology.num_nodes).to(device)
+    pl_cfg = cfg.get("placement", {})
+    hc_cfg = pl_cfg.get("hard_concrete", {})
+    regen_placement = RegenPlacement(
+        topology.num_nodes,
+        gate=pl_cfg.get("gate", "sigmoid"),
+        beta=hc_cfg.get("beta", 0.5),
+        gamma=hc_cfg.get("gamma", -0.1),
+        zeta=hc_cfg.get("zeta", 1.1),
+    ).to(device)
 
     pipeline = DiffONetPipeline(
         topology=topology,
@@ -227,7 +235,7 @@ def main() -> None:
         lr=cfg["training"]["lr_edge_net"],
     )
     opt_regen = optim.Adam(
-        [regen_placement.regen_logits],
+        [regen_placement._parameter],
         lr=cfg["training"]["lr_regen"],
     )
 
@@ -241,7 +249,7 @@ def main() -> None:
     # Training-only masking of the physics-path regen probabilities. See
     # DiffONetPipeline.forward's gate_dropout_p docstring and
     # docs/investigations/regen_over_provisioning.md Finding 2.
-    gate_dropout_p: float = cfg.get("placement", {}).get("gate_dropout_p", 0.0)
+    gate_dropout_p: float = pl_cfg.get("gate_dropout_p", 0.0)
 
     hard_eval_enabled = cfg.get("selection", {}).get("hard_eval", True)
 
@@ -296,7 +304,7 @@ def main() -> None:
             "lambda_max_observed", "num_at_cap",
             "tau", "vlastelica_lambda",
             "regen_logit_mean", "regen_logit_min", "regen_logit_max",
-            "regen_prob_max", "gate_dropout_p",
+            "regen_prob_max", "gate_dropout_p", "gate",
         ])
 
         for epoch in range(1, epochs + 1):
@@ -325,6 +333,7 @@ def main() -> None:
                 margin_db=c_cfg["margin_db"],
                 lambda_regen=p_cfg["lambda_regen"],
                 lambda_cost=p_cfg["lambda_cost"],
+                regen_count_penalty=regen_placement.count_penalty(tau),
             )
 
             # Snapshot the state the forward pass above (and therefore
@@ -341,7 +350,7 @@ def main() -> None:
             edge_weight_net_state_pre_step = {
                 k: v.clone() for k, v in edge_weight_net.state_dict().items()
             }
-            regen_logits_pre_step = regen_placement.regen_logits.detach().clone()
+            regen_param_pre_step = regen_placement._parameter.detach().clone()
 
             # Selection metrics, measured on the deployed placement rather
             # than on the relaxation the gradient step is taken through.
@@ -410,7 +419,7 @@ def main() -> None:
 
             # Pre-step, like num_regen_soft/num_regen_noncand above -- same
             # row, same state, not next epoch's already-updated logits.
-            logits = regen_logits_pre_step
+            logits = regen_param_pre_step
             writer.writerow([
                 epoch,
                 f"{loss.item():.6f}",
@@ -435,6 +444,7 @@ def main() -> None:
                 f"{logits.max().item():.6f}",
                 f"{regen_probs.max().item():.6f}",
                 f"{gate_dropout_p:.3f}",
+                regen_placement.gate,
             ])
             f.flush()
 
@@ -484,7 +494,12 @@ def main() -> None:
                     {
                         "epoch": epoch,
                         "edge_weight_net_state": edge_weight_net_state_pre_step,
-                        "regen_logits": regen_logits_pre_step.cpu(),
+                        "gate": regen_placement.gate,
+                        **(
+                            {"regen_logits": regen_param_pre_step.cpu()}
+                            if regen_placement.gate == "sigmoid"
+                            else {"regen_log_alpha": regen_param_pre_step.cpu()}
+                        ),
                         "opt_edge_state": opt_edge.state_dict(),
                         "opt_regen_state": opt_regen.state_dict(),
                         "vlastelica_lambda": vlastelica_lambda,
