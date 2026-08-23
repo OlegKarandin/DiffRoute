@@ -24,6 +24,62 @@ sections; nothing below has been reworded in the move.
 - Valid bitrates: 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800 Gbps (11 values).
 - WDM grid: 48 channels at 100 GHz spacing, C-band centered at 193.5 THz.
 
+## Traffic matrix / constraint
+
+- The traffic matrix is **fixed for a whole run**, built once before the epoch
+  loop from `(topology, traffic.seed, traffic.scale, alpha)`. `train.py`
+  previously called `generate_demands(..., seed=epoch)` and redrew 100 demands
+  every epoch — "all demands feasible" cannot be stated against a set replaced
+  each epoch, and a per-demand dual is meaningless without demand identity
+  persisting across epochs.
+- **`Demand.id` indexes the dual vector.** `build_traffic_matrix` emits
+  contiguous ids `0..N-1` and `preflight_filter` **renumbers** what it keeps. A
+  gap left by an exclusion would attach every later dual to the wrong demand.
+- **No committed matrix file.** The matrix regenerates deterministically and
+  `tests/test_traffic.py` pins a checksum of it. The checksum is pinned on the
+  *pre-preflight* matrix, because the preflight needs a QoT model and pinning
+  its output would pin a checkpoint.
+- `alpha` is derived from a named `traffic.scenario` (`stress` → 0.0,
+  `realistic` → 1.0), never set directly, so the two settings stay reportable
+  named things rather than free-floating numbers.
+- The preflight routes **shortest-by-km**, not by `EdgeWeightNet` — the
+  learned router changes during training, which would make the matrix depend on
+  whichever checkpoint happened to build it.
+- The preflight is a **necessary, not sufficient** screen. A surviving demand
+  may still be unreachable under learned routing; those surface as duals pinned
+  at `dual_max` in the end-of-run report, and that report is the intended
+  diagnostic — not a silent oscillation.
+- **The hinge carries a margin**: `relu(thr + delta - gsnr)`, not
+  `relu(thr - gsnr)`. Without it the term is exactly zero the moment a demand
+  clears, `|g_feas|_1` measures 0.000 on fully-feasible epochs, and the system
+  sits on the feasibility boundary by construction. Do not "simplify" the
+  margin away.
+- **Duals are not autograd parameters.** They are Lagrange multipliers updated
+  by an explicit clamped ascent rule after the primal step, and they are on no
+  optimizer.
+- **The deployed placement is `RegenPlacement.hard_placement_mask()`**, and
+  every cross-epoch or cross-arm comparison reads it. For the `sigmoid` gate
+  that is exactly `regen_logits > 0`, hence tau-invariant. For the
+  `hard_concrete` gate it is `sigmoid(log_alpha/beta) > -gamma/(zeta-gamma)`,
+  evaluated deterministically — `get_regen_probs` is *stochastic* under that
+  gate during training, so `(regen_probs > 0.5).sum()` is a random variable
+  there and is not comparable across epochs. `regen_loss` is not comparable
+  under either gate (87% of its observed 66 → 18 fall came from `tau`).
+- **Checkpoint selection is lexicographic on the DEPLOYED placement**:
+  fewest `hard_num_violated`, then fewest `hard_num_placed`, then the
+  greatest `hard_worst_margin_db`. Selecting on metrics from the training
+  forward pass is wrong: at epoch 1 every logit is 0, so every candidate sits
+  at `p = 0.5`, the fold returns a partition-weighted expectation more
+  optimistic than any deployable placement, and the key is `(0, 0, loss)` —
+  lexicographically unbeatable, freezing the checkpoint on an epoch whose
+  real placement is empty. Gate dropout makes those metrics stochastic and
+  deliberately pessimistic on top of that. The third slot is
+  `worst_margin_db` rather than total loss because total loss is dominated by
+  the `tau` anneal and the duals are deliberately non-stationary.
+- `num_violated` counts against `thr + delta`; `num_infeasible` counts against
+  the bare `thr`. Both are logged: the second is what keeps new runs comparable
+  to every pre-change number in the investigation record.
+
 ## QoT model
 
 - Input is per-span features for a single **transparent segment** only. No cross-segment state.
@@ -42,7 +98,15 @@ sections; nothing below has been reworded in the move.
 
 ## Upstream dependency (`multilayer-optical-network`)
 
-- Pinned via git dependency in `pyproject.toml` at tag `v0.1.1` (`https://github.com/OlegKarandin/multilayer-optical-network.git`). `diffopt.topology.Topology` subclasses its `OpticalNetworkModel` directly, the same extension pattern the MCP server uses for its own `NetworkModel(OpticalNetworkModel)` IP-layer subclass.
+- Pinned via git dependency in `pyproject.toml` at tag `v0.1.2`
+  (`https://github.com/OlegKarandin/multilayer-optical-network.git`). The
+  bump from `v0.1.1` was required by `diffopt/traffic.py`: `v0.1.2` added
+  `generate_demands`' `aggregate` and `undirected` parameters and made node
+  derivation IP-layer-optional (falling back to OMS endpoints), without
+  which a bare `OpticalNetworkModel` subclass like `Topology` cannot be used
+  as a traffic source. `diffopt.topology.Topology` subclasses its
+  `OpticalNetworkModel` directly, the same extension pattern the MCP server
+  uses for its own `NetworkModel(OpticalNetworkModel)` IP-layer subclass.
 - This project depends on specific upstream behavior: the ground-truth 18.85 dB GSNR test in `tests/test_optical_bridge.py`, and the exact `populate_optical`/`split_link_into_spans` algorithms that `diffopt/topology.py` and `diffopt/topology_builder.py` re-export. Bumping the pin requires re-verifying the ground-truth test and the traps above still hold, not just updating a version number.
 - **Pin a tag, never a branch commit.** This dependency was previously `multilayer-optical-mcp @ 2b64361`, an exact commit on `master`. Upstream later split the simulator out into this package and rebased `master`, orphaning `2b64361` — `git fetch` of that SHA now returns `upload-pack: not our ref`, so the old pin could not be installed by anyone. Tags survive a rebase; branch commits do not.
 - Migrated from `multilayer-optical-mcp` after that split (imports renamed `multilayer_optical_mcp` → `multilayer_optical_network` across 7 files). Verified as a no-op: relative to the orphaned `2b64361`, `optical_topology_import.py` differs only by a path comment and import ordering (algorithms byte-identical), `modes.py` only adds a `default_modes()` helper, and `gnpy_adapter/adapter.py` only drops a dead `DEFAULT_EQPT`/`DEFAULT_TOPO` fallback inside the `topo_path is not None or eqpt_path is not None` branch — which `optical_bridge.py` never enters, since it passes neither and so always takes `build_gnpy_network(model)`. Full suite before and after: 113 passed / 2 failed (the same pre-existing `.dat` failures).
@@ -58,9 +122,14 @@ sections; nothing below has been reworded in the move.
 
 - `SegmentCombiner` accumulates noise internally in **float64** and casts back to float32 on return. Do not move this to float32 — overflow on long noisy paths is real.
 - GSNR inputs are clamped to `[-5, 35]` dB before conversion to linear noise. This is intentional.
-- **`soft_max` is scale-normalised** — it divides by `max(a,b).detach()` before the log-sum-exp and multiplies back after. Do not "simplify" this back to the plain `t * logsumexp([a/t, b/t])` form. The plain form's approximation error is `t*ln2`, which is **absolute** in linear-noise units and does not shrink with its operands; real per-segment noise is ~0.0025, so it swamped the signal and inverted the "regen helps" invariant (see [Phase 1c correction #8](../investigations/CHANGELOG.md#correction-1c-8)). Normalised, the error is `max(a,b)*t*ln2` — a fixed fraction — and the invariant holds for any `temperature < 1/ln2 ≈ 1.44` at any noise magnitude.
-- Because the error is now relative, the temperature no longer encodes a hidden assumption about topology-dependent noise scale. `soft_max_temperature=0.5` annealing down to `0.01` is sign-correct end to end; `temperature=0.01` remains the value to use in unit tests that need the approximation tight (soft_max ≈ hard max).
+- **The fold is an exact, polynomial-time dynamic program, not enumeration and not a soft approximation.** Instead of asking "what is the average worst chunk?" — which forces looking at every one of the `2^(N-1)` hard partitions at once — it asks "what is the probability that every realized chunk stays under a bar `tau`?", which is checkable left to right: a chunk can never span a cut, so past a cut the path forgets its history. Vectorizing that question over all `N(N+1)/2` possible chunk-sum thresholds and reassembling `E[max]` from the resulting step function (`F(tau_r) - F(tau_{r-1})` per threshold) gives the exact expectation in polynomial time. `F(tau)` is built purely from sums and products of the per-boundary probabilities `p_k` — it never puts a probability inside an exponential — so the shared-temperature dominance bug two paragraphs down is **structurally impossible** under this fold, not merely tested against. "Regen helps" is consequently **provable, not temperature-conditional**: cutting a boundary splits one chunk into two no-larger pieces, so `E[max]` cannot rise, for any `p`. See `diffopt/qot/segment_combiner.py`'s module docstring (`_expected_max_chunk_noise`) for the DP's exact recurrence.
+- **`SegmentCombiner` is stateless and parameter-free — it takes no annealed knob at all.** The module-level `soft_max` helper still exists (kept for `tests/test_segment_combiner.py` and `scripts/diagnose_fold_error.py`, which still need it to reconstruct/replay the approximation the exact fold replaced), but the production fold does not call it, and there is no `temperature` anywhere in `SegmentCombiner.forward`'s signature. **`soft_max` is still scale-normalised** — it divides by `max(a,b).detach()` before the log-sum-exp and multiplies back after. Do not "simplify" this back to the plain `t * logsumexp([a/t, b/t])` form: the plain form's approximation error is `t*ln2`, **absolute** in linear-noise units and does not shrink with its operands; real per-segment noise is ~0.0025, so it swamped the signal and inverted the "regen helps" invariant (see [Phase 1c correction #8](../investigations/CHANGELOG.md#correction-1c-8)). This is a live property of the helper itself, in case it is ever reused elsewhere — not a statement about the current fold, which does not use it.
 - Any test of the "regen helps" invariant must include a case at the **production** noise scale (two segments at ~26 dB → noise ~0.0025), not only the 5–15 dB fixtures. `tests/test_segment_combiner.py::test_gradient_wrt_regen_prob_at_production_noise_scale` and `::test_regen_never_increases_noise_across_noise_scales` exist for exactly this and are what caught [correction #8](../investigations/CHANGELOG.md#correction-1c-8).
+- **The fold is an exact probability-weighted expectation over every hard partition of the path into chunks, not a single running accumulator.** A regenerator rebuilds the signal, so end-to-end effective noise is `-10*log10(max over chunk noises)` — physically, the path only fails at its worst chunk. **Still banned**: the single-accumulator form (`accumulated = (1-p)*(accumulated+next) + p*soft_max(accumulated, next)`, carried across the whole path). At `p=1` it takes a max but then keeps *adding* the next segment on top of that max, so a downstream chunk's noise piles onto a value that was supposed to have replaced its upstream chunk. It under-reported end-to-end GSNR by up to **3.5 dB** on real multi-segment-chunk paths and gave a redundant regenerator a fake **+1.233 dB** marginal value — the root cause of the regenerator over-provisioning in [correction #11](../investigations/CHANGELOG.md#correction-1c-11). That reasoning doesn't change just because the exact formula shipped in a different shape since.
+  **Also still banned, and a real regression risk because it looks superficially similar and a future implementer could plausibly reach for it again**: weighting each *chunk* by its probability but blending that weight *inside a single shared-temperature exponential* as the chunk's noise (a log-sum-exp over chunks, rather than a linear sum over partitions). At production temperature (0.01) chunk-noise differences would scale as `O(1/t)` while log-probability differences stay `O(1)`, so probability gets swamped and the fold silently collapses toward the no-regen value regardless of `p` — this was tried, measured (attenuated the placement gradient ~33x, made it identical for every boundary regardless of actual benefit), and rejected; see correction #11. **The currently shipped code does not use `soft_max` for the fold at all** — the DP above weights each hard partition linearly by its true probability, entirely outside any exponential, which is what makes this failure mode structurally impossible rather than merely avoided.
+  Note `soft_max(0, C) != C` at loose temperature (`soft_max` is scale-normalised by `max(a,b)`, and `max(0,C)=C` only makes the *normalizer* right — the log-sum-exp term still adds its own `t*ln2`-scale overshoot on top). This is exactly why an earlier two-state design (`M`=worst completed chunk seeded at a `0` sentinel, `C`=current chunk) needed a third `any_regen` scalar just to blend the sentinel out safely, and why that design was still wrong (non-monotonic, up to 2.94 dB off, at fractional `p`) — it blended a fake "no chunk yet" state linearly with a real chunk value and fed that blend into a nonlinear `soft_max`, which does not correctly propagate uncertainty (`soft_max(E[a],E[b]) != E[soft_max(a,b)]`). The shipped DP never uses a zero sentinel at all — every chunk in every partition is a real, complete sum of real segment noises — so this failure mode cannot recur.
+  **Cost:** the genuinely-fractional-probability branch is polynomial, `O(N^4)` elementwise work over an `(R, N)` float64 working set (an `O(N)` hybrid path handles the all-hard-vertex case exactly, e.g. thousands of segments all at `p∈{0,1}`). The cap is now on **segments**, not boundaries: `MAX_EXACT_FOLD_SEGMENTS = 128` (`diffopt/qot/segment_combiner.py`) raises `ValueError` above that, rather than hang — real `ind_132` km-shortest paths reach 16-19 segments, so this leaves ~7x headroom. This replaces the earlier exponential fold's `num_boundaries > 20` cap, which had almost no real margin (measured km-shortest paths on `ind_132` reach 18 boundaries) and is resolved, not open — see [correction #12](../investigations/CHANGELOG.md#correction-1c-12) and `docs/investigations/fold_formula_scalability.md`.
+  Enforcing tests: `tests/test_segment_combiner.py` (25 tests as of this change, including 6 added to validate the DP against a shared brute-force oracle in `tests/_fold_reference.py`), among them `test_fractional_p_matches_hand_derived_expectation`, `test_multi_segment_chunks_equal_max_over_chunks`, `test_chunk_completes_before_next_accumulates`, `test_redundant_regenerator_has_zero_marginal_value`, `test_three_segments_two_boundaries` (hard-vertex/multi-boundary coverage), `test_dp_matches_oracle_across_probability_regimes`, `test_gradcheck_fractional_branch_wrt_boundary_probabilities`/`_wrt_segment_gsnr`, `test_long_path_beyond_old_boundary_cap_now_succeeds` (26 segments — beyond the old 20-boundary cap), and `test_exact_ties_need_no_special_casing_against_oracle`.
 
 ## Surrogate gradient / routing
 
@@ -87,7 +156,7 @@ sections; nothing below has been reworded in the move.
 
 ## Pipeline
 
-- `tau`, `lambda_`, and `soft_max_temperature` are passed per-call to `pipeline.forward()` — never stored as module attributes (prevents stale annealing state across epochs). `SegmentCombiner` is correspondingly stateless: `temperature` is a required `forward()` argument, not a constructor parameter (see [Phase 1c correction #7](../investigations/CHANGELOG.md#correction-1c-7) for why this matters — an earlier version took it at construction and it was never annealed).
+- `tau` and `lambda_` are passed per-call to `pipeline.forward()` — never stored as module attributes (prevents stale annealing state across epochs). `SegmentCombiner` is correspondingly stateless, and takes this further than `tau`/`lambda_` do: it has no annealed parameter at all (not even a per-call one) — the exact fold needs no temperature to keep in sync (see [Phase 1c correction #7](../investigations/CHANGELOG.md#correction-1c-7) for why a per-call, never-stored parameter mattered when `SegmentCombiner` still had one, and [correction #12](../investigations/CHANGELOG.md#correction-1c-12) for its removal).
 - Pre-STE: `path_cost_loss = Σ_demands (path_indicator · edge_weights).sum()` was mechanically required — without it, `∂L/∂path_indicator = 0`, the Vlastelica backward returns the same path, and `EdgeWeightNet` receives zero gradient. It was a gradient enabler, not optional regularization. As of the STE correction (see [correction #6](../investigations/CHANGELOG.md#correction-1c-6)), this is no longer the sole gradient enabler — the ASE-noise proxy independently supplies `∂L/∂path_indicator`, which is why `lambda_cost` was demoted to `0.01`. **Superseded by [correction #9](../investigations/CHANGELOG.md#correction-1c-9):** this quantity is now `path_noise_cost = Σ(path_indicator · edge_ase_noise)`, not `edge_weights` — using `edge_weights` here is the collapse bug correction #9 fixes.
 - `_reconstruct_path` uses `path_indicator.detach()` for the discrete graph walk, but `path_indicator` stays live in the autograd graph for `path_cost` — both uses of the same tensor are intentional.
 - `segment_path` requires `demand_dst` to suppress a spurious empty trailing segment when the path ends exactly on a regen candidate node.

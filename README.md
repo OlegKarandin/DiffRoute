@@ -138,37 +138,59 @@ linear noise and accumulated according to the physics: if there's no
 regenerator at a boundary, noise from the two neighboring segments simply
 adds; if there is one, only the worse (higher-noise) segment matters, because
 regeneration resets accumulated noise. Since regenerator placement is a soft
-probability during training, the combiner interpolates between the two
-regimes using that boundary's probability, and approximates "worse segment"
-with a scale-normalized soft-max (`soft_max`) whose sharpness (`temperature`)
-is a required `forward()` argument, annealed by the training loop from a
-loose `0.5` down to a tight `0.01`.
+probability during training, `SegmentCombiner` returns the **exact**
+probability-weighted expectation of the worst chunk's noise over every hard
+partition of the path at the boundaries — not an approximation, and not a
+running accumulator. It computes this exactly via a polynomial-time dynamic
+program rather than by enumerating all `2^(N-1)` partitions: instead of
+asking "what is the average worst chunk?" it asks "what is the probability
+every chunk stays under a bar `tau`?", checkable left to right since a chunk
+can never span a cut, vectorized over all `N(N+1)/2` possible chunk-sum
+thresholds. `SegmentCombiner` is stateless and takes no annealed
+parameter at all — there is no temperature to keep sharp or in sync,
+because the fold has no approximation error to control.
 
-**6. The loss compares the predicted GSNR against the demand's modulation
-threshold.** `diffopt/loss.py`'s `compute_loss` looks up the required SNR for
-each demand's requested bitrate via `ModulationConfig` (a direct dictionary
-lookup — 11 fixed bitrates, no interpolation) and combines three terms as a
-weighted sum:
+**6. The loss enforces feasibility as a constraint, via per-demand duals,
+rather than pricing it as a fixed-weight penalty.** `diffopt/loss.py`'s
+`compute_loss` looks up the required SNR for each demand's requested bitrate
+via `ModulationConfig` (a direct dictionary lookup — 11 fixed bitrates, no
+interpolation) against a **fixed traffic matrix** (`diffopt/traffic.py`,
+built once per run from `traffic.seed`/`traffic.scale`/`traffic.scenario`,
+not redrawn every epoch) and combines three terms as a weighted sum:
 
 $$
-L = \lambda_{\text{infeasible}} \sum_{d \in D} \mathrm{ReLU}\big(\tau(b_d) - \widehat{GSNR}_d\big)
+L = \sum_{d \in D} \lambda_d \, \mathrm{ReLU}\big(\tau(b_d) + \delta - \widehat{GSNR}_d\big)
   \;+\; \lambda_{\text{regen}} \sum_{n} p_n
   \;+\; \lambda_{\text{cost}} \sum_{d \in D} \sum_{e} z_{d,e}\,\nu_e
 $$
 
-For each demand `d` requesting bitrate `b_d`: `τ(b_d)` is its SNR threshold
-and `ĜSNR_d` the pipeline's predicted end-to-end GSNR; a `ReLU` penalizes
-falling short of the threshold and costs nothing once it's met. `p_n =
-sigmoid(logit_n / τ)` is `RegenPlacement`'s soft regenerator-presence
-probability at node `n` — summing it is a soft count, penalizing more
-regenerators. `z_{d,e}` is demand `d`'s (surrogate-differentiable) binary
-path indicator on edge `e`, and `ν_e` is the fixed per-edge ASE-noise
-coefficient from step 4 — this route-noise term is a regularizer, not the
-primary routing signal (that's the straight-through estimator in step 4); it
-exists so that once every demand is feasible (the ReLU term's gradient is
-zero everywhere) some signal still reaches `EdgeWeightNet` favoring
-lower-noise routes. Default weights (`configs/experiment/base.yaml`):
-`λ_infeasible = 10.0`, `λ_regen = 1.0`, `λ_cost = 0.01`.
+For each demand `d` requesting bitrate `b_d`: `τ(b_d)` is its SNR threshold,
+`δ` (`constraint.margin_db`) is a fixed margin added inside the hinge so the
+term stays active with a gradient even after a demand clears the bare
+threshold, and `ĜSNR_d` is the pipeline's predicted end-to-end GSNR; a `ReLU`
+penalizes falling short of `τ(b_d) + δ` and costs nothing once it's met.
+`λ_d` is demand `d`'s **dual variable** — not a fixed hyperparameter, but a
+per-demand Lagrange multiplier persisted across epochs and updated by an
+explicit clamped ascent step *after* the optimizer step (`diffopt/loss.py`'s
+`update_duals`, not on any optimizer): `λ_d ← clamp(λ_d + η·shortfall_d, 0,
+λ_max)` (`constraint.dual_lr`, `constraint.dual_max`). A demand that keeps
+falling short gets a rising, individually-targeted penalty; one that is
+feasible sees its dual relax. This replaces a single fixed `λ_infeasible`
+that priced every demand's shortfall the same regardless of how persistently
+it failed. `p_n = sigmoid(logit_n / τ)` is `RegenPlacement`'s soft
+regenerator-presence probability at node `n` — summing it is a soft count,
+penalizing more regenerators, at a fixed weight (`λ_regen` stays fixed;
+feasibility no longer competes with it on a tuned exchange rate — the duals
+buy feasibility directly). `z_{d,e}` is demand `d`'s (surrogate-
+differentiable) binary path indicator on edge `e`, and `ν_e` is the fixed
+per-edge ASE-noise coefficient from step 4 — this route-noise term is a
+regularizer, not the primary routing signal (that's the straight-through
+estimator in step 4); it exists so that once every demand is feasible (the
+ReLU term's gradient is zero everywhere) some signal still reaches
+`EdgeWeightNet` favoring lower-noise routes. Default weights
+(`configs/experiment/base.yaml`): `δ = 0.5` dB, `λ_0 = 10.0` (matching the
+old fixed `λ_infeasible`, so epoch 1 reproduces prior behaviour), `λ_regen =
+1.0`, `λ_cost = 0.01`.
 
 ```
 FORWARD
@@ -199,20 +221,20 @@ regen_logits ──sigmoid(·/τ)──► p ∈ (0,1)ⁿ                       
                                   ▼
       segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())          [straight-through, step 4]
                                   ▼
-      SegmentCombiner: soft_max(noise_a, noise_b; T) blended by p           [step 5]
+      SegmentCombiner: exact DP fold, E[max chunk noise] over partitions    [step 5]
                                   ▼
                           path GSNR (dB), per demand
                                   ▼
-      loss = λ_inf·ReLU(τ(b) - GSNR) + λ_regen·Σp + λ_cost·Σ z·ν_e          [step 6]
+      loss = Σ_d λ_d·ReLU(τ(b_d)+δ - GSNR_d) + λ_regen·Σp + λ_cost·Σ z·ν_e   [step 6]
                                   ▼
                               scalar loss L
 
 BACKWARD  (gradient flows bottom-to-top, mirroring the arrows above)
 ────────
-∂L/∂GSNR = -λ_inf if infeasible, else 0     (ReLU'(τ-GSNR) gates the -1 from d(τ-GSNR)/dGSNR)
+∂L/∂GSNR = -λ_d if shortfall > 0, else 0    (ReLU'(τ+δ-GSNR) gates the -1 from d(τ+δ-GSNR)/dGSNR; λ_d is demand d's dual)
       │
       ▼
-∂L/∂segment_gsnr ──through soft_max's smooth blend──   also: ∂L/∂p ──sigmoid'(·)──► regen_logits directly
+∂L/∂segment_gsnr ──through the DP fold's exact partition weighting──   also: ∂L/∂p ──sigmoid'(·)──► regen_logits directly
       │
       ▼
 ∂L/∂qot_gsnr → discarded (frozen model, nothing upstream to update)
@@ -253,11 +275,17 @@ All defaults below are from `configs/experiment/base.yaml`;
 
 | Section | Key | Default | Controls |
 |---|---|---|---|
-| `pipeline` | `lambda_infeasible` | 10.0 | Weight on the GSNR-feasibility ReLU term (step 6) |
+| `constraint` | `margin_db` | 0.5 | delta added inside the feasibility hinge (step 6) |
+| `constraint` | `dual_init` | 10.0 | lambda_0 — matches the old fixed `lambda_infeasible`, so epoch 1 reproduces prior behaviour |
+| `constraint` | `dual_lr` | 1.0 | eta — dual ascent step size (a 1 dB shortfall moves a dual 10% of lambda_0) |
+| `constraint` | `dual_max` | 1000.0 | lambda_max — cap; demands pinned here are reported at end of run |
+| `traffic` | `scenario` | `stress` | `stress` (alpha 0.0) or `realistic` (alpha 1.0); mapped by `diffopt.traffic.scenario_alpha` |
+| `traffic` | `seed` | 0 | matrix identity — a different value is a different constraint set |
+| `traffic` | `scale` | 1300000.0 | total offered load in Gbps |
+| `traffic` | `holdout_seed` | 1 | a different matrix, for the generalisation gap (`scripts/evaluate_matrix.py --holdout`) |
 | `pipeline` | `lambda_regen` | 1.0 | Weight on the regenerator-count penalty (step 6) |
 | `pipeline` | `lambda_cost` | 0.01 | Weight on the ASE-noise route regularizer (step 6) |
 | `pipeline` | `channel_loading_fraction` | 0.5 | Channel loading assumed for span-feature extraction |
-| `segment_combiner` | `soft_max_temperature` → `soft_max_temperature_min` | 0.5 → 0.01 | `SegmentCombiner`'s soft-max sharpness, annealed over training (step 5) |
 | `training` | `lr_edge_net` | 1e-3 | Adam LR for `EdgeWeightNet` |
 | `training` | `lr_regen` | 1e-2 | Adam LR for `RegenPlacement`'s logits |
 | `training` | `epochs_e2e` | 500 | Number of end-to-end training epochs |
@@ -266,21 +294,20 @@ All defaults below are from `configs/experiment/base.yaml`;
 
 How they interact:
 
-- **`regen_tau` and `soft_max_temperature` anneal on the same epoch window
-  (100-400) on purpose.** Both represent "how sharp is this continuous
-  relaxation," and annealing them together means the physics evaluation
-  (step 5) sharpens at the same rate as the placement decisions (step 3) it's
-  evaluating.
-- **`soft_max_temperature`'s safe range depends on the topology's noise
-  scale, in a way the code now compensates for.** `soft_max`'s approximation
-  error used to be an *absolute* offset in linear-noise units
-  (`temperature · ln2`); at this topology's real per-segment noise scale
-  (~0.0025, i.e. ~26 dB segments), even the tightest scheduled temperature
-  (0.01) overshot by 2.6x the real signal and *inverted the sign* of every
-  gradient into regenerator placement. `soft_max` is now scale-normalized, so
-  the "regen helps" invariant holds for any `temperature < 1/ln2 ≈ 1.44` at
-  any noise magnitude — but this history is why the value isn't simply "pick
-  something small."
+- **`regen_tau` anneals alone now; `SegmentCombiner` has no matching knob to
+  keep in step with it.** An earlier version of the fold annealed a
+  `soft_max_temperature` over the same epoch window (100-400) as
+  `regen_tau`, so the physics evaluation (step 5) sharpened at the same rate
+  as the placement decisions (step 3) it was evaluating. That approximation
+  is gone: `SegmentCombiner`'s fold is now an exact dynamic program with no
+  approximation sharpness to anneal, so `regen_tau` is the only schedule left
+  in this window. The approximation this replaced had a real failure mode
+  worth remembering — its error was an *absolute* offset in linear-noise
+  units (`temperature · ln2`), and at this topology's real per-segment noise
+  scale (~0.0025, i.e. ~26 dB segments) even the tightest scheduled
+  temperature (0.01) overshot by 2.6x the real signal and *inverted the
+  sign* of every gradient into regenerator placement — see
+  `docs/investigations/CHANGELOG.md`'s corrections #8 and #12.
 - **`vlastelica_lambda` trades perturbation size against gradient
   magnitude.** A larger λ perturbs costs further, making it more likely some
   edge actually flips in the re-solve (real signal instead of a zero

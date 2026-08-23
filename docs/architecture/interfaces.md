@@ -158,15 +158,15 @@ SegmentCombiner()  # stateless — takes no constructor arguments
 forward(
     segment_gsnrs_db:          List[Tensor],  # N scalar float32 tensors (GSNR in dB)
     regen_probs_at_boundaries: List[Tensor],  # N-1 scalar float32 tensors ∈ (0, 1)
-    temperature:               float,          # required, no default — see below
 ) -> Tensor  # scalar float32, end-to-end GSNR in dB
 ```
 
-- `temperature` is a **required** `forward()` argument, not a constructor parameter — matches `DiffONetPipeline.forward()`'s `tau`/`lambda_` pattern (passed per-call, never stored, to prevent stale annealing state). An earlier version took `soft_max_temperature` at construction and it was never annealed anywhere in the codebase — see `docs/investigations/CHANGELOG.md`'s Phase 1c corrections for the bug this caused and the fix.
+- Takes no annealed parameters at all — not `temperature`, not anything else. The fold is exact, so there is no approximation sharpness to keep in sync across calls. An earlier version took `soft_max_temperature` at construction (never annealed anywhere in the codebase), then as a required per-call `forward()` argument (matching `DiffONetPipeline.forward()`'s `tau`/`lambda_` pattern) — see `docs/investigations/CHANGELOG.md`'s Phase 1c corrections (#7, #8, #11, #12) for the bugs this history caused and the fixes, ending with the parameter's outright removal.
 - `len(regen_probs_at_boundaries) == len(segment_gsnrs_db) - 1` is enforced.
 - Inputs are clamped to `[-5, 35]` dB internally; caller does not need to clamp.
 - Gradient flows through `regen_probs_at_boundaries`; also through `segment_gsnrs_db` if those tensors require grad.
-- `DiffONetPipeline.forward(..., soft_max_temperature: float = 0.5)` passes this straight through to `self.segment_combiner(...)`. `diffopt/train.py` anneals it every epoch from `segment_combiner.soft_max_temperature` (config, default 0.5) down to `segment_combiner.soft_max_temperature_min` (config, default 0.01) over the same epoch window as `regen_tau`.
+- **Chunk semantics.** A regenerator boundary splits the path into independent chunks — it rebuilds the signal, so noise does not carry across it. `forward`'s result is the **exact probability-weighted expectation over every possible chunking** (every hard partition of the path at the boundaries): `Σ_π P(π) · (chunk-max noise under partition π)`, `π` ranging over all `2^(N-1)` ways the `N-1` boundaries could independently cut — but it is computed by a polynomial-time dynamic program, not by enumerating `π`. The DP asks "what is the probability every realized chunk stays under a bar `tau`?" (checkable left to right, since a chunk can never span a cut), vectorized over all `N(N+1)/2` possible chunk-sum thresholds, then reconstructs `E[max]` from the resulting step function. `F(tau)` is built purely from sums and products of the per-boundary probabilities, never through an exponential, which is also why "regen helps" is provable directly from the DP's structure (cutting a boundary can only split a chunk into two no-larger pieces) rather than depending on a temperature staying small. Exact at `p ∈ {0,1}` for every boundary simultaneously (a separate `O(N)` hybrid path handles this case directly — no enumeration, so this holds even for thousands of segments), and exact at any individual hard vertex (`p_i ∈ {0,1}` for boundary `i` while others stay fractional) via the general DP's own limit — no separate code path is needed for that case. See `diffopt/qot/segment_combiner.py`'s module docstring for the DP's exact recurrence and `docs/architecture/invariants.md`'s "Segment combiner" section for the invariants it guarantees.
+- **Cost.** The genuinely-fractional-probability branch is polynomial: `O(N^4)` elementwise work over an `(R, N)` float64 working set, capped at `MAX_EXACT_FOLD_SEGMENTS = 128` **segments** (not boundaries) — `ValueError` above that rather than hang. Real `ind_132` km-shortest paths reach 16-19 segments, so this leaves ~7x headroom; see `docs/investigations/fold_formula_scalability.md`, resolved by `docs/investigations/CHANGELOG.md`'s correction #12. This replaces an earlier exponential-fold implementation whose `num_boundaries > 20` cap had almost no real margin against measured real-topology path lengths.
 
 Module-level helpers (also importable):
 
@@ -227,6 +227,76 @@ Implemented as `DijkstraSurrogate.apply(...)`. The returned tensor is not a prop
 
 **λ guidance:** λ=10 is a reasonable default. Smaller λ → larger gradient signal but noisier; larger λ → smaller signal. Anneal from 10 → 1 during training (`vlastelica_lambda_decay` in config).
 
+## Traffic matrix (diffopt/traffic.py)
+
+The fixed traffic matrix and its preflight screen — the constraint set the
+duals in `diffopt/loss.py` act on. See `docs/architecture/invariants.md`,
+"Traffic matrix / constraint" for the invariants; this section is contracts
+and signatures only.
+
+```python
+SCENARIO_ALPHA: Dict[str, float] = {"realistic": 1.0, "stress": 0.0}
+
+def scenario_alpha(scenario: str) -> float
+    # Maps a named traffic scenario to its gravity distance exponent.
+    # Raises ValueError for any scenario not in SCENARIO_ALPHA.
+
+def build_traffic_matrix(
+    topology: Topology,
+    *,
+    seed: int,
+    scale: float,
+    alpha: float,
+    bitrate_options: List[float],
+) -> List[Demand]
+    # Wraps upstream generate_demands with aggregate=True, undirected=True,
+    # protected_fraction=0.0. Each pair's offered volume is mapped to the
+    # nearest member of bitrate_options; pairs below
+    # min(bitrate_options) - 25 are dropped. Returns Demand ids contiguous
+    # 0..N-1.
+
+def traffic_matrix_checksum(demands: List[Demand]) -> str
+    # Stable 16-hex-char sha256 digest of a matrix's (src, dst, bitrate)
+    # content. Deliberately excludes `id` (a positional artifact), so the
+    # digest is unchanged by a renumbering that preserves content.
+
+def shortest_path_edges_by_km(
+    topology: Topology, src: int, dst: int
+) -> Optional[List[int]]
+    # Edge ids of the minimum-kilometre path, in traversal order src -> dst.
+    # Returns None if dst is unreachable from src, [] when src == dst.
+    # Deliberately NOT routed by EdgeWeightNet.
+
+def preflight_filter(
+    topology: Topology,
+    demands: Sequence[Demand],
+    *,
+    qot_model: torch.nn.Module,
+    segment_combiner: torch.nn.Module,
+    modulation_config,
+    margin_db: float,
+    channel_loading_fraction: float = 0.5,
+    max_spans: int = 60,
+) -> Tuple[List[Demand], List[Tuple[Demand, float]]]
+    # Drops demands that are infeasible under the most favourable conditions
+    # (all regen candidates active, routed shortest-by-km). Returns
+    # (kept, excluded): kept is renumbered with contiguous ids 0..N-1 in
+    # input order; excluded is a list of (demand, shortfall_db), where
+    # shortfall_db = threshold + margin - best_case_gsnr, or inf when there
+    # is no route at all. Necessary, not sufficient — a demand that survives
+    # may still be unreachable under the routing the model actually learns.
+```
+
+- `Demand.id` contiguity is load-bearing throughout this module: it indexes
+  the per-demand dual vector in `diffopt.loss.compute_loss`, so both
+  `build_traffic_matrix` and `preflight_filter` renumber `0..N-1` on their
+  own output rather than preserving upstream/input ids.
+- `preflight_filter`'s `margin_db` is the same `delta` the constrained loss
+  adds inside the hinge — a demand that cannot reach `threshold + margin`
+  even under the most favourable route/placement can never satisfy the
+  constraint, so excluding it here trades a silently non-converging dual for
+  a reported exclusion.
+
 ## Experiment YAML config keys used at runtime
 
 | Key | Used by | Notes |
@@ -238,8 +308,18 @@ Implemented as `DijkstraSurrogate.apply(...)`. The returned tensor is not a prop
 | `dataset_dir` | both | directory containing train.parquet / val.parquet |
 | `batch_size`, `learning_rate`, `epochs` | `train_qot.py` | |
 | `checkpoint_dir`, `log_dir` | `train_qot.py` | created if absent |
-| `segment_combiner.soft_max_temperature` | `diffopt/train.py` | anneal start value (default 0.5 if section absent) |
-| `segment_combiner.soft_max_temperature_min` | `diffopt/train.py` | anneal end value (default 0.01 if section absent) — see `docs/investigations/CHANGELOG.md`'s Phase 1c corrections for why this was previously hardcoded and never annealed |
 | `training.vlastelica_lambda` | `DijkstraSurrogate` | perturbation strength start; default 10.0 |
 | `training.vlastelica_lambda_min` | `diffopt/train.py` | decay floor; default 1.0 |
 | `training.vlastelica_lambda_decay` | `diffopt/train.py` | per-epoch multiplier; default 0.995 |
+| `traffic.scenario` | `diffopt/train.py`, `scripts/evaluate_matrix.py` | `stress` (alpha 0.0) or `realistic` (alpha 1.0); mapped by `diffopt.traffic.scenario_alpha` |
+| `traffic.seed` | same | matrix identity; a different value is a different constraint set |
+| `traffic.scale` | same | total offered load in Gbps, calibrated per topology to ~500-900 demands |
+| `traffic.holdout_seed` | `scripts/evaluate_matrix.py --holdout` | the generalisation-gap matrix |
+| `constraint.margin_db` | `diffopt/train.py`, `diffopt/loss.py` | delta inside the hinge; 0.5 dB ≈ 2.6σ on the QoT model's 0.1909 dB val RMSE |
+| `constraint.dual_init` | `diffopt/train.py` | lambda_0; 10.0 matches the removed `lambda_infeasible` so epoch 1 reproduces prior behaviour |
+| `constraint.dual_lr` | `diffopt/train.py` | eta in the dual ascent step |
+| `constraint.dual_max` | `diffopt/train.py` | cap; demands pinned here are reported at end of run |
+| `placement.gate` | `sigmoid` (default) or `hard_concrete` |
+| `placement.gate_dropout_p` | Training-only gate dropout probability; `0.0` = off |
+| `placement.hard_concrete.{beta,gamma,zeta}` | Hard-concrete stretch parameters; defaults `0.5 / -0.1 / 1.1` |
+| `selection.hard_eval` | `true` (default): selection key from a hard-placement forward pass |

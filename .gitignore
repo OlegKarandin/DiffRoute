@@ -26,6 +26,11 @@ data/datasets/
 checkpoints/
 logs/
 
+# scripts/run_placement_ablation.py output (per-arm/seed configs+logs+
+# checkpoints, and the measured CSV) — generated, not source
+runs/
+results/
+
 # IDE
 .vscode/
 .idea/
