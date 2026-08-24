@@ -79,6 +79,26 @@ def segment_path(
     return segments, boundary_nodes
 
 
+def _spearman(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Spearman rank correlation between two 1-D tensors.
+
+    Ranks each input by double argsort (argsort(argsort(x)) gives each
+    element's rank), then computes the Pearson correlation coefficient on
+    the two rank vectors. Ties are broken by original order — the same
+    simplification plain argsort makes — rather than proper tie-corrected
+    (averaged) ranking; acceptable here since this is a diagnostic, not a
+    statistic anything downstream reads.
+    """
+    a_rank = torch.argsort(torch.argsort(a)).float()
+    b_rank = torch.argsort(torch.argsort(b)).float()
+    a_c = a_rank - a_rank.mean()
+    b_c = b_rank - b_rank.mean()
+    denom = torch.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())
+    if denom.item() == 0.0:
+        return float("nan")
+    return (a_c * b_c).sum().item() / denom.item()
+
+
 # ---------------------------------------------------------------------------
 # Allocation record
 # ---------------------------------------------------------------------------
@@ -104,6 +124,13 @@ class AllocationOutputs:
     num_segments: torch.Tensor        # (D,) long
     boundary_node_ids: torch.Tensor   # (D, J-1) long, -1 where padded
     demand_ids: List[int]             # row index -> Demand.id
+    ste_clamped_segments: int         # count of segments whose qot_gsnr fell
+                                       # outside SegmentCombiner's [-5, 35] dB
+                                       # clamp band this forward call
+    proxy_qot_rank_corr: float        # Spearman(proxy, qot) over this call's
+                                       # segments; drift toward 0 means the
+                                       # STE gradient disagrees with the
+                                       # forward value about segment ordering
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +631,14 @@ class DiffONetPipeline(nn.Module):
         else:
             batched_qot_gsnr = torch.zeros(0, device=device)
 
+        # Count segments whose raw QoT prediction falls outside
+        # SegmentCombiner's [GSNR_MIN, GSNR_MAX] clamp band: _safe_noise's
+        # clamp zeroes the STE gradient for exactly those segments, silently.
+        clamped = int(
+            ((batched_qot_gsnr < GSNR_MIN) | (batched_qot_gsnr > GSNR_MAX))
+            .sum().item()
+        )
+
         # 6. Scatter the batched QoT output back per demand, blend with the
         # STE proxy per segment, then fold EVERY demand in one call.
         #
@@ -617,6 +652,7 @@ class DiffONetPipeline(nn.Module):
         flat_idx = 0
 
         segment_gsnr_flat: List[torch.Tensor] = []
+        proxy_flat: List[torch.Tensor] = []
         seg_rows: List[int] = []
         seg_cols: List[int] = []
         seg_km_flat: List[float] = []
@@ -647,6 +683,7 @@ class DiffONetPipeline(nn.Module):
                 # gradient outside the clamped band).
                 segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())
                 segment_gsnr_flat.append(segment_gsnr)
+                proxy_flat.append(proxy_gsnr)
                 seg_rows.append(row)
                 seg_cols.append(col)
                 seg_km_flat.append(
@@ -660,6 +697,15 @@ class DiffONetPipeline(nn.Module):
 
             path_noise_costs[demand.id] = demand_path_noise_costs[demand.id]
             path_indicators[demand.id] = path_indicator
+
+        # Spearman: rank-correlate the proxy's segment ordering against
+        # the QoT model's. The STE is only a legitimate gradient
+        # substitute to the extent the two agree on which segment is
+        # worse; a correlation drifting toward 0 means the backward pass
+        # is pointing somewhere the forward pass does not go.
+        rank_corr = _spearman(
+            torch.stack(proxy_flat).detach(), batched_qot_gsnr
+        ) if len(proxy_flat) > 1 else float("nan")
 
         if demands:
             num_demands = len(demands)
@@ -755,6 +801,8 @@ class DiffONetPipeline(nn.Module):
                 num_segments=num_segments,
                 boundary_node_ids=bnd_matrix,
                 demand_ids=[d.id for d in demands],
+                ste_clamped_segments=clamped,
+                proxy_qot_rank_corr=rank_corr,
             )
         else:
             # No demands: every per-demand tensor is empty in its row
@@ -772,6 +820,8 @@ class DiffONetPipeline(nn.Module):
                 num_segments=torch.zeros(0, dtype=torch.long, device=device),
                 boundary_node_ids=torch.zeros(0, 0, dtype=torch.long, device=device),
                 demand_ids=[],
+                ste_clamped_segments=clamped,
+                proxy_qot_rank_corr=rank_corr,
             )
 
         return path_noise_costs, gsnr_preds, path_indicators, alloc_outputs

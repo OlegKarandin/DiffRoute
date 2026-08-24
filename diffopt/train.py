@@ -489,11 +489,8 @@ def main() -> None:
                 f"{score_max:.6f}",
                 f"{alloc_dropout_p:.3f}",
                 lookahead,
-                # Filled by Task 10 (AllocationOutputs.ste_clamped_segments /
-                # .proxy_qot_rank_corr). Written as empty strings until then
-                # so the header and the row widths already agree.
-                "",
-                "",
+                alloc.ste_clamped_segments,
+                f"{alloc.proxy_qot_rank_corr:.4f}",
             ])
             f.flush()
 

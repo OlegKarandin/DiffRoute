@@ -250,6 +250,8 @@ class _DummyAlloc:
         self.num_segments = torch.tensor([2])
         self.boundary_node_ids = torch.tensor([[3]])
         self.demand_ids = [0]
+        self.ste_clamped_segments = 0
+        self.proxy_qot_rank_corr = 1.0
 
 
 class _DummyPipeline:

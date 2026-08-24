@@ -1278,3 +1278,37 @@ def test_edge_weights_still_have_the_undetached_unit_mean_divisor():
     g = torch.autograd.grad(loss, pipeline.edge_log_weight, allow_unused=True)[0]
     raw = torch.nn.functional.softplus(pipeline.edge_log_weight)
     assert (raw * g).sum().abs().item() < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Task 10: STE guardrails
+# ---------------------------------------------------------------------------
+
+def test_clamped_segments_are_counted():
+    """If qot_gsnr leaves SegmentCombiner's [-5, 35] dB band, _safe_noise's
+    clamp zeroes that segment's STE gradient silently. Count it, so a run
+    that quietly loses its routing signal is visible in the log."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    _, _, _, alloc = pipeline(make_demands())
+    assert alloc.ste_clamped_segments == 0
+
+    class Saturating(torch.nn.Module):
+        def forward(self, feats, mask):
+            return torch.full((feats.shape[0],), 99.0)
+
+    pipeline.qot_model = Saturating()
+    pipeline.clear_segment_gsnr_cache()
+    _, _, _, alloc = pipeline(make_demands())
+    assert alloc.ste_clamped_segments > 0
+
+
+def test_proxy_qot_rank_correlation_is_reported():
+    """Nothing currently detects forward/backward mismatch: the STE's value
+    comes from the transformer and its gradient from the proxy, and if the
+    two disagree about which segment is noisier the gradient points the
+    wrong way. Spearman over the epoch's segments makes that visible."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    _, _, _, alloc = pipeline(make_demands())
+    assert -1.0 <= alloc.proxy_qot_rank_corr <= 1.0
