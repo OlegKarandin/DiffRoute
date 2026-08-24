@@ -27,12 +27,11 @@ def simple_loss_inputs():
         0: torch.tensor(1.5),
         1: torch.tensor(2.5),
     }
-    regen_probs = torch.tensor([0.1, 0.6, 0.3])
     return dict(
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=regen_probs,
+        device_count=torch.zeros(()),
         modulation_config=mod_cfg,
         duals=torch.tensor([10.0, 10.0]),
     )
@@ -48,7 +47,7 @@ def test_empty_demand_list_does_not_crash():
         gsnr_preds={},
         path_noise_costs={},
         demands=[],
-        regen_probs=torch.zeros(5),
+        device_count=torch.zeros(()),
         modulation_config=None,
         duals=torch.zeros(0),
     )
@@ -64,9 +63,8 @@ def test_metrics_dict_has_the_keys_train_py_logs(simple_loss_inputs):
     _, metrics = compute_loss(**simple_loss_inputs)
     for key in (
         "feasibility_loss",
-        "regen_loss",
+        "device_count",
         "path_noise_loss",
-        "num_regen_soft",
         "num_infeasible",
         "weighted_feasibility_loss",
         "num_violated",
@@ -105,11 +103,11 @@ def test_margin_keeps_hinge_active_above_threshold():
         gsnr_preds={0: gsnr},
         path_noise_costs={0: torch.tensor(0.0)},
         demands=demands,
-        regen_probs=torch.zeros(3),
+        device_count=torch.zeros(()),
         modulation_config=mod_cfg,
         duals=torch.tensor([1.0]),
         margin_db=margin_db,
-        lambda_regen=0.0,
+        lambda_dev=0.0,
         lambda_cost=0.0,
     )
     assert total.item() == pytest.approx(margin_db / 2)
@@ -130,11 +128,11 @@ def test_zero_loss_only_once_the_margin_is_cleared():
         gsnr_preds={0: torch.tensor(20.6)},
         path_noise_costs={0: torch.tensor(0.0)},
         demands=demands,
-        regen_probs=torch.zeros(3),
+        device_count=torch.zeros(()),
         modulation_config=mod_cfg,
         duals=torch.tensor([1.0]),
         margin_db=0.5,
-        lambda_regen=0.0,
+        lambda_dev=0.0,
         lambda_cost=0.0,
     )
     assert total.item() == pytest.approx(0.0)
@@ -153,10 +151,10 @@ def test_duals_weight_demands_independently():
         gsnr_preds={0: torch.tensor(18.0), 1: torch.tensor(19.0)},
         path_noise_costs={0: torch.tensor(0.0), 1: torch.tensor(0.0)},
         demands=demands,
-        regen_probs=torch.zeros(3),
+        device_count=torch.zeros(()),
         modulation_config=mod_cfg,
         margin_db=0.0,
-        lambda_regen=0.0,
+        lambda_dev=0.0,
         lambda_cost=0.0,
     )
     base, _ = compute_loss(duals=torch.tensor([1.0, 1.0]), **common)
@@ -175,11 +173,11 @@ def test_shortfalls_are_returned_indexed_by_demand_id():
         gsnr_preds={0: torch.tensor(18.0), 1: torch.tensor(25.0)},
         path_noise_costs={0: torch.tensor(0.0), 1: torch.tensor(0.0)},
         demands=demands,
-        regen_probs=torch.zeros(3),
+        device_count=torch.zeros(()),
         modulation_config=mod_cfg,
         duals=torch.tensor([1.0, 1.0]),
         margin_db=0.0,
-        lambda_regen=0.0,
+        lambda_dev=0.0,
         lambda_cost=0.0,
     )
     shortfalls = metrics["shortfalls"]
@@ -201,7 +199,7 @@ def test_worst_margin_db_is_reported_against_the_bare_threshold():
         gsnr_preds={0: torch.tensor(21.5), 1: torch.tensor(19.4)},
         path_noise_costs={0: torch.tensor(0.0), 1: torch.tensor(0.0)},
         demands=demands,
-        regen_probs=torch.zeros(3),
+        device_count=torch.zeros(()),
         modulation_config=mod_cfg,
         duals=torch.tensor([1.0, 1.0]),
         margin_db=0.5,
@@ -259,30 +257,36 @@ def test_dual_decays_only_when_satisfied():
     assert updated[1].item() == pytest.approx(9.0)
 
 
-def test_regen_count_penalty_defaults_to_the_probability_mass(simple_loss_inputs):
-    """Regression guard: omitting the argument must reproduce the pre-2026-08-21
-    objective exactly, so every previously-measured number stays comparable."""
-    explicit = dict(simple_loss_inputs)
-    explicit["regen_count_penalty"] = simple_loss_inputs["regen_probs"].sum()
-
-    default_total, default_metrics = compute_loss(**simple_loss_inputs)
-    explicit_total, explicit_metrics = compute_loss(**explicit)
-
-    assert torch.allclose(default_total, explicit_total)
-    assert default_metrics["regen_loss"] == explicit_metrics["regen_loss"]
-
-
-def test_regen_count_penalty_overrides_the_mass(simple_loss_inputs):
-    """A hard-concrete gate prices the expected COUNT, which is a different
-    number from sum(p) — compute_loss must use what it is handed."""
+def test_device_count_is_priced_by_lambda_dev(simple_loss_inputs):
+    """The whole point of the stage: the objective's second term is a count
+    of DEVICES, sum_{d,k} a[d,k], not a count of sites."""
     inputs = dict(simple_loss_inputs)
-    inputs["lambda_regen"] = 1.0
-    baseline, _ = compute_loss(**inputs)
+    inputs["lambda_dev"] = 2.0
+    inputs["device_count"] = torch.tensor(7.0)
+    with_devices, m = compute_loss(**inputs)
+    inputs["device_count"] = torch.tensor(0.0)
+    without, _ = compute_loss(**inputs)
+    assert (with_devices - without).item() == pytest.approx(14.0, rel=1e-6)
+    assert m["device_count"] == pytest.approx(7.0)
 
-    inputs["regen_count_penalty"] = simple_loss_inputs["regen_probs"].sum() + 3.0
-    bumped, metrics = compute_loss(**inputs)
 
-    assert torch.allclose(bumped - baseline, torch.tensor(3.0))
-    assert metrics["regen_loss"] == pytest.approx(
-        simple_loss_inputs["regen_probs"].sum().item() + 3.0
-    )
+def test_device_term_carries_gradient_to_the_allocation(simple_loss_inputs):
+    inputs = dict(simple_loss_inputs)
+    inputs["lambda_dev"] = 1.0
+    a = torch.tensor([[0.3, 0.7], [0.1, 0.0]], requires_grad=True)
+    inputs["device_count"] = a.sum()
+    total, _ = compute_loss(**inputs)
+    total.backward()
+    assert a.grad is not None
+    assert torch.allclose(a.grad, torch.ones_like(a))
+
+
+def test_no_regen_probs_parameter_survives(simple_loss_inputs):
+    """Regression guard: a leftover regen_probs kwarg is how site pricing
+    creeps back in."""
+    import inspect
+
+    params = inspect.signature(compute_loss).parameters
+    assert "regen_probs" not in params
+    assert "lambda_regen" not in params
+    assert "regen_count_penalty" not in params

@@ -15,22 +15,21 @@ def compute_loss(
     gsnr_preds: Dict[int, torch.Tensor],
     path_noise_costs: Dict[int, torch.Tensor],
     demands: List[Demand],
-    regen_probs: torch.Tensor,
+    device_count: torch.Tensor,
     modulation_config: ModulationConfig,
     duals: torch.Tensor,
     margin_db: float = 0.5,
-    lambda_regen: float = 1.0,
+    lambda_dev: float = 1.0,
     lambda_cost: float = 0.01,
-    regen_count_penalty: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the constrained training loss.
 
         L = sum_d lambda_d * relu(thr_d + delta - gsnr_d)
-          + lambda_regen * sum_n p_n
-          + lambda_cost  * path_noise
+          + lambda_dev  * sum_n sum_d a[d,n]
+          + lambda_cost * path_noise
 
     This replaces a weighted sum of three soft penalties in which feasibility
-    competed with regenerator count on a fixed exchange rate. `lambda_regen`
+    competed with regenerator count on a fixed exchange rate. `lambda_dev`
     stays fixed; the duals rise until feasibility is bought, so regenerator
     count becomes an outcome rather than a tuned trade-off.
 
@@ -45,7 +44,17 @@ def compute_loss(
         demands:      List of Demand namedtuples, from the FIXED traffic
                       matrix (diffopt/traffic.py). Their `id`s must be
                       contiguous 0..N-1 — they index `duals`.
-        regen_probs:  (num_nodes,) tensor from RegenPlacement.get_regen_probs().
+        device_count: The scalar `lambda_dev` multiplies — how many
+                      REGENERATOR DEVICES the allocation buys,
+                      `sum_n sum_d a[d,n]`, from
+                      `diffopt.placement.allocation.total_device_cost`.
+                      This replaces a per-SITE count, which was the wrong
+                      metric: 40 demands regenerating at node 7 need 40
+                      devices, not 1, and pricing sites is what made the
+                      placement count track lambda's magnitude rather than
+                      need. Live in the autograd graph — the gradient
+                      through it is the only downward pressure on the
+                      allocation head.
         modulation_config: Bitrate -> SNR threshold lookup.
         duals:        (num_demands,) tensor of per-demand multipliers, indexed
                       by `Demand.id` and persisted across epochs by the caller.
@@ -67,27 +76,20 @@ def compute_loss(
                       0.5 dB is ~2.6 sigma on the QoT model's 0.1909 dB val
                       RMSE plus headroom over soft_max's ~0.03 dB relative
                       error at t=0.01.
-        lambda_regen: Weight on regenerator count penalty. Fixed, not tuned.
+        lambda_dev:   Weight on the device count. Fixed, not annealed, and
+                      LIVE FROM EPOCH 0 — see spec 2.2 for why a warm-up
+                      saturates the head at ~20-30x the optimum with no
+                      gradient left to escape. Calibrate with
+                      scripts/calibrate_lambda_dev.py; do not hand-tune.
         lambda_cost:  Weight on the ASE-denominated path-noise regulariser. Not the
                       primary routing signal -- the STE in pipeline.forward supplies that.
-        regen_count_penalty: The scalar `lambda_regen` multiplies. `None`
-                      (default) means `regen_probs.sum()` — the probability
-                      MASS, this function's original and unchanged
-                      behaviour. A hard-concrete L0 gate passes its expected
-                      COUNT instead, which is a different function of the
-                      parameters: pricing the count rather than the mass is
-                      the entire reason that gate can express "exactly three
-                      regenerators" when no value of `lambda_regen` under an
-                      L1-on-mass penalty ever could. Supplied by
-                      `RegenPlacement.count_penalty()`; compute_loss does not
-                      branch on the gate itself.
 
     Returns:
         (total_loss, metrics_dict). `metrics["shortfalls"]` is a detached
         (num_demands,) tensor indexed by `Demand.id`, to be fed straight into
         `update_duals` after the optimizer step.
     """
-    device = regen_probs.device
+    device = duals.device
 
     # Start as zero tensors (not float 0) so the graph is valid even when
     # all demands are feasible and no shortfall terms are added.
@@ -126,10 +128,6 @@ def compute_loss(
             num_infeasible += 1
         worst_margin_db = min(worst_margin_db, margin)
 
-    regen_loss = (
-        regen_probs.sum() if regen_count_penalty is None else regen_count_penalty
-    )
-
     # sum() over dict values — each is a scalar tensor live in the autograd graph.
     # Seed with a zero tensor so an empty demand list still yields a tensor
     # (bare sum() returns int 0, and .item() below would then raise).
@@ -137,20 +135,20 @@ def compute_loss(
 
     total = (
         weighted_feasibility
-        + lambda_regen * regen_loss
+        + lambda_dev * device_count
         + lambda_cost * path_noise_loss
     )
 
     metrics = {
         "feasibility_loss": feasibility_loss.item(),
         "weighted_feasibility_loss": weighted_feasibility.item(),
-        "regen_loss": regen_loss.item(),
         "path_noise_loss": path_noise_loss.item(),
-        # (regen_probs > 0.5) is exactly (regen_logits > 0) for any tau > 0,
-        # since sigmoid is monotone and sigmoid(0) = 0.5 — so this count is
-        # tau-invariant and safe to compare across an annealing run, unlike
-        # regen_loss (87% of whose observed 66 -> 18 fall came from tau).
-        "num_regen_soft": int((regen_probs > 0.5).sum().item()),
+        # The soft (mean-field) device count. NOT tau-invariant the way the
+        # old num_regen_soft was — sigmoid(score/tau) moves with tau even on
+        # frozen scores — so this is a within-epoch diagnostic only. The
+        # cross-epoch comparison belongs to train.py's hard_num_devices,
+        # which is a count of actual decisions and has no tau in it.
+        "device_count": float(device_count.item()),
         "num_infeasible": num_infeasible,
         "num_violated": num_violated,
         "worst_margin_db": worst_margin_db if demands else math.nan,

@@ -188,7 +188,7 @@ def test_gradient_flow_edge_weight_net():
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=alloc.site_view,
+        device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
@@ -216,7 +216,7 @@ def test_qot_frozen():
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=alloc.site_view,
+        device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
@@ -295,7 +295,7 @@ def test_loss_backward_no_nan():
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=alloc.site_view,
+        device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
@@ -381,7 +381,7 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
-        regen_probs=alloc.site_view, modulation_config=always_infeasible_cfg,
+        device_count=alloc.device_count, modulation_config=always_infeasible_cfg,
         duals=torch.ones(1),
     )
     loss.backward()
@@ -419,7 +419,7 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
         path_noise_costs, gsnr_preds, _, alloc = pipeline([demand], lambda_=5.0)
         loss, _ = compute_loss(
             gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
-            regen_probs=alloc.site_view, modulation_config=always_infeasible_cfg,
+            device_count=alloc.device_count, modulation_config=always_infeasible_cfg,
             duals=torch.ones(1),
         )
         loss.backward()
@@ -654,7 +654,7 @@ def test_scale_direction_gradient_is_zero():
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=alloc.site_view,
+        device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
@@ -700,7 +700,7 @@ def test_total_loss_invariant_to_edge_weight_scale():
                 gsnr_preds=gsnr_preds,
                 path_noise_costs=path_noise_costs,
                 demands=demands,
-                regen_probs=alloc.site_view,
+                device_count=alloc.device_count,
                 modulation_config=mod_cfg,
                 duals=torch.ones(len(demands)),
             )
@@ -880,7 +880,7 @@ def test_edge_weights_do_not_collapse_over_training():
             gsnr_preds=gsnr_preds,
             path_noise_costs=path_noise_costs,
             demands=demands,
-            regen_probs=alloc.site_view,
+            device_count=alloc.device_count,
             modulation_config=mod_cfg,
             duals=torch.ones(len(demands)),
         )
