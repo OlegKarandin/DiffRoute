@@ -88,7 +88,17 @@ def _spearman(a: torch.Tensor, b: torch.Tensor) -> float:
     simplification plain argsort makes — rather than proper tie-corrected
     (averaged) ranking; acceptable here since this is a diagnostic, not a
     statistic anything downstream reads.
+
+    Degenerate input (a or b constant) is checked on the SOURCE values,
+    before ranking: double-argsort always yields a full 0..n-1 permutation
+    even when the underlying values are all tied, so a post-ranking
+    zero-variance check would never fire — it would silently report a
+    "perfect" correlation for a constant input instead of nan.
     """
+    if a.numel() > 0 and (a.max() == a.min()).item():
+        return float("nan")
+    if b.numel() > 0 and (b.max() == b.min()).item():
+        return float("nan")
     a_rank = torch.argsort(torch.argsort(a)).float()
     b_rank = torch.argsort(torch.argsort(b)).float()
     a_c = a_rank - a_rank.mean()

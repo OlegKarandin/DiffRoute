@@ -29,7 +29,7 @@ import pytest
 from diffopt.demands import Demand
 from diffopt.loss import compute_loss
 from diffopt.modulation import ModulationConfig
-from diffopt.pipeline import DiffONetPipeline, segment_path
+from diffopt.pipeline import DiffONetPipeline, _spearman, segment_path
 from diffopt.placement.allocation import AllocationHead
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
@@ -1312,3 +1312,18 @@ def test_proxy_qot_rank_correlation_is_reported():
     pipeline = make_pipeline(topology)
     _, _, _, alloc = pipeline(make_demands())
     assert -1.0 <= alloc.proxy_qot_rank_corr <= 1.0
+
+
+def test_spearman_returns_nan_on_constant_input():
+    """Double-argsort always yields a full 0..n-1 permutation, even when the
+    underlying values are all tied — so a post-ranking zero-variance check
+    never fires. Without a pre-ranking guard on the source values, a
+    constant proxy (e.g. an ASE noise floor) against a varying qot_gsnr
+    would report a 'perfect' 1.0 correlation instead of nan, which is
+    exactly backwards for a diagnostic meant to flag disagreement."""
+    import math
+
+    a = torch.tensor([5.0, 5.0, 5.0, 5.0])
+    b = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    assert math.isnan(_spearman(a, b))
+    assert math.isnan(_spearman(b, a))
