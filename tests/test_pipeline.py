@@ -831,19 +831,30 @@ def test_edge_weights_do_not_collapse_over_training():
     # lr=0.1 / 200 steps *explodes* the raw median weight ~150x even on the
     # healthy, committed pipeline.py on this 5-edge toy fixture -- the
     # fixture is small enough that an aggressive optimizer setting
-    # overwhelms any signal from the correction-#9 fix either way. Swept
-    # lr in {0.01, 0.02, 0.03, 0.05} x steps in {50, 100, 200}: lr=0.01/50
-    # steps is the combination where the healthy pipeline's raw median
-    # weight stays close to its starting value (ratio ~1.01, comfortably
-    # inside the 2x band below), while reverting correction #9's
-    # divisor-detach fix in pipeline.py (`.mean().clamp_min(1e-12)` ->
-    # `.mean().clamp_min(1e-12).detach()`) collapses the same measurement
-    # by ~20 orders of magnitude (7.1e-01 -> 3.5e-20) in the same 50 steps
-    # -- an unambiguous discriminator, not a coin flip. Verified by hand:
+    # overwhelms any signal from the correction-#9 fix either way. Original
+    # tuning (pre approach-A) swept lr in {0.01, 0.02, 0.03, 0.05} x steps
+    # in {50, 100, 200} against edge features built from regen_probs at
+    # each edge's endpoints; lr=0.01/50 steps was the pick there.
+    #
+    # Approach A (static is_candidate columns replacing regen_probs, see
+    # pipeline.py __init__) changed this fixture's input distribution to
+    # EdgeWeightNet: RegenPlacement's fresh logits are all zero, so
+    # regen_probs was 0.5/0.5 on every edge at init -- a constant that
+    # carried no edge-discriminating signal. is_candidate is exactly 0 or 1
+    # per endpoint and does vary by edge (hub topology's node 3 is the only
+    # candidate), so it is real per-edge signal from step 1, and the same
+    # lr=0.01/50 steps now genuinely explodes the healthy pipeline (~17x,
+    # not a bug -- more informative input drives bigger early gradients).
+    # Re-swept lr in {0.0035, 0.004, 0.0045} x steps in {26, 28, 30, 32,
+    # 34}: lr=0.004/30 steps keeps the healthy pipeline's ratio at ~1.76
+    # (inside the 2x band below) while reverting correction #9's
+    # divisor-detach fix (`.mean().clamp_min(1e-12)` ->
+    # `.mean().clamp_min(1e-12).detach()`) still drives the same
+    # measurement down to ratio ~0.41 (outside the 0.5x band) in the same
+    # 30 steps -- still an unambiguous discriminator. Verified by hand:
     # mutate pipeline.py that one line, `pytest -k collapse` fails with
-    # exactly that number, `git checkout -- diffopt/pipeline.py`, passes
-    # again.
-    optimizer = torch.optim.Adam(pipeline.edge_weight_net.parameters(), lr=0.01)
+    # ratio ~0.41, `git checkout -- diffopt/pipeline.py`, passes again.
+    optimizer = torch.optim.Adam(pipeline.edge_weight_net.parameters(), lr=0.004)
 
     demands = [
         Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
@@ -853,19 +864,21 @@ def test_edge_weights_do_not_collapse_over_training():
     def median_raw_weight() -> float:
         """Median of EdgeWeightNet's RAW output — the quantity that collapsed.
         Measured pre-normalisation, since the unit-mean division would hide
-        any scale drift by construction."""
+        any scale drift by construction.
+
+        Edge features are static (approach A) and no longer depend on
+        regen_probs, so this reads pipeline._static_edge_features directly
+        instead of rebuilding features from a live regen_probs call — that
+        would measure a different function than the one actually trained
+        below."""
         with torch.no_grad():
-            regen_probs = pipeline.regen_placement.get_regen_probs(1.0)
-            feats = torch.cat([
-                pipeline._topo_edge_features,
-                regen_probs[pipeline._edge_src_ids].unsqueeze(1),
-                regen_probs[pipeline._edge_dst_ids].unsqueeze(1),
-            ], dim=1)
-            return pipeline.edge_weight_net(feats).squeeze(-1).median().item()
+            return pipeline.edge_weight_net(
+                pipeline._static_edge_features
+            ).squeeze(-1).median().item()
 
     before = median_raw_weight()
 
-    for _ in range(50):
+    for _ in range(30):
         optimizer.zero_grad()
         path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
         loss, _ = compute_loss(
@@ -884,7 +897,7 @@ def test_edge_weights_do_not_collapse_over_training():
     assert before > 0.0, "degenerate fixture: initial median weight is zero"
     assert after > before / 2.0, (
         f"median raw edge weight collapsed {before:.6e} -> {after:.6e} "
-        f"({before / max(after, 1e-30):.2e}x) over 50 steps at lr=0.01"
+        f"({before / max(after, 1e-30):.2e}x) over 30 steps at lr=0.004"
     )
     assert after < before * 2.0, (
         f"median raw edge weight exploded {before:.6e} -> {after:.6e}"
@@ -1212,3 +1225,36 @@ def test_pipeline_handles_an_empty_demand_list():
 
     assert costs == {} and gsnr == {} and indicators == {}
     assert probs.shape == (topology.num_nodes,)
+
+
+# ---------------------------------------------------------------------------
+# Approach A: the edge features are entirely static
+# ---------------------------------------------------------------------------
+
+def test_edge_features_are_static_and_carry_candidate_indicators():
+    """Spec decision 5. The last two columns are is_candidate at each
+    endpoint — indicators, not probabilities, and not learned."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    feats = pipeline._static_edge_features
+    assert feats.shape == (len(topology.undirected_edges), 7)
+    assert not feats.requires_grad
+
+    candidates = set(topology.regen_candidate_nodes)
+    for eid, edge in enumerate(topology.undirected_edges):
+        assert feats[eid, 5].item() == pytest.approx(float(edge.src in candidates))
+        assert feats[eid, 6].item() == pytest.approx(float(edge.dst in candidates))
+
+
+@pytest.mark.xfail(reason="allocation_head lands in Task 4", strict=True)
+def test_edge_features_do_not_move_when_the_allocation_head_moves():
+    """The circularity is gone: no learned quantity reaches the router's
+    input. This is what makes approach A permanent rather than a tuning
+    choice — see spec section 5 for why B and C were rejected."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    before = pipeline._static_edge_features.clone()
+    with torch.no_grad():
+        for p in pipeline.allocation_head.parameters():
+            p.add_(torch.randn_like(p))
+    assert torch.equal(pipeline._static_edge_features, before)

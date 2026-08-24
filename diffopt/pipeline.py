@@ -150,18 +150,49 @@ class DiffONetPipeline(nn.Module):
         # instead of dividing by ~0. Constant columns are deliberately NOT
         # dropped — they are constant on ind_132, not in general, and
         # dropping them would break mixed-fiber-type topologies.
+        edge_index = topology.edge_index                           # (2, E)
+
         raw_topo_edge_features = topology.get_edge_features()       # (E, 5)
         feat_mean = raw_topo_edge_features.mean(dim=0, keepdim=True)             # (1, 5)
         feat_std = raw_topo_edge_features.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-8)
         topo_edge_features = (raw_topo_edge_features - feat_mean) / feat_std
 
-        edge_index = topology.edge_index                           # (2, E)
         self.register_buffer("_topo_feat_mean", feat_mean)
         self.register_buffer("_topo_feat_std", feat_std)
         self.register_buffer("_topo_edge_features", topo_edge_features)
         self.register_buffer("_edge_index", edge_index)
         self.register_buffer("_edge_src_ids", edge_index[0])       # (E,)
         self.register_buffer("_edge_dst_ids", edge_index[1])       # (E,)
+
+        # Spec decision 5, "approach A": the two trailing columns are STATIC
+        # `is_candidate` indicators, not the learned regenerator
+        # probabilities they replace.
+        #
+        # Before this, regen_probs fed EdgeWeightNet at both endpoints of
+        # every edge, so the router's input moved whenever the placement head
+        # moved and vice versa. That loop is why a non-candidate logit could
+        # pick up feasibility signal at all (train.py's num_regen_noncand
+        # warning), and under per-demand allocation there is no per-node
+        # probability to feed it anyway.
+        #
+        # The structural signal approaches B and C were meant to supply
+        # already exists and is computed exactly: Vlastelica's backward
+        # perturbs the weights by lambda * grad_output and RE-SOLVES with
+        # SPFA (surrogate.py:56-88). Since grad_output now carries the device
+        # term, that re-solve is literally searching for a route that needs
+        # fewer regenerators, including one through a different candidate
+        # set. See spec section 5.
+        is_candidate = torch.zeros(topology.num_nodes)
+        is_candidate[list(topology.regen_candidate_nodes)] = 1.0
+        static_edge_features = torch.cat(
+            [
+                topo_edge_features,
+                is_candidate[edge_index[0]].unsqueeze(1),
+                is_candidate[edge_index[1]].unsqueeze(1),
+            ],
+            dim=1,
+        )
+        self.register_buffer("_static_edge_features", static_edge_features)
 
         if edge_ase_noise is None:
             edge_ase_noise = compute_edge_ase_noise(topology)
@@ -358,12 +389,8 @@ class DiffONetPipeline(nn.Module):
             else:
                 regen_probs_physics = regen_probs
 
-        # 2. Build (E, 7) edge features: topology cols + regen probs at endpoints
-        edge_feats = torch.cat([
-            self._topo_edge_features,
-            regen_probs_physics[self._edge_src_ids].unsqueeze(1),
-            regen_probs_physics[self._edge_dst_ids].unsqueeze(1),
-        ], dim=1)
+        # 2. Edge features — static, built once in __init__ (approach A).
+        edge_feats = self._static_edge_features
 
         # 3. Edge weights via EdgeWeightNet — (E,), strictly positive via
         # Softplus, then renormalised to unit mean.

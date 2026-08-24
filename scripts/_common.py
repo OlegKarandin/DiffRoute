@@ -297,11 +297,14 @@ def fixed_traffic_demands(ctx: DiagContext) -> Tuple[List[Demand], List[Tuple[De
 # ---------------------------------------------------------------------------
 
 def edge_weights_of(ctx: DiagContext, tau: float, *, normalised: bool = True) -> torch.Tensor:
-    """The (E,) edge-weight tensor for the current pipeline state at
-    regen-decision temperature `tau`, mirroring `pipeline.forward`'s steps
-    1-3 exactly:
-    regen probabilities -> concatenated edge features -> EdgeWeightNet ->
-    unit-mean renormalisation.
+    """The (E,) edge-weight tensor for the current pipeline state, mirroring
+    `pipeline.forward`'s steps 2-3 exactly: static edge features (approach
+    A) -> EdgeWeightNet -> unit-mean renormalisation.
+
+    `tau` is accepted but no longer affects the result: edge features are a
+    static buffer built once in `DiffONetPipeline.__init__` (no
+    regen-probability columns to temperature-scale any more) — kept in the
+    signature so every existing call site keeps working unchanged.
 
     `normalised=True` (default) is what `pipeline.forward` actually routes
     on (correction #9's unit-mean renormalisation, undetached divisor) —
@@ -334,13 +337,12 @@ def edge_weights_of(ctx: DiagContext, tau: float, *, normalised: bool = True) ->
     """
     with torch.no_grad():
         pipe = ctx.pipeline
-        regen_probs = pipe.regen_placement.get_regen_probs(tau)
-        edge_feats = torch.cat([
-            pipe._topo_edge_features,
-            regen_probs[pipe._edge_src_ids].unsqueeze(1),
-            regen_probs[pipe._edge_dst_ids].unsqueeze(1),
-        ], dim=1)
-        raw = pipe.edge_weight_net(edge_feats).squeeze(-1)
+        # Edge features are static (approach A, pipeline.py __init__) and no
+        # longer depend on regen_probs/tau — read the buffer pipeline.forward
+        # actually uses instead of rebuilding from a live regen_probs call,
+        # which would silently drift from what forward() computes (this is
+        # exactly the class of bug this module's docstring warns about).
+        raw = pipe.edge_weight_net(pipe._static_edge_features).squeeze(-1)
         if not normalised:
             return raw
         return raw / raw.mean().clamp_min(1e-12)
