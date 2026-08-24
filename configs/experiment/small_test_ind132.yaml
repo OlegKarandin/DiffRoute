@@ -43,11 +43,28 @@ dataset_dir: data/datasets/ind_132
 qot_checkpoint: checkpoints/best_qot.pt
 
 pipeline:
-  lambda_dev: 1.0          # PLACEHOLDER — Task 9 replaces this with the
-                           # calibrated value. 1.0 is the old lambda_regen
-                           # and is certainly wrong: the quantity it
-                           # multiplies grew from ~1e1 (sites) to ~1e2-1e3
-                           # (devices).
+  lambda_dev: 0.11         # MEASURED 2026-08-24 by
+                           # scripts/calibrate_lambda_dev.py --config
+                           # configs/experiment/constrained_stress.yaml.
+                           # Measured, not swept and not inherited: the old
+                           # lambda_regen 1.0 priced ~1e1 SITES, this prices
+                           # ~1e2-1e3 DEVICES, so it is a different problem.
+                           #   feasibility push ||dL/dw||_1 = 3.24e+03
+                           #                    (at dual_init = 10.0)
+                           #   device push      ||dL/dw||_1 = 2.87e+03
+                           #                    (at lambda_dev = 1.0)
+                           # The two forces are already near parity at unit
+                           # lambda, so landing the device push at 10-20% of
+                           # feasibility gives the band [0.11, 0.23] — an
+                           # order of magnitude BELOW the old value, not
+                           # above it.
+                           # DECIDED BY check 1, the force-ratio band's lower
+                           # edge. Check 2 (flip time) AGREED rather than
+                           # overriding: at 0.11 the first device is
+                           # recruited at epoch 3 of a 20-epoch trial, inside
+                           # its epochs/4 budget, so no below-band override
+                           # was needed. Re-run the script if the physics,
+                           # the topology or dual_init changes.
   lambda_cost: 0.01
   channel_loading_fraction: 0.5
 
