@@ -169,9 +169,21 @@ class AllocationHead(nn.Module):
             max_chunk = torch.maximum(max_chunk, c)
 
             n_next = n[:, k + 1]
-            g_k = -10.0 * torch.log10(c + _EPS)
+            # The carry enters the features as an OBSERVATION, never as a
+            # differentiable function of this head's own earlier decisions.
+            # Undetached, d a_{k+1} / d a_k runs through -10 log10(c) and is
+            # both huge (c_k / c_{k+1} ~ 1e2-1e3 right after a cut) and
+            # sign-indefinite, which breaks "regen helps" (invariants.md) at
+            # the level of the head's parameters: measured on
+            # constrained_stress's epoch-35 checkpoint, d(device_count)/d(bias)
+            # swings -3317 .. +1163 across a 0.002-wide window in that one
+            # parameter -- i.e. lambda_dev rewarding MORE devices -- where the
+            # detached value is a steady +89 .. +92. Forward values are
+            # unchanged; c = c * (1 - a_phys) below stays live physics.
+            cd = c.detach()
+            g_k = -10.0 * torch.log10(cd + _EPS)
             g_next = -10.0 * torch.log10(n_next + _EPS)
-            g_after = -10.0 * torch.log10(c + n_next + _EPS)
+            g_after = -10.0 * torch.log10(cd + n_next + _EPS)
 
             feats = torch.stack(
                 [
