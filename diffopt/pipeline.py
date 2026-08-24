@@ -508,13 +508,18 @@ class DiffONetPipeline(nn.Module):
                 for row, i in enumerate(miss_positions):
                     cache[(seg_keys[i], batch_max_spans)] = miss_gsnr[row]
 
-                if len(self._segment_gsnr_cache) > _SEGMENT_GSNR_CACHE_MAX:
-                    self._segment_gsnr_cache.clear()
-
             batched_qot_gsnr = torch.tensor(
                 [cache[(key, batch_max_spans)] for key in seg_keys],
                 dtype=torch.float32, device=device,
             )
+
+            # Cache eviction: check size after building batched_qot_gsnr (not
+            # before) to avoid clearing entries we just read. The read at
+            # batched_qot_gsnr construction uses cache[(key, batch_max_spans)]
+            # for every key in seg_keys; only after that read completes is it
+            # safe to evict.
+            if len(self._segment_gsnr_cache) > _SEGMENT_GSNR_CACHE_MAX:
+                self._segment_gsnr_cache.clear()
         else:
             batched_qot_gsnr = torch.zeros(0, device=device)
 

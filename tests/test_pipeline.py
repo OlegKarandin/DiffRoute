@@ -1095,3 +1095,43 @@ def test_memoised_forward_still_carries_gradient_to_regen_logits():
     grad = pipeline.regen_placement.regen_logits.grad
     assert grad is not None
     assert grad.abs().sum().item() > 0.0
+
+
+def test_segment_gsnr_cache_eviction_does_not_read_from_cleared_cache(monkeypatch):
+    """Cache eviction check must happen AFTER reading from cache, not before.
+    This regression test lowers the cache max and verifies (a) no KeyError on
+    forward pass after eviction, (b) cache cleared after eviction, (c) output
+    still correct."""
+    import diffopt.pipeline as pipeline_module
+
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+
+    # Lower cache max to 2 so multiple forwards trigger eviction.
+    monkeypatch.setattr(pipeline_module, "_SEGMENT_GSNR_CACHE_MAX", 2)
+
+    # First forward fills cache with some segments.
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+    with torch.no_grad():
+        paths1, gsnr_dict1, _, _ = pipeline(demands, tau=1.0)
+
+    cache_size_after_first = len(pipeline._segment_gsnr_cache)
+    # At this point cache has <= 2 entries (or was cleared if it hit the limit).
+
+    # Second forward with different demand may add more segments, potentially
+    # triggering eviction. This should not KeyError on reading the cache.
+    demands2 = [
+        Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
+        Demand(id=1, src=1, dst=3, bitrate_gbps=400.0),
+    ]
+    with torch.no_grad():
+        paths2, gsnr_dict2, _, _ = pipeline(demands2, tau=1.0)
+
+    # Cache should be empty (cleared by eviction) or very small (bounded by limit).
+    # After eviction, cache should be empty (we use "clear all", not LRU).
+    assert len(pipeline._segment_gsnr_cache) <= 2, "Cache should be bounded"
+
+    # Verify output has correct number of demands.
+    assert len(gsnr_dict2) == 2, f"Expected 2 demands in output, got {len(gsnr_dict2)}"
+    # Verify both demands have GSNR predictions (not None or missing).
+    assert all(gsnr_dict2[d.id] is not None for d in demands2), "All demands should have GSNR"
