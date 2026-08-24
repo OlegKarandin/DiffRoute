@@ -115,6 +115,14 @@ training:
   vlastelica_lambda_min: 1.0
   vlastelica_lambda_decay: 0.995
   alloc_tau_start: 1.0
-  alloc_tau_end: 0.1
+  # tau_end was 0.1 and the anneal ended at epoch 40 -- the same pair that
+  # collapsed training on constrained_stress's 60-epoch run (irreversible
+  # float32 sigmoid underflow once scores drift past the tau=0.1 usable band
+  # of |s| < 0.5). Propagated here unchanged, since this config shares that
+  # config's exact epochs_e2e (60) and original anneal window (10/40). See
+  # docs/investigations/open_followups.md, "Stage II acceptance run", and
+  # .superpowers/sdd/2026-08-24-per-demand-allocation-head/task12-investigation.md
+  # (fix B).
+  alloc_tau_end: 0.3
   alloc_tau_anneal_start_epoch: 10
-  alloc_tau_anneal_end_epoch: 40
+  alloc_tau_anneal_end_epoch: 55   # companion to tau_end, same reasoning
