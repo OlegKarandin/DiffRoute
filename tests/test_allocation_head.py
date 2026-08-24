@@ -178,3 +178,35 @@ def test_rollout_is_differentiable_in_seg_noise():
     total_device_cost(a).backward()
     assert seg_noise.grad is not None
     assert seg_noise.grad.abs().sum().item() > 0
+
+
+def test_first_segment_has_no_device_gradient_because_the_carry_is_detached():
+    """Pins the carry detach (invariants.md, "regen helps is a property of the
+    FOLD"). seg_noise column 0 is the ONE column whose only route into any
+    score is through the carry: at k=0 the features read c (= n[:,0]) and
+    n_next (= n[:,1]), and column 0 never appears as an n_next or a seg_km
+    anywhere. So with `cd = c.detach()` its device-count gradient is EXACTLY
+    zero, while every later column keeps a live path.
+
+    This is the discriminator the sum-over-everything assertion in
+    test_rollout_is_differentiable_in_seg_noise cannot make: reverting the fix
+    to `cd = c` leaves that test — and the whole 306-test suite — green, but
+    turns this column nonzero.
+    """
+    torch.manual_seed(0)
+    head = AllocationHead()
+    with torch.no_grad():
+        head.net[-1].weight.normal_(std=0.5)
+    seg_noise = (torch.rand(3, 5) + 0.01).requires_grad_(True)
+    a, _ = head.rollout(
+        seg_noise, torch.rand(3, 5) * 100,
+        torch.full((3,), 9.5), torch.full((3,), 5, dtype=torch.long),
+    )
+    total_device_cost(a).backward()
+
+    assert seg_noise.grad is not None
+    # The carry-only column: exactly 0, not merely small.
+    assert seg_noise.grad[:, 0].abs().sum().item() == 0.0
+    # ...and the fix must not have killed route-differentiability outright:
+    # the later columns still reach the score via g_next / g_after's n_next.
+    assert seg_noise.grad[:, 1:].abs().sum().item() > 0
