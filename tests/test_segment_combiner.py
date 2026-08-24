@@ -33,6 +33,7 @@ from diffopt.qot.segment_combiner import (
     MAX_EXACT_FOLD_SEGMENTS,
     SegmentCombiner,
     _expected_max_chunk_noise,
+    _expected_max_chunk_noise_batched,
     db_to_linear_noise,
     linear_noise_to_db,
 )
@@ -857,4 +858,142 @@ def test_gradients_are_location_aware_not_shared_across_boundaries():
         f"boundaries at different structural positions should get distinct "
         f"gradients even though both have p=0.4: got {grad_b0:.8f} vs "
         f"{grad_b3:.8f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batched fold
+# ---------------------------------------------------------------------------
+
+def _ragged_case():
+    """Four demands of 1, 2, 3 and 5 segments -- deliberately ragged, and
+    deliberately not all the same GSNR, so padding that leaked between rows
+    would change a value rather than cancel."""
+    gsnrs = [[21.0], [26.0, 24.0], [18.0, 26.0, 22.5], [26.0, 26.0, 19.0, 23.0, 25.5]]
+    probs = [[], [0.4], [0.7, 0.25], [0.5, 0.1, 0.9, 0.35]]
+    return gsnrs, probs
+
+
+def _pack(gsnrs, probs, requires_grad=False):
+    """Pack ragged python lists into the (D, J) / (D, J-1) / (D,) triple."""
+    d = len(gsnrs)
+    j = max(len(g) for g in gsnrs)
+    g_mat = torch.zeros(d, j, dtype=torch.float32)
+    p_mat = torch.zeros(d, max(j - 1, 0), dtype=torch.float32)
+    counts = torch.tensor([len(g) for g in gsnrs], dtype=torch.long)
+    for row, (g, p) in enumerate(zip(gsnrs, probs)):
+        g_mat[row, : len(g)] = torch.tensor(g)
+        if p:
+            p_mat[row, : len(p)] = torch.tensor(p)
+    g_mat.requires_grad_(requires_grad)
+    p_mat.requires_grad_(requires_grad)
+    return g_mat, p_mat, counts
+
+
+def test_batched_fold_matches_the_per_demand_loop_on_ragged_input():
+    """The load-bearing equivalence. 1e-6 dB is five orders below the QoT
+    model's 0.1909 dB val RMSE and six below the 0.5 dB constraint margin;
+    the two paths differ only in float64 reduction order over
+    exactly-zero padding."""
+    combiner = SegmentCombiner()
+    gsnrs, probs = _ragged_case()
+
+    batched = combiner.forward_batched(*_pack(gsnrs, probs))
+    looped = torch.stack([
+        combiner([t(v) for v in g], [t(v) for v in p])
+        for g, p in zip(gsnrs, probs)
+    ])
+
+    assert batched.shape == (4,)
+    assert torch.allclose(batched, looped, atol=1e-6)
+
+
+def test_batched_fold_does_not_leak_padding_between_demands():
+    """The 1-segment demand batched next to a 5-segment one must give the
+    same answer as that demand alone."""
+    combiner = SegmentCombiner()
+    gsnrs, probs = _ragged_case()
+
+    together = combiner.forward_batched(*_pack(gsnrs, probs))
+    alone = combiner.forward_batched(*_pack(gsnrs[:1], probs[:1]))
+
+    assert torch.allclose(together[:1], alone, atol=1e-6)
+
+
+def test_batched_fold_single_segment_demand_is_its_own_gsnr():
+    """A demand padded from 1 real segment up to J must reduce to
+    -10*log10(noise) of that one segment -- the same value forward()'s
+    num_segments == 1 early return gives."""
+    combiner = SegmentCombiner()
+    out = combiner.forward_batched(*_pack([[21.0], [26.0, 24.0, 22.0]], [[], [0.5, 0.5]]))
+    assert out[0].item() == pytest.approx(21.0, abs=1e-4)
+
+
+def test_batched_fold_with_no_boundaries_at_all():
+    """J == 1: the boundary loop never runs and boundary_probs is (D, 0).
+    No NaN, no special case."""
+    combiner = SegmentCombiner()
+    out = combiner.forward_batched(*_pack([[21.0], [17.5]], [[], []]))
+    assert torch.isfinite(out).all()
+    assert out[1].item() == pytest.approx(17.5, abs=1e-4)
+
+
+def test_batched_fold_gradient_matches_the_per_demand_loop():
+    """Elementwise on the boundary probabilities, which is what the
+    placement head learns through."""
+    combiner = SegmentCombiner()
+    gsnrs, probs = _ragged_case()
+
+    g_mat, p_mat, counts = _pack(gsnrs, probs, requires_grad=True)
+    combiner.forward_batched(g_mat, p_mat, counts).sum().backward()
+
+    for row, (g, p) in enumerate(zip(gsnrs, probs)):
+        for col, value in enumerate(p):
+            scalar_p = t(value, requires_grad=True)
+            boundaries = [t(v) for v in p]
+            boundaries[col] = scalar_p
+            combiner([t(v) for v in g], boundaries).backward()
+            assert p_mat.grad[row, col].item() == pytest.approx(
+                scalar_p.grad.item(), abs=1e-6
+            )
+
+
+def test_batched_fold_puts_no_gradient_on_the_padding():
+    """Padded entries are masked to exactly 0 before the DP sees them, so
+    they must be gradient-dead. A nonzero grad here means the mask was
+    applied after the fold instead of before, and the value is wrong too."""
+    combiner = SegmentCombiner()
+    gsnrs, probs = _ragged_case()
+    g_mat, p_mat, counts = _pack(gsnrs, probs, requires_grad=True)
+
+    combiner.forward_batched(g_mat, p_mat, counts).sum().backward()
+
+    for row, count in enumerate(counts.tolist()):
+        assert torch.all(g_mat.grad[row, count:] == 0.0)
+        assert torch.all(p_mat.grad[row, max(count - 1, 0):] == 0.0)
+
+
+def test_batched_fold_rejects_a_batch_over_the_segment_cap():
+    """The cap now applies to the BATCH maximum, because every demand is
+    padded to it. The message must say so -- otherwise someone reads
+    'this path has 129 segments' and goes looking for a 129-segment demand
+    that does not exist."""
+    combiner = SegmentCombiner()
+    j = MAX_EXACT_FOLD_SEGMENTS + 1
+    with pytest.raises(ValueError, match="BATCH maximum"):
+        combiner.forward_batched(
+            torch.full((2, j), 20.0),
+            torch.full((2, j - 1), 0.5),
+            torch.tensor([j, 2], dtype=torch.long),
+        )
+
+
+def test_scalar_dp_entry_point_is_a_d1_slice_of_the_batched_kernel():
+    """There is one implementation of the recurrence. This pins that."""
+    n = db_to_linear_noise(torch.tensor([12.0, 22.0, 9.0, 18.0]).double())
+    p = torch.tensor([0.2, 0.6, 0.4]).double()
+
+    assert torch.equal(
+        _expected_max_chunk_noise(n, p),
+        _expected_max_chunk_noise_batched(n.unsqueeze(0), p.unsqueeze(0))[0],
     )

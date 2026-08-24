@@ -82,15 +82,18 @@ import torch.nn as nn
 # one of the ~N-1 loop iterations' intermediates (U, g_b, and the concat
 # result) stays live in the graph until `.backward()` is called, so the
 # retained graph is roughly 2*N^4 bytes per call — about 1.1 GB at the
-# 128-segment cap, not 8 MB. `diffopt/train.py` calls `.backward()` once per
-# demand, so exactly one such graph is held at a time per demand during
-# training (not accumulated across the batch). At real topology path
-# lengths — 16-19 segments (ind_132's km-shortest paths — see
-# docs/investigations/fold_formula_scalability.md) — 2*N^4 is a few hundred
-# KB, so a few hundred demands' worth totals well under 100 MB: not a
-# problem in practice. But before raising MAX_EXACT_FOLD_SEGMENTS, redo this
-# estimate — the O(N^4) retained-graph cost, not the O(N^3) output size, is
-# what will actually bite.
+# 128-segment cap, not 8 MB. `diffopt/train.py:373` calls `.backward()` once
+# per EPOCH over the whole demand set, so all D of these graphs are live
+# simultaneously — the per-call figure must be multiplied by the demand
+# count, not treated as a peak. `forward_batched` pays this as one (D, R, J)
+# working set padded to the batch's longest demand: about 2x the total at
+# ind_132 scale, in exchange for J-1 interpreter steps instead of
+# sum_d (N_d - 1). At real topology path lengths — 16-19 segments (ind_132's
+# km-shortest paths — see docs/investigations/fold_formula_scalability.md)
+# — 2*N^4 is a few hundred KB, so a few hundred demands' worth totals well
+# under 100 MB: not a problem in practice. But before raising
+# MAX_EXACT_FOLD_SEGMENTS, redo this estimate — the O(N^4) retained-graph
+# cost, not the O(N^3) output size, is what will actually bite.
 MAX_EXACT_FOLD_SEGMENTS = 128
 
 
@@ -145,49 +148,92 @@ def soft_max(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.5) -> torc
     return m * t * torch.logsumexp(stacked, dim=0)
 
 
-def _expected_max_chunk_noise(n: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-    """Exact E[max over chunks] for independent Bernoulli(p) boundary cuts.
+def _expected_max_chunk_noise_batched(
+    n: torch.Tensor, p: torch.Tensor
+) -> torch.Tensor:
+    """Exact E[max over chunks] for a BATCH of paths.
 
-    `n` is the (N,) vector of per-segment linear noises, `p` the (N-1,)
-    vector of per-boundary cut probabilities. Implements the module
-    docstring's dynamic program; returns a scalar tensor in `n`'s dtype.
+    `n` is `(D, J)` per-segment linear noises, `p` is `(D, J-1)` per-boundary
+    cut probabilities; returns `(D,)` in `n`'s dtype. Identical mathematics
+    to the module docstring's dynamic program, with the demand index riding
+    in front of the threshold batch dimension. This is the ONE
+    implementation of the recurrence — `_expected_max_chunk_noise` below is
+    a `D=1` slice of it.
 
     Gradient w.r.t. `n` flows solely through the sorted thresholds `tau`
     (`torch.sort` is a differentiable permutation); the `<=` comparisons are
     plain constants, which is exactly right — `F` is piecewise constant in
     `n` between thresholds, and `sum_r tau_r * (F_r - F_{r-1})` reproduces
     `E[d max / d n]` term by term.
+
+    PADDING CONTRACT — what makes ragged demands exact rather than
+    approximate. A demand with `N_d < J` real segments is padded with
+    segment noise EXACTLY 0 and boundary probability EXACTLY 0:
+
+    * `p_b == 0` at a padded boundary makes the appended `cut` column
+      exactly `0 * (...)`, so no partition cutting there carries weight, and
+      `u * (1 - p_b)` is an exact multiply by one. The realised chunking is
+      the real demand's chunking with zeros appended to its trailing chunk.
+    * Adding 0 does not change a chunk sum, so every threshold a padded
+      segment contributes either duplicates one already present or is 0. The
+      module docstring's undeduplicated-threshold argument then makes each
+      contribute `F(tau_r) - F(tau_{r-1}) = 0` — exactly zero, no tolerance.
+
+    Both halves need the padding to be EXACTLY zero. Do not pad with a small
+    epsilon "for safety": an epsilon probability makes padded cuts real, and
+    an epsilon noise makes the duplicate thresholds distinct.
     """
-    num_segments = n.shape[0]
+    num_demands, num_segments = n.shape
     dtype, device = n.dtype, n.device
 
-    # chunk_sums[j, i] = S(j, i) = n_j + ... + n_i, valid for j <= i.
+    # chunk_sums[d, j, i] = S(j, i) = n_j + ... + n_i, valid for j <= i.
     cumulative = torch.cat(
-        [torch.zeros(1, dtype=dtype, device=device), torch.cumsum(n, dim=0)]
+        [torch.zeros(num_demands, 1, dtype=dtype, device=device),
+         torch.cumsum(n, dim=1)],
+        dim=1,
+    )                                                              # (D, J+1)
+    chunk_sums = cumulative[:, 1:].unsqueeze(1) - cumulative[:, :-1].unsqueeze(2)
+
+    # Every value the max can take, ascending, per demand. Duplicates are
+    # kept on purpose (see the module docstring): they contribute exactly
+    # zero, which is also what carries the padding argument above.
+    upper = torch.triu(
+        torch.ones(num_segments, num_segments, dtype=torch.bool, device=device)
     )
-    chunk_sums = cumulative[1:].unsqueeze(0) - cumulative[:-1].unsqueeze(1)  # (N, N)
+    tau, _ = torch.sort(chunk_sums[:, upper], dim=1)   # (D, R), R = J(J+1)/2
 
-    # Every value the max can take, ascending. Duplicates are kept on
-    # purpose (see the module docstring): they contribute exactly zero.
-    upper = torch.triu(torch.ones(num_segments, num_segments, dtype=torch.bool, device=device))
-    tau, _ = torch.sort(chunk_sums[upper])  # (R,), R = N(N+1)/2
-
-    # U[:, j] = P(a cut sits immediately before segment j, every chunk left
-    # of it fits under tau, and no boundary since then has cut) — i.e. the
-    # still-open chunk currently starts at segment j.
-    u = torch.ones(tau.shape[0], 1, dtype=dtype, device=device)
+    # u[d, :, j] = P(a cut sits immediately before segment j, every chunk
+    # left of it fits under tau, and no boundary since then has cut).
+    u = torch.ones(num_demands, tau.shape[1], 1, dtype=dtype, device=device)
     for b in range(num_segments - 1):
         # Does the open chunk j..b still fit under each threshold?
-        fits = (chunk_sums[: b + 1, b].unsqueeze(0) <= tau.unsqueeze(1)).to(dtype)
-        cut = p[b] * (u * fits).sum(dim=1, keepdim=True)
-        u = torch.cat([u * (1.0 - p[b]), cut], dim=1)
+        fits = (chunk_sums[:, : b + 1, b].unsqueeze(1) <= tau.unsqueeze(2)).to(dtype)
+        p_b = p[:, b].view(num_demands, 1, 1)
+        cut = p_b * (u * fits).sum(dim=2, keepdim=True)
+        u = torch.cat([u * (1.0 - p_b), cut], dim=2)
 
-    # Final chunk j..N-1: no trailing cut to pay for.
-    fits = (chunk_sums[:, num_segments - 1].unsqueeze(0) <= tau.unsqueeze(1)).to(dtype)
-    cdf = (u * fits).sum(dim=1)  # F(tau_r)
+    # Final chunk j..J-1: no trailing cut to pay for.
+    fits = (
+        chunk_sums[:, :, num_segments - 1].unsqueeze(1) <= tau.unsqueeze(2)
+    ).to(dtype)
+    cdf = (u * fits).sum(dim=2)                                    # F(tau_r)
 
-    shifted = torch.cat([torch.zeros(1, dtype=dtype, device=device), cdf[:-1]])
-    return (tau * (cdf - shifted)).sum()
+    shifted = torch.cat(
+        [torch.zeros(num_demands, 1, dtype=dtype, device=device), cdf[:, :-1]],
+        dim=1,
+    )
+    return (tau * (cdf - shifted)).sum(dim=1)                      # (D,)
+
+
+def _expected_max_chunk_noise(n: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """Exact E[max over chunks] for one path: `(N,)` noises, `(N-1,)` probs.
+
+    Unchanged contract — tests and `scripts/diagnose_fold_error.py` import
+    this directly. It is now a `D=1` slice of
+    `_expected_max_chunk_noise_batched`, so there is exactly one place the
+    recurrence lives and the single-path tests exercise the batched kernel.
+    """
+    return _expected_max_chunk_noise_batched(n.unsqueeze(0), p.unsqueeze(0))[0]
 
 
 # ---------------------------------------------------------------------------
@@ -311,3 +357,88 @@ class SegmentCombiner(nn.Module):
             effective_noise = _expected_max_chunk_noise(n, p)
 
         return linear_noise_to_db(effective_noise).float()
+
+    def forward_batched(
+        self,
+        segment_gsnrs_db: torch.Tensor,
+        boundary_probs: torch.Tensor,
+        num_segments: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fold every demand's segments in one call.
+
+        Parameters
+        ----------
+        segment_gsnrs_db:
+            `(D, J)` float tensor; entry `[d, k]` is demand `d`'s `k`-th
+            segment GSNR in dB. Entries at or past `num_segments[d]` are
+            IGNORED — fill them with anything finite (`0.0` is
+            conventional); they are masked to noise 0 below.
+        boundary_probs:
+            `(D, J-1)` float tensor of regenerator probabilities. Entries at
+            or past `num_segments[d] - 1` are ignored and forced to exactly
+            0. Pass a `(D, 0)` tensor when `J == 1`.
+        num_segments:
+            `(D,)` long tensor, each entry in `[1, J]`.
+
+        Returns
+        -------
+        `(D,)` float32 end-to-end GSNR in dB, elementwise equal to calling
+        `forward()` once per demand on that demand's real segments.
+
+        Unlike `forward()` there is NO `is_hard` fast path. The DP is exact
+        at hard vertices too (docs/architecture/invariants.md, "Segment
+        combiner"), a batch is generally mixed, and branching per demand
+        would defeat the batching. The one consequence: a batch of
+        all-hard probabilities gets the DP's limiting gradient w.r.t. `p`
+        rather than `forward()`'s exact zero. Irrelevant for the callers
+        that pass hard probabilities — `train.py`'s hard_placement_metrics
+        and `traffic.preflight_filter` — both of which run under
+        `torch.no_grad()`.
+        """
+        if segment_gsnrs_db.dim() != 2:
+            raise ValueError(
+                f"segment_gsnrs_db must be (D, J), got "
+                f"{tuple(segment_gsnrs_db.shape)}"
+            )
+        num_demands, j = segment_gsnrs_db.shape
+        expected = (num_demands, max(j - 1, 0))
+        if tuple(boundary_probs.shape) != expected:
+            raise ValueError(
+                f"Expected boundary_probs of shape {expected}, got "
+                f"{tuple(boundary_probs.shape)}"
+            )
+        if num_segments.shape != (num_demands,):
+            raise ValueError(
+                f"Expected num_segments of shape {(num_demands,)}, got "
+                f"{tuple(num_segments.shape)}"
+            )
+        if j > MAX_EXACT_FOLD_SEGMENTS:
+            raise ValueError(
+                f"SegmentCombiner's exact fractional-probability fold is "
+                f"O(N^4) and is capped at {MAX_EXACT_FOLD_SEGMENTS} "
+                f"segments; this batch pads to {j}. The cap applies to the "
+                f"BATCH maximum, because every demand is padded up to the "
+                f"longest one — no single demand need be that long. Real "
+                f"topology paths measure 16-19 segments, see "
+                f"docs/investigations/fold_formula_scalability.md."
+            )
+
+        # Same clamp band as forward(); same float64 accumulation.
+        GSNR_MIN, GSNR_MAX = -5.0, 35.0
+        device = segment_gsnrs_db.device
+        positions = torch.arange(j, device=device)
+
+        seg_valid = (positions.unsqueeze(0) < num_segments.unsqueeze(1)).double()
+        # Multiply AFTER the dB->linear conversion so padded columns land on
+        # exactly 0 noise (and exactly 0 gradient) whatever dB value they
+        # happen to hold. Masking the dB value instead would need +inf.
+        n = db_to_linear_noise(
+            segment_gsnrs_db.clamp(GSNR_MIN, GSNR_MAX).double()
+        ) * seg_valid
+
+        bnd_valid = (
+            positions[: j - 1].unsqueeze(0) < (num_segments - 1).unsqueeze(1)
+        ).double()
+        p = boundary_probs.double() * bnd_valid
+
+        return linear_noise_to_db(_expected_max_chunk_noise_batched(n, p)).float()
