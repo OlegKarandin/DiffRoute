@@ -54,9 +54,23 @@ dataset_dir: data/datasets/german_17
 qot_checkpoint: checkpoints/german_17/best_qot.pt
 
 pipeline:
-  lambda_regen: 1.0
+  lambda_dev: 1.0          # PLACEHOLDER — Task 9 replaces this with the
+                           # calibrated value. 1.0 is the old lambda_regen
+                           # and is certainly wrong: the quantity it
+                           # multiplies grew from ~1e1 (sites) to ~1e2-1e3
+                           # (devices).
   lambda_cost: 0.01              # demoted to regularizer; ASE-noise STE now dominates routing signal
   channel_loading_fraction: 0.5  # fixed during inference
+
+placement:
+  alloc_dropout_p: 0.0     # OFF by default. The old gate_dropout existed to
+                           # manufacture node-discriminating gradient that a
+                           # per-node mask could not otherwise get. A
+                           # per-demand variable already has a sharp,
+                           # demand-specific signal, so re-measure whether
+                           # this is still needed (Task 11's arm) rather
+                           # than assuming it.
+  lookahead: true
 
 # Fixed traffic matrix. Regenerates deterministically from
 # (topology, seed, scale, alpha) — nothing is committed; the checksum is
@@ -67,9 +81,9 @@ traffic:
   scale: 300000.0         # total offered load in Gbps
   holdout_seed: 1         # a different matrix, for the generalisation gap
 
-# Feasibility as a constraint, not a penalty. `lambda_regen` above stays
-# fixed; these duals rise until feasibility is bought, so the regenerator
-# count is whatever the constraint requires. Values are reasoned starting
+# Feasibility as a constraint, not a penalty. `lambda_dev` above stays
+# fixed; these duals rise until feasibility is bought, so the device count
+# is whatever the constraint requires. Values are reasoned starting
 # points, not measured optima — see the design spec §4.
 constraint:
   margin_db: 0.5          # delta, added inside the hinge
@@ -80,22 +94,20 @@ constraint:
 
 training:
   lr_edge_net: 1.0e-3  # NOTE: EdgeWeightNet grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
-  # Adam's step is ~lr regardless of gradient magnitude, so a logit moves at
-  # most lr_regen per epoch. Crossing p>0.5 from a drifted-down logit needs
-  # tens of consecutive correct-sign steps; the old 20 epochs x 1e-2 gave a
-  # total excursion of 0.2 and could not place a regenerator even with a
-  # correctly-signed gradient. See
-  # docs/investigations/regen_placement_not_concentrating.md.
-  lr_regen: 2.0e-2
+  # The old lr_regen reasoning — "Adam moves a logit at most lr per epoch, so
+  # the total excursion is lr * epochs_e2e" — was about a single free logit
+  # per node. The allocation head is an MLP over route-local features, so no
+  # such excursion budget applies; this value is inherited, not re-derived.
+  lr_alloc: 2.0e-2         # was lr_regen
   epochs_e2e: 60
   vlastelica_lambda: 10.0
   vlastelica_lambda_min: 1.0
   vlastelica_lambda_decay: 0.995
-  regen_tau_start: 1.0
-  regen_tau_end: 0.1
+  alloc_tau_start: 1.0
+  alloc_tau_end: 0.1
   # Window is proportional to epochs_e2e above (60) — mirrors the validated
   # small_test_ind132.yaml window (10/40, anneal ends at 67% of training).
   # If epochs_e2e changes again, update this pair rather than leaving it
   # stale relative to it.
-  regen_tau_anneal_start_epoch: 10
-  regen_tau_anneal_end_epoch: 40
+  alloc_tau_anneal_start_epoch: 10
+  alloc_tau_anneal_end_epoch: 40

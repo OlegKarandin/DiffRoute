@@ -8,16 +8,18 @@ import argparse
 import csv
 import math
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.optim as optim
 import yaml
 
+from diffopt.demands import Demand
 from diffopt.loss import compute_loss, update_duals
-from diffopt.modulation import ModulationConfig
+from diffopt.modulation import ModulationConfig, bar_db_for_demands
 from diffopt.pipeline import DiffONetPipeline
-from diffopt.placement.regenerator import RegenPlacement
+from diffopt.placement.allocation import AllocationHead
+from diffopt.placement.oracle import oracle_allocation, oracle_gap
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.routing.edge_weight_net import EdgeWeightNet
@@ -53,12 +55,12 @@ def linear_anneal(
 ) -> float:
     """Linearly anneal a scalar from `start` to `end` over [anneal_start, anneal_end].
 
-    Generic — currently drives RegenPlacement's `tau` (decision sharpness).
-    It also used to drive SegmentCombiner's `soft_max_temperature` on the
-    same epoch window, so that the physics evaluation sharpened at the same
-    pace as the regen decisions it backed; SegmentCombiner's fold is exact
-    now and has no such knob, but the helper stays generic — nothing about
-    it is tau-specific.
+    Generic — currently drives the AllocationHead's `tau` (decision
+    sharpness). It also used to drive SegmentCombiner's
+    `soft_max_temperature` on the same epoch window, so that the physics
+    evaluation sharpened at the same pace as the allocation decisions it
+    backed; SegmentCombiner's fold is exact now and has no such knob, but the
+    helper stays generic — nothing about it is tau-specific.
     """
     if epoch <= anneal_start:
         return start
@@ -68,57 +70,141 @@ def linear_anneal(
     return start + frac * (end - start)
 
 
-def hard_placement_metrics(
+def alloc_score_stats(alloc, tau: float) -> Tuple[float, float, float]:
+    """(mean, min, max) of the head's raw scores on REAL boundaries.
+
+    The scores themselves are not returned by the forward pass, but they are
+    exactly recoverable from the priced allocations that are: on a valid
+    boundary `a = sigmoid(score / tau)`, so `score = tau * logit(a)`. Padded
+    columns (`boundary_node_ids < 0`) hold exactly 0 and are excluded — a
+    padded cut is no cut, not a score of -inf.
+
+    `a` is clamped to float32's own representable range before the logit
+    (~[-87.3, +15.9] * tau in score units, asymmetric because a sigmoid
+    approaches 1 far sooner than it underflows to 0). The clamp is therefore
+    the point where the information is genuinely gone from `a`, not an
+    arbitrary readout window: a column pinned at either cap IS saturation,
+    which is what this diagnostic exists to make visible. Read a
+    score_min == score_max at a cap as "every boundary saturated", not as
+    "the head stopped discriminating between boundaries".
+
+    Returns (nan, nan, nan) when the routing produced no boundary at all.
+    """
+    a = alloc.a.detach()
+    if a.numel() == 0:
+        return math.nan, math.nan, math.nan
+    valid = alloc.boundary_node_ids >= 0
+    if not bool(valid.any()):
+        return math.nan, math.nan, math.nan
+    finfo = torch.finfo(torch.float32)
+    p = a[valid].to(dtype=torch.float64).clamp(finfo.tiny, 1.0 - finfo.eps)
+    scores = tau * (torch.log(p) - torch.log1p(-p))
+    return (
+        float(scores.mean().item()),
+        float(scores.min().item()),
+        float(scores.max().item()),
+    )
+
+
+def hard_rollout(
     pipeline,
-    regen_placement,
     demands: List[Demand],
     modulation_config: ModulationConfig,
     *,
     lambda_: float,
     margin_db: float,
 ) -> dict:
-    """Evaluate the DEPLOYED placement — the one that would actually ship.
+    """Evaluate the DEPLOYED allocation — the one that would actually ship.
 
-    The training forward pass evaluates a RELAXATION: fractional
-    probabilities, over which SegmentCombiner returns a partition-weighted
-    expectation. That expectation is systematically more optimistic than any
-    single placement early in training, when every candidate sits near
-    p = 0.5. Selecting a checkpoint on it picks epochs that look good only
-    because they are fractional — most starkly at epoch 1, where the soft
-    key is (violated=0, regens=0) while the real placement is empty and
-    46/346 demands fail.
+    Deterministic hard decisions (a_k = 1 if score_k > 0), NOT a threshold
+    applied to the soft pass. The distinction is physical, not cosmetic:
+    under hard decisions the head's carry `c` is the EXACT noise of the
+    current chunk, so the rollout is self-consistent. The soft pass is a
+    mean-field relaxation whose carry `c * (1 - a)` is an expectation over
+    partitions; thresholding it reports a number no single allocation
+    produces. Spec 2.5.
 
-    Gate dropout (configs' `placement.gate_dropout_p`) makes the soft
-    metrics stochastic and deliberately pessimistic on top of that, so once
-    it is enabled the training pass cannot serve as a selection signal at
-    all. This function is the replacement.
+    Also computes the oracle's minimum on the SAME routes and segment GSNRs,
+    so `oracle_gap` costs no extra forward pass. The gap is the acceptance
+    metric for the whole stage: 0 means the head allocates optimally given
+    the routes, and therefore that anything still wrong is a ROUTING
+    problem. Note the oracle is ground truth only — its allocation is never
+    substituted here. Repair is a deployment step
+    (`diffopt.placement.oracle.repair_with_oracle`), and running it during
+    training would destroy this signal.
 
-    Runs under no_grad on a hard 0/1 override, so it neither disturbs the
-    live autograd graph nor mutates any parameter. `tau` is irrelevant to an
-    override and is passed as 1.0 for definiteness.
+    Runs under no_grad, so it neither disturbs the live graph nor mutates a
+    parameter. `tau` is irrelevant to a hard decision and is not passed.
+
+    WHICH DEMANDS THE GAP IS MEASURED OVER. `oracle.count[d]` is a lower
+    bound on device count only among allocations that make demand d
+    FEASIBLE. Two situations break that:
+
+      the head under-buys   epoch 1 has the head initialised CLOSED (spec
+                            2.2), so it buys 0 devices while the oracle
+                            needs many. `0 - many` is negative, and it is
+                            not a competence measurement — the shortfall is
+                            already reported, exactly, as
+                            `hard_num_violated`.
+
+      nothing works at all  when a single segment alone busts the bar
+                            (`oracle.feasible[d]` False) no allocation on
+                            this route is feasible, and `oracle.count[d]`
+                            is only the oracle's best-effort attempt — not
+                            a minimum of anything.
+
+    So the gap sums over the demands the head actually made feasible, where
+    minimality really does apply and `oracle_gap`'s negative-gap assertion
+    really does mean "the fold and the oracle disagree about chunk noise",
+    which is the bug it exists to catch. `oracle_devices` stays the total
+    floor over ALL demands, because "this routing needs at least N devices"
+    is the useful reading of it. The two therefore satisfy
+    `oracle_gap == hard_num_devices - oracle_devices` exactly when
+    `hard_num_violated == 0` — which is the only regime the stage's
+    acceptance test (`oracle_gap == 0` at the selected epoch, an epoch
+    selected on zero violations first) ever reads.
     """
-    mask = regen_placement.hard_placement_mask()
-    hard_probs = mask.to(dtype=torch.float32)
-
     with torch.no_grad():
-        _, gsnr_preds, _, _ = pipeline(
-            demands, tau=1.0, lambda_=lambda_, regen_probs_override=hard_probs
+        _, gsnr_preds, _, alloc = pipeline(demands, lambda_=lambda_, hard_alloc=True)
+
+        bar_db = bar_db_for_demands(demands, modulation_config, margin_db).to(
+            alloc.a.device
         )
+        oracle = oracle_allocation(alloc.seg_gsnr_db, bar_db, alloc.num_segments)
 
     num_violated = 0
     worst_margin_db = math.inf
+    bar_by_id = {}
     for demand in demands:
         threshold = modulation_config.required_snr_threshold(demand.bitrate_gbps)
+        bar_by_id[demand.id] = threshold + margin_db
         gsnr = gsnr_preds[demand.id].item()
         if gsnr < threshold + margin_db:
             num_violated += 1
         worst_margin_db = min(worst_margin_db, gsnr - threshold)
 
+    # Row order follows `alloc.demand_ids`, not `demands` — the oracle's
+    # rows are indexed the same way.
+    hard_feasible = torch.tensor(
+        [gsnr_preds[did].item() >= bar_by_id[did] for did in alloc.demand_ids],
+        dtype=torch.bool,
+    )
+
+    site_mask = alloc.site_view > 0.5
+    hard_devices = int(alloc.a.sum().item())
+
     return {
         "hard_num_violated": num_violated,
-        "hard_num_placed": int(mask.sum().item()),
+        "hard_num_devices": hard_devices,
+        "hard_num_sites": int(site_mask.sum().item()),
         "hard_worst_margin_db": worst_margin_db if demands else math.nan,
-        "placement_mask": mask.cpu(),
+        "oracle_devices": int(oracle.count.sum().item()),
+        "oracle_gap": oracle_gap(
+            alloc.a[hard_feasible], oracle.count[hard_feasible]
+        ),
+        "oracle_infeasible": int((~oracle.feasible).sum().item()),
+        "site_mask": site_mask.cpu(),
+        "alloc_by_node": alloc.alloc_by_node.cpu(),
     }
 
 
@@ -192,40 +278,24 @@ def main() -> None:
     # multipliers driven by an explicit ascent rule, not gradient descent.
     duals = torch.full((len(demands),), float(c_cfg["dual_init"]), device=device)
 
-    # Mask of nodes where a placed regenerator can actually do something.
-    # `lambda_regen * regen_probs.sum()` prices ALL num_nodes nodes, but
-    # `pipeline.segment_path` only splits a route at regen candidates
-    # (undirected degree >= 3 — 48 of 132 on ind_132), so probability mass
-    # anywhere else is physically inert while still costing loss. Tracked as
-    # its own log column rather than fixed here: restricting the penalty to
-    # candidates would shrink it ~2.75x at fixed lambda_regen, which IS a
-    # lambda_regen retune by the back door and is an explicit non-goal of the
-    # design spec (§2).
-    regen_candidate_mask = torch.zeros(
-        topology.num_nodes, dtype=torch.bool, device=device
-    )
-    regen_candidate_mask[
-        torch.tensor(topology.regen_candidate_nodes, dtype=torch.long, device=device)
-    ] = True
-    warned_inert = False
+    # There is no inert-placement column any more: the old `num_regen_noncand`
+    # watched for probability mass landing on a node `segment_path` never
+    # splits at, which a per-(demand, boundary) variable cannot express —
+    # every allocation variable IS a real boundary of a real route.
 
     edge_weight_net = EdgeWeightNet().to(device)
     pl_cfg = cfg.get("placement", {})
-    hc_cfg = pl_cfg.get("hard_concrete", {})
-    regen_placement = RegenPlacement(
-        topology.num_nodes,
-        gate=pl_cfg.get("gate", "sigmoid"),
-        beta=hc_cfg.get("beta", 0.5),
-        gamma=hc_cfg.get("gamma", -0.1),
-        zeta=hc_cfg.get("zeta", 1.1),
-    ).to(device)
+    lookahead: bool = pl_cfg.get("lookahead", True)
+    allocation_head = AllocationHead(lookahead=lookahead).to(device)
 
     pipeline = DiffONetPipeline(
         topology=topology,
         qot_model=qot_model,
         segment_combiner=segment_combiner,
         edge_weight_net=edge_weight_net,
-        regen_placement=regen_placement,
+        allocation_head=allocation_head,
+        modulation_config=mod_cfg,
+        margin_db=c_cfg["margin_db"],
         channel_loading_fraction=cfg["pipeline"]["channel_loading_fraction"],
         max_spans=cfg.get("max_spans_per_segment", 60),
     ).to(device)
@@ -234,9 +304,9 @@ def main() -> None:
         edge_weight_net.parameters(),
         lr=cfg["training"]["lr_edge_net"],
     )
-    opt_regen = optim.Adam(
-        [regen_placement._parameter],
-        lr=cfg["training"]["lr_regen"],
+    opt_alloc = optim.Adam(
+        allocation_head.parameters(),
+        lr=cfg["training"]["lr_alloc"],
     )
 
     t_cfg = cfg["training"]
@@ -246,12 +316,12 @@ def main() -> None:
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
     epochs: int = t_cfg["epochs_e2e"]
 
-    # Training-only masking of the physics-path regen probabilities. See
-    # DiffONetPipeline.forward's gate_dropout_p docstring and
-    # docs/investigations/regen_over_provisioning.md Finding 2.
-    gate_dropout_p: float = pl_cfg.get("gate_dropout_p", 0.0)
-
-    hard_eval_enabled = cfg.get("selection", {}).get("hard_eval", True)
+    # Training-only masking of the PHYSICS allocation decisions. See
+    # DiffONetPipeline.forward's alloc_dropout_p docstring. OFF by default:
+    # the old gate_dropout manufactured node-discriminating gradient that a
+    # per-node mask could not otherwise get, and a per-demand variable
+    # already has a sharp, demand-specific signal.
+    alloc_dropout_p: float = pl_cfg.get("alloc_dropout_p", 0.0)
 
     log_dir = Path(cfg.get("log_dir", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -259,7 +329,7 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = log_dir / "e2e_train_log.csv"
-    # One row per epoch of the DEPLOYED placement set. A checkpoint is one
+    # One row per epoch of the DEPLOYED allocation. A checkpoint is one
     # sample of a process that may not be converging at all; this is the
     # process. Two things it makes measurable that no snapshot can:
     # churn (mean Hamming distance between consecutive epochs' sets over the
@@ -268,8 +338,8 @@ def main() -> None:
     # selected one. It also allows re-running selection under a different
     # key without retraining.
     trajectory_path = log_dir / "placement_trajectory.csv"
-    # Lexicographic selection: fewest violated demands, then fewest
-    # regenerators, then lowest total loss.
+    # Lexicographic selection on the DEPLOYED allocation: fewest violated
+    # demands, then fewest DEVICES, then the most headroom.
     #
     # `loss.item() < best_loss` was already wrong under the old objective —
     # the shipped checkpoints/e2e_ind132/best_e2e.pt is epoch 40 while its own
@@ -280,64 +350,70 @@ def main() -> None:
     # formulation `lambda` is deliberately non-stationary, so total loss
     # becomes still less comparable across epochs.
     #
-    # num_regen_soft is (regen_probs > 0.5).sum(), which is exactly
-    # (regen_logits > 0).sum() for any tau > 0 — tau-invariant, so it is a
-    # legitimate cross-epoch comparison during annealing.
+    # The middle slot is a DEVICE count, not a site count. A site count let
+    # an epoch win by touching fewer nodes while buying more hardware —
+    # 40 demands regenerating at node 7 need 40 devices, not 1.
     best_key = (math.inf, math.inf, math.inf)
 
     with open(log_path, "w", newline="") as f, \
          open(trajectory_path, "w", newline="") as tf:
         writer = csv.writer(f)
         traj_writer = csv.writer(tf)
-        traj_writer.writerow(["epoch", "num_placed", "placed_nodes"])
-        # regen_logit_* are the RAW learned parameters. regen_loss alone is
-        # misleading: it reports sum(sigmoid(logit/tau)) while tau is being
-        # annealed, so it moves dramatically even when the logits are static
-        # (measured: 87% of the observed 66 -> 18 fall came from tau, not
-        # learning). Log the parameter itself so drift is visible directly.
+        traj_writer.writerow(["epoch", "num_devices", "num_sites", "site_nodes"])
+        # alloc_score_* are the head's RAW scores, recovered from the priced
+        # allocations (see alloc_score_stats). device_count alone is
+        # misleading while tau is annealed: it reports sum(sigmoid(score/tau))
+        # and so moves dramatically even when the scores are static. Log the
+        # scores themselves so saturation is visible directly.
         writer.writerow([
             "epoch", "total_loss", "feasibility_loss", "weighted_feasibility_loss",
-            "regen_loss", "path_noise_loss", "num_regen_soft", "num_regen_noncand",
+            "device_loss", "path_noise_loss", "device_count",
             "num_infeasible", "num_violated",
-            "hard_num_violated", "hard_num_placed", "hard_worst_margin_db",
-            "worst_margin_db",
+            "hard_num_violated", "hard_num_devices", "hard_num_sites",
+            "hard_worst_margin_db", "oracle_devices", "oracle_gap",
+            "oracle_infeasible", "worst_margin_db",
             "lambda_max_observed", "num_at_cap",
             "tau", "vlastelica_lambda",
-            "regen_logit_mean", "regen_logit_min", "regen_logit_max",
-            "regen_prob_max", "gate_dropout_p", "gate",
+            "alloc_score_mean", "alloc_score_min", "alloc_score_max",
+            "alloc_dropout_p", "lookahead",
+            "ste_clamped_segments", "proxy_qot_rank_corr",
         ])
 
         for epoch in range(1, epochs + 1):
             tau = linear_anneal(
                 epoch,
-                t_cfg["regen_tau_start"],
-                t_cfg["regen_tau_end"],
-                t_cfg["regen_tau_anneal_start_epoch"],
-                t_cfg["regen_tau_anneal_end_epoch"],
+                t_cfg["alloc_tau_start"],
+                t_cfg["alloc_tau_end"],
+                t_cfg["alloc_tau_anneal_start_epoch"],
+                t_cfg["alloc_tau_anneal_end_epoch"],
             )
 
             opt_edge.zero_grad()
-            opt_regen.zero_grad()
+            opt_alloc.zero_grad()
 
-            path_noise_costs, gsnr_preds, _, regen_probs = pipeline(
+            path_noise_costs, gsnr_preds, _, alloc = pipeline(
                 demands, tau=tau, lambda_=vlastelica_lambda,
-                gate_dropout_p=gate_dropout_p,
+                alloc_dropout_p=alloc_dropout_p,
             )
             loss, metrics = compute_loss(
                 gsnr_preds=gsnr_preds,
                 path_noise_costs=path_noise_costs,
                 demands=demands,
-                regen_probs=regen_probs,
+                device_count=alloc.device_count,
                 modulation_config=mod_cfg,
                 duals=duals,
                 margin_db=c_cfg["margin_db"],
-                lambda_regen=p_cfg["lambda_regen"],
+                lambda_dev=p_cfg["lambda_dev"],
                 lambda_cost=p_cfg["lambda_cost"],
-                regen_count_penalty=regen_placement.count_penalty(tau),
             )
 
+            # Pre-step, like the state snapshots below — same row, same
+            # parameters, not next epoch's already-updated ones.
+            score_mean, score_min, score_max = alloc_score_stats(alloc, tau)
+            device_loss = p_cfg["lambda_dev"] * metrics["device_count"]
+
             # Snapshot the state the forward pass above (and therefore
-            # `metrics` -- num_violated, num_regen_soft, worst_margin_db,
+            # `metrics` -- num_violated, device_count, worst_margin_db,
             # loss.item()) actually describes, BEFORE the optimizer step
             # mutates it. Checkpoint selection compares `metrics` across
             # epochs, so the checkpoint must save the parameters those
@@ -350,29 +426,23 @@ def main() -> None:
             edge_weight_net_state_pre_step = {
                 k: v.clone() for k, v in edge_weight_net.state_dict().items()
             }
-            regen_param_pre_step = regen_placement._parameter.detach().clone()
+            alloc_head_state_pre_step = {
+                k: v.clone() for k, v in allocation_head.state_dict().items()
+            }
 
-            # Selection metrics, measured on the deployed placement rather
+            # Selection metrics, measured on the deployed allocation rather
             # than on the relaxation the gradient step is taken through.
-            # Pre-step, like edge_weight_net_state_pre_step above: the
-            # checkpoint must save the parameters its own key describes.
-            if hard_eval_enabled:
-                hard = hard_placement_metrics(
-                    pipeline, regen_placement, demands, mod_cfg,
-                    lambda_=vlastelica_lambda,
-                    margin_db=c_cfg["margin_db"],
-                )
-            else:
-                hard = {
-                    "hard_num_violated": metrics["num_violated"],
-                    "hard_num_placed": metrics["num_regen_soft"],
-                    "hard_worst_margin_db": metrics["worst_margin_db"],
-                    "placement_mask": regen_placement.hard_placement_mask().cpu(),
-                }
+            # Pre-step, like the two snapshots above: the checkpoint must
+            # save the parameters its own key describes.
+            hard = hard_rollout(
+                pipeline, demands, mod_cfg,
+                lambda_=vlastelica_lambda,
+                margin_db=c_cfg["margin_db"],
+            )
 
             loss.backward()
             opt_edge.step()
-            opt_regen.step()
+            opt_alloc.step()
 
             # Dual ascent, using the same shortfalls the loss consumed this
             # epoch. Runs AFTER the primal step so the duals price the
@@ -387,70 +457,49 @@ def main() -> None:
             lambda_max_observed = duals.max().item()
             num_at_cap = int((duals >= c_cfg["dual_max"]).sum().item())
 
-            # Placements that can never split a path. Expected to stay 0: a
-            # non-candidate logit receives only down-pressure from the regen
-            # penalty, and on the shipped epoch-40 checkpoint all 84
-            # non-candidates sit pinned in a 0.0069-wide band at ~-0.817
-            # while 8 of 8 placements land on candidates.
-            #
-            # Watched anyway because the duals now scale to dual_max, and they
-            # amplify the one path by which feasibility DOES reach a
-            # non-candidate logit: regen_probs feed EdgeWeightNet's edge
-            # features at both endpoints of every edge. That path is worth
-            # ~0.007 of logit at a fixed weight of 10; at 100x it is ~0.7,
-            # comparable to Adam's entire +/-1.2 reachable excursion.
-            placed_nodes = regen_probs.detach() > 0.5
-            num_regen_noncand = int(
-                (placed_nodes & ~regen_candidate_mask).sum().item()
-            )
-            if num_regen_noncand > 0 and not warned_inert:
-                warned_inert = True
-                inert = (placed_nodes & ~regen_candidate_mask)
-                inert_ids = inert.nonzero(as_tuple=True)[0].tolist()
-                print(
-                    f"  !! epoch {epoch}: {num_regen_noncand} placement(s) on "
-                    f"NON-candidate node(s) {inert_ids} — physically inert "
-                    f"(segment_path never splits there) but counted by "
-                    f"num_regen_soft and priced by lambda_regen. "
-                    f"lambda_max_observed={lambda_max_observed:.1f}"
-                )
-
             vlastelica_lambda = max(lambda_min, vlastelica_lambda * lambda_decay)
 
-            # Pre-step, like num_regen_soft/num_regen_noncand above -- same
-            # row, same state, not next epoch's already-updated logits.
-            logits = regen_param_pre_step
             writer.writerow([
                 epoch,
                 f"{loss.item():.6f}",
                 f"{metrics['feasibility_loss']:.6f}",
                 f"{metrics['weighted_feasibility_loss']:.6f}",
-                f"{metrics['regen_loss']:.6f}",
+                f"{device_loss:.6f}",
                 f"{metrics['path_noise_loss']:.6f}",
-                metrics["num_regen_soft"],
-                num_regen_noncand,
+                f"{metrics['device_count']:.6f}",
                 metrics["num_infeasible"],
                 metrics["num_violated"],
                 hard["hard_num_violated"],
-                hard["hard_num_placed"],
+                hard["hard_num_devices"],
+                hard["hard_num_sites"],
                 f"{hard['hard_worst_margin_db']:.4f}",
+                hard["oracle_devices"],
+                hard["oracle_gap"],
+                hard["oracle_infeasible"],
                 f"{metrics['worst_margin_db']:.4f}",
                 f"{lambda_max_observed:.4f}",
                 num_at_cap,
                 f"{tau:.4f}",
                 f"{vlastelica_lambda:.4f}",
-                f"{logits.mean().item():.6f}",
-                f"{logits.min().item():.6f}",
-                f"{logits.max().item():.6f}",
-                f"{regen_probs.max().item():.6f}",
-                f"{gate_dropout_p:.3f}",
-                regen_placement.gate,
+                f"{score_mean:.6f}",
+                f"{score_min:.6f}",
+                f"{score_max:.6f}",
+                f"{alloc_dropout_p:.3f}",
+                lookahead,
+                # Filled by Task 10 (AllocationOutputs.ste_clamped_segments /
+                # .proxy_qot_rank_corr). Written as empty strings until then
+                # so the header and the row widths already agree.
+                "",
+                "",
             ])
             f.flush()
 
-            placed_ids = hard["placement_mask"].nonzero(as_tuple=True)[0].tolist()
+            site_nodes = hard["site_mask"].nonzero(as_tuple=True)[0].tolist()
             traj_writer.writerow([
-                epoch, len(placed_ids), " ".join(str(n) for n in placed_ids)
+                epoch,
+                hard["hard_num_devices"],
+                hard["hard_num_sites"],
+                " ".join(str(n) for n in site_nodes),
             ])
             tf.flush()
 
@@ -460,33 +509,26 @@ def main() -> None:
                     f"| violated={metrics['num_violated']}/{len(demands)} "
                     f"| infeasible={metrics['num_infeasible']} "
                     f"| worst_margin={metrics['worst_margin_db']:+.2f}dB "
-                    f"| regen_soft={metrics['num_regen_soft']}"
-                    f"({num_regen_noncand} inert) "
+                    f"| devices={hard['hard_num_devices']}"
+                    f"(oracle {hard['oracle_devices']}, gap {hard['oracle_gap']}) "
+                    f"| sites={hard['hard_num_sites']} "
                     f"| lambda_max={lambda_max_observed:.1f} at_cap={num_at_cap} "
-                    f"| logit[{logits.min().item():+.3f},{logits.max().item():+.3f}] "
+                    f"| score[{score_min:+.3f},{score_max:+.3f}] "
                     f"| tau={tau:.3f} | λ={vlastelica_lambda:.3f}"
                 )
 
-            # Lexicographic on the DEPLOYED placement: fewest violated, then
-            # fewest regenerators, then the most headroom. The third slot
-            # used to be loss.item(), which invariants.md itself calls
-            # non-comparable across epochs — the tau anneal dominates it and
-            # the duals are deliberately non-stationary. worst_margin_db is
-            # physical, tau-invariant, gate-independent, and already
-            # computed. Negated because the key is minimised and MORE
-            # headroom is better.
-            if hard_eval_enabled:
-                selection_key = (
-                    hard["hard_num_violated"],
-                    hard["hard_num_placed"],
-                    -hard["hard_worst_margin_db"],
-                )
-            else:
-                selection_key = (
-                    metrics["num_violated"],
-                    metrics["num_regen_soft"],
-                    loss.item(),
-                )
+            # Lexicographic on the DEPLOYED allocation: fewest violated, then
+            # fewest DEVICES, then the most headroom. The third slot used to
+            # be loss.item(), which invariants.md itself calls non-comparable
+            # across epochs — the tau anneal dominates it and the duals are
+            # deliberately non-stationary. worst_margin_db is physical,
+            # tau-invariant and already computed. Negated because the key is
+            # minimised and MORE headroom is better.
+            selection_key = (
+                hard["hard_num_violated"],
+                hard["hard_num_devices"],
+                -hard["hard_worst_margin_db"],
+            )
             if selection_key < best_key:
                 best_key = selection_key
                 ckpt_path = checkpoint_dir / "best_e2e.pt"
@@ -494,34 +536,32 @@ def main() -> None:
                     {
                         "epoch": epoch,
                         "edge_weight_net_state": edge_weight_net_state_pre_step,
-                        "gate": regen_placement.gate,
-                        **(
-                            {"regen_logits": regen_param_pre_step.cpu()}
-                            if regen_placement.gate == "sigmoid"
-                            else {"regen_log_alpha": regen_param_pre_step.cpu()}
-                        ),
+                        "alloc_head_state": alloc_head_state_pre_step,
                         "opt_edge_state": opt_edge.state_dict(),
-                        "opt_regen_state": opt_regen.state_dict(),
+                        "opt_alloc_state": opt_alloc.state_dict(),
                         "vlastelica_lambda": vlastelica_lambda,
                         "total_loss": loss.item(),
                         "num_violated": metrics["num_violated"],
-                        "num_regen_soft": metrics["num_regen_soft"],
+                        "device_count": metrics["device_count"],
                         "hard_num_violated": hard["hard_num_violated"],
-                        "hard_num_placed": hard["hard_num_placed"],
+                        "hard_num_devices": hard["hard_num_devices"],
+                        "hard_num_sites": hard["hard_num_sites"],
                         "hard_worst_margin_db": hard["hard_worst_margin_db"],
-                        "placement_mask": hard["placement_mask"],
+                        "oracle_gap": hard["oracle_gap"],
+                        "site_mask": hard["site_mask"],
                         "duals": duals.detach().cpu(),
                     },
                     ckpt_path,
                 )
                 print(
                     f"  -> Checkpoint saved (violated={selection_key[0]}, "
-                    f"regens={selection_key[1]}, loss={selection_key[2]:.4f})"
+                    f"devices={selection_key[1]}, "
+                    f"worst_margin={-selection_key[2]:+.4f}dB)"
                 )
 
     print(
         f"\nTraining complete. Best: violated={best_key[0]}, "
-        f"regens={best_key[1]}, loss={best_key[2]:.4f}"
+        f"devices={best_key[1]}, worst_margin={-best_key[2]:+.4f}dB"
     )
     at_cap = (duals >= c_cfg["dual_max"]).nonzero(as_tuple=True)[0].tolist()
     if at_cap:

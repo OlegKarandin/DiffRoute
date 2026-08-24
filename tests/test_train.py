@@ -1,16 +1,26 @@
-"""Unit tests for diffopt/train.py's pure annealing helper.
+"""Unit tests for diffopt/train.py.
 
-`linear_anneal` (renamed/generalized from `compute_regen_tau`) drives
-RegenPlacement's `tau`. It stays generic — nothing in it is tau-specific —
-because it also used to drive SegmentCombiner's `soft_max_temperature`,
-before that fold became exact and lost its temperature entirely (see
-docs/investigations/CHANGELOG.md's Phase 1c corrections, and
-diffopt/qot/segment_combiner.py's docstring, for that history).
+Two groups:
+
+  `linear_anneal` (renamed/generalized from `compute_regen_tau`) drives the
+  AllocationHead's `tau`. It stays generic — nothing in it is tau-specific —
+  because it also used to drive SegmentCombiner's `soft_max_temperature`,
+  before that fold became exact and lost its temperature entirely (see
+  docs/investigations/CHANGELOG.md's Phase 1c corrections, and
+  diffopt/qot/segment_combiner.py's docstring, for that history).
+
+  `hard_rollout` and the checkpoint-selection loop it feeds. Selection is
+  lexicographic on (hard_num_violated, hard_num_devices,
+  -hard_worst_margin_db) — a DEVICE count in the middle slot, never a site
+  count: 40 demands regenerating at node 7 need 40 devices, not 1, and a
+  site-priced key let an epoch win by touching fewer nodes while buying
+  more hardware.
 """
 from __future__ import annotations
 
 import csv
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -19,8 +29,14 @@ import yaml
 
 import diffopt.train as train_mod
 from diffopt.demands import Demand
-from diffopt.placement.regenerator import RegenPlacement
+from diffopt.modulation import ModulationConfig
+from diffopt.pipeline import DiffONetPipeline
+from diffopt.placement.allocation import AllocationHead
+from diffopt.qot.model import SpanAttentionQoT
+from diffopt.qot.segment_combiner import SegmentCombiner
+from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.train import linear_anneal
+from tests.test_pipeline import make_demands, make_hub_topology, make_mod_config, make_pipeline
 
 
 def test_before_anneal_start_returns_start_value():
@@ -68,49 +84,191 @@ def test_generic_across_different_schedules():
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint selection under the constrained objective
+# hard_rollout, against a REAL pipeline
+# ---------------------------------------------------------------------------
+
+def _tiny_e2e_setup():
+    """A real (hub topology, pipeline, demands, ModulationConfig).
+
+    Deliberately NOT the stubbed harness below: hard_rollout's whole job is
+    to agree with the oracle on how a chunk is scored, and a stub that
+    hands both sides the same made-up numbers cannot test that agreement.
+
+    The 400G threshold is 0.0 dB here, NOT tests/test_pipeline.py's 20.0 dB.
+    The QoT model is randomly initialised and returns ~1.0-1.4 dB per
+    segment, so at a 20.5 dB bar EVERY demand is infeasible under EVERY
+    allocation: the oracle's `count` degenerates to a best-effort attempt
+    that is not a minimum of anything, and the gap these tests exist to
+    measure becomes vacuous. At a 0.5 dB bar the segments clear
+    comfortably, the oracle's minimum is a real minimum, and a nonzero gap
+    means what it says.
+    """
+    torch.manual_seed(0)
+    topology = make_hub_topology()
+    mod_cfg = ModulationConfig(
+        channel_spacing_ghz=100.0,
+        symbol_rate_gbaud=64.0,
+        num_channels_cband=48,
+        cut_channel_index=24,
+        formats=[{"bitrate_gbps": 400, "snr_threshold_db": 0.0}],
+    )
+    pipeline = DiffONetPipeline(
+        topology=topology,
+        qot_model=SpanAttentionQoT(max_spans=60),
+        segment_combiner=SegmentCombiner(),
+        edge_weight_net=EdgeWeightNet(),
+        allocation_head=AllocationHead(),
+        modulation_config=mod_cfg,
+        margin_db=0.5,
+    )
+    return topology, pipeline, make_demands(), mod_cfg
+
+
+def test_hard_rollout_reports_devices_sites_and_the_oracle_gap():
+    """Spec 2.5 + 2.6. hard_num_placed is DELETED; hard_num_sites is
+    logged and never priced."""
+    topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].bias.fill_(5.0)   # cut everywhere
+    hard = train_mod.hard_rollout(
+        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+    )
+    assert "hard_num_placed" not in hard
+    assert hard["hard_num_devices"] >= hard["hard_num_sites"]
+    assert hard["oracle_gap"] >= 0
+    assert hard["oracle_gap"] == hard["hard_num_devices"] - hard["oracle_devices"]
+
+
+def test_hard_rollout_is_deterministic_and_leaves_no_graph():
+    topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
+    a = train_mod.hard_rollout(pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5)
+    b = train_mod.hard_rollout(pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5)
+    assert a["hard_num_devices"] == b["hard_num_devices"]
+    for p in pipeline.allocation_head.parameters():
+        assert p.grad is None
+
+
+def test_oracle_gap_is_measured_only_on_demands_the_head_made_feasible():
+    """`oracle.count[d]` is a lower bound only among allocations that make
+    demand d feasible, so two situations produce a meaningless negative
+    difference and must be excluded:
+
+      * the head UNDER-buys — epoch 1 has it initialised CLOSED (spec 2.2),
+        buying 0 devices while the oracle needs many;
+      * nothing works at all — a single segment alone busts the bar
+        (`oracle.feasible[d]` False), so `count[d]` is the oracle's
+        best-effort attempt, not a minimum.
+
+    Both are real: this setup is the second (a 20.5 dB bar against ~1.4 dB
+    segments) on top of the first (a closed head). Left unguarded, the
+    negative-gap AssertionError inside `oracle_gap()` fires on epoch 1 of
+    every real run. The shortfall is not lost — it IS hard_num_violated.
+    """
+    torch.manual_seed(0)
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)      # the 20.0 dB threshold config
+    demands, mod_cfg = make_demands(), make_mod_config()
+
+    hard = train_mod.hard_rollout(
+        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+    )
+    assert hard["hard_num_devices"] == 0          # closed head buys nothing
+    assert hard["oracle_devices"] > 0             # the floor is not zero
+    assert hard["oracle_infeasible"] == len(demands)
+    assert hard["hard_num_violated"] == len(demands)
+    assert hard["oracle_gap"] == 0                # NOT negative, NOT a crash
+
+
+def test_oracle_gap_survives_an_under_buying_head_at_epoch_one():
+    """The other flavour of the same guard, and the one that would crash a
+    REAL run: here the route IS feasible (`oracle_infeasible == 0`, the
+    oracle needs 2 devices) but the head is initialised CLOSED and buys 0.
+    Unrestricted, `oracle_gap()` would see 0 - 2 and raise on epoch 1 of
+    every training run. The shortfall is reported as hard_num_violated.
+    """
+    topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
+    hard = train_mod.hard_rollout(
+        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+    )
+    assert hard["oracle_infeasible"] == 0        # the route admits a solution
+    assert hard["oracle_devices"] > 0            # and it needs devices
+    assert hard["hard_num_devices"] == 0         # the closed head buys none
+    assert hard["hard_num_violated"] > 0         # which is where that shows
+    assert hard["oracle_gap"] == 0
+
+
+def test_hard_rollout_counts_violations_against_threshold_plus_margin():
+    """num_violated is the margin-inclusive count, matching compute_loss."""
+    topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
+    hard = train_mod.hard_rollout(
+        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+    )
+    threshold = mod_cfg.required_snr_threshold(400.0)
+    with torch.no_grad():
+        _, gsnr_preds, _, _ = pipeline(demands, lambda_=10.0, hard_alloc=True)
+    expected = sum(
+        1 for d in demands if gsnr_preds[d.id].item() < threshold + 0.5
+    )
+    assert hard["hard_num_violated"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Stubbed harness for the epoch loop
 # ---------------------------------------------------------------------------
 
 _MODULATION_FORMATS_PATH = Path(__file__).parent.parent / "configs/modulation_formats.yaml"
 
 
 class _DummyTopology:
-    """Stand-in for a loaded Topology. main() reads `num_nodes` (to size
-    RegenPlacement) and `regen_candidate_nodes` (to build the
-    inert-placement mask) before DiffONetPipeline is constructed, and
-    DiffONetPipeline is itself stubbed below.
-
-    Nodes 1 and 3 are regen candidates; 0, 2 and 4 are not — a placement on
-    those can never split a path, because pipeline.segment_path only splits
-    at candidates.
-    """
+    """Stand-in for a loaded Topology. DiffONetPipeline is itself stubbed
+    below, so main() only ever passes this object straight through."""
     num_nodes = 5
     regen_candidate_nodes = [1, 3]
 
 
-class _DummyPipeline:
-    """Stand-in for DiffONetPipeline. Its physics forward pass is irrelevant
-    to checkpoint selection and to the inert-placement count, so it is
-    replaced with a cheap no-op that satisfies main()'s call shape:
-    `pipeline(demands, tau=..., lambda_=..., gate_dropout_p=...)` ->
-    (path_noise_costs, gsnr_preds, path_indicators, regen_probs).
+class _DummyAlloc:
+    """Stand-in for AllocationOutputs — one demand, two segments, one
+    boundary (node 3).
 
-    `regen_probs_value` is a class attribute rather than a constructor
-    argument because main() constructs the pipeline itself — the test has no
-    handle on the instance.
+    The per-segment GSNRs sit comfortably above the 400G bar (7.1 + 0.5 dB)
+    and inside the fold's [GSNR_MIN, GSNR_MAX] clamp band, so the REAL
+    oracle_allocation run by the REAL hard_rollout needs no cut: the default
+    (unscripted) path through this harness has oracle_devices == 0 and
+    oracle_gap == 0 rather than tripping oracle_gap's negative-gap
+    assertion.
     """
 
-    regen_probs_value = torch.zeros(_DummyTopology.num_nodes)
+    def __init__(self, *, hard: bool) -> None:
+        n = _DummyTopology.num_nodes
+        a_value = 0.0 if hard else torch.sigmoid(torch.tensor(-3.0)).item()
+        self.a = torch.full((1, 1), a_value)
+        self.a_physics = self.a
+        self.alloc_by_node = torch.zeros(1, n)
+        self.alloc_by_node[0, 3] = a_value
+        self.device_count = self.a.sum()
+        self.site_view = self.alloc_by_node.max(dim=0).values
+        self.seg_gsnr_db = torch.full((1, 2), 30.0)
+        self.seg_noise = torch.full((1, 2), 1.0e-3)
+        self.num_segments = torch.tensor([2])
+        self.boundary_node_ids = torch.tensor([[3]])
+        self.demand_ids = [0]
 
-    # Per-demand GSNR the stub reports when NO regenerators are placed, and
-    # when at least one is. Lets a test script the hard-eval pass
-    # independently of the soft one, which is the whole point of the fix.
-    # gsnr_unplaced must clear below the 400G demand's real threshold
-    # (7.1 dB, from configs/modulation_formats.yaml) plus the 0.5 dB test
-    # margin, so the empty placement is genuinely infeasible -- matching
-    # what the real bug looks like (an unplaced route failing GSNR).
-    gsnr_unplaced = 5.0
-    gsnr_placed = 100.0
+
+class _DummyPipeline:
+    """Stand-in for DiffONetPipeline. Its physics forward pass is irrelevant
+    to checkpoint selection, so it is replaced with a cheap deterministic
+    no-op satisfying main()'s call shape:
+    `pipeline(demands, tau=..., lambda_=..., alloc_dropout_p=...)` ->
+    (path_noise_costs, gsnr_preds, path_indicators, AllocationOutputs), plus
+    the `hard_alloc=True` variant hard_rollout uses.
+
+    `gsnr_value` is a class attribute rather than a constructor argument
+    because main() constructs the pipeline itself — the test has no handle
+    on the instance. 100.0 dB clears every threshold in
+    configs/modulation_formats.yaml with room to spare.
+    """
+
+    gsnr_value = 100.0
 
     def __init__(self, **kwargs) -> None:
         pass
@@ -118,24 +276,21 @@ class _DummyPipeline:
     def to(self, device):
         return self
 
-    def __call__(self, demands, tau=None, lambda_=None, regen_probs_override=None,
-                 gate_dropout_p=0.0):
-        probs = (_DummyPipeline.regen_probs_value
-                 if regen_probs_override is None else regen_probs_override)
-        if regen_probs_override is None:
-            return {}, {}, {}, probs
-        value = (_DummyPipeline.gsnr_placed if probs.sum() > 0
-                 else _DummyPipeline.gsnr_unplaced)
-        gsnr = {d.id: torch.tensor(value) for d in demands}
-        return {}, gsnr, {}, probs
+    def __call__(self, demands, tau=1.0, lambda_=10.0, *, hard_alloc=False,
+                 alloc_dropout_p=0.0):
+        alloc = _DummyAlloc(hard=hard_alloc)
+        gsnr = {d.id: torch.tensor(_DummyPipeline.gsnr_value) for d in demands}
+        noise = {d.id: torch.zeros(()) for d in demands}
+        return noise, gsnr, {}, alloc
 
 
-def _mod_config():
-    from diffopt.modulation import ModulationConfig
-    return ModulationConfig.from_yaml(str(_MODULATION_FORMATS_PATH))
-
-
-def _write_config(tmp_path, *, epochs: int, hard_eval: bool = False, gate: str = None) -> Path:
+def _write_config(
+    tmp_path,
+    *,
+    epochs: int,
+    lookahead: bool = True,
+    alloc_dropout_p: float = 0.0,
+) -> Path:
     config = {
         "topology": "unused",
         "modulation_formats": str(_MODULATION_FORMATS_PATH),
@@ -157,58 +312,59 @@ def _write_config(tmp_path, *, epochs: int, hard_eval: bool = False, gate: str =
             "dual_max": 1000.0,
         },
         "pipeline": {
-            "lambda_regen": 1.0,
+            "lambda_dev": 1.0,
             "lambda_cost": 0.01,
             "channel_loading_fraction": 0.5,
         },
+        "placement": {
+            "alloc_dropout_p": alloc_dropout_p,
+            "lookahead": lookahead,
+        },
         "training": {
             "lr_edge_net": 1.0e-3,
-            "lr_regen": 1.0e-2,
+            "lr_alloc": 2.0e-2,
             "epochs_e2e": epochs,
             "vlastelica_lambda": 10.0,
             "vlastelica_lambda_min": 1.0,
             "vlastelica_lambda_decay": 0.995,
-            "regen_tau_start": 1.0,
-            "regen_tau_end": 0.1,
-            "regen_tau_anneal_start_epoch": 1,
-            "regen_tau_anneal_end_epoch": epochs,
+            "alloc_tau_start": 1.0,
+            "alloc_tau_end": 0.1,
+            "alloc_tau_anneal_start_epoch": 1,
+            "alloc_tau_anneal_end_epoch": epochs,
         },
         "log_dir": str(tmp_path / "logs"),
         "checkpoint_dir": str(tmp_path / "checkpoints"),
-        "selection": {"hard_eval": hard_eval},
     }
-    if gate is not None:
-        config["placement"] = {"gate": gate}
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.dump(config))
     return config_path
 
 
-def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: bool = False,
-               gate: str = None):
-    """Drive the real diffopt.train.main() epoch loop with a scripted
-    per-epoch (total_loss, num_violated, num_regen_soft) sequence.
+def _run_training(tmp_path, *, epochs: int = 1, scripted=None, monkeypatch=None,
+                  **config_kwargs):
+    """Drive the real diffopt.train.main() epoch loop.
 
     Only the numerically expensive / physics-derived pieces irrelevant to
     checkpoint selection (topology loading, QoT checkpoint loading, traffic
     matrix construction, preflight, and the pipeline forward + compute_loss)
-    are replaced with cheap deterministic stand-ins.
+    are replaced with cheap deterministic stand-ins. `hard_rollout` is left
+    REAL by default — the stub pipeline feeds it a genuinely feasible
+    allocation — so the default path still exercises the oracle. A test that
+    needs a specific deployed allocation monkeypatches `train_mod.hard_rollout`
+    itself, before calling this.
 
-    `regen_probs` overrides what the stub pipeline returns, so a test can
-    place probability mass on a specific node. Restored afterwards because it
-    is class state on _DummyPipeline.
+    `scripted` is a per-epoch (total_loss, num_violated, device_count)
+    sequence for the stubbed compute_loss.
 
-    `gate` is threaded into the written config's `placement.gate` key
-    (`None`, the default, omits the key entirely so main() falls back to
-    "sigmoid" the same way an old config with no `placement` section does).
-    RegenPlacement and its `count_penalty`/`hard_placement_mask` are the
-    REAL implementation here, not stubbed — only DiffONetPipeline and
-    compute_loss are — so this exercises the real gate-dispatch logic in
-    both.
+    Uses its own MonkeyPatch when the caller does not supply one, so a test
+    can patch `hard_rollout` on the pytest fixture and still call this with
+    no arguments. The two never collide: this helper patches only the names
+    listed below.
     """
+    if scripted is None:
+        scripted = [(1.0, 0, 0.0)] * epochs
+    epochs = len(scripted)
     call_count = {"n": 0}
-    if regen_probs is not None:
-        monkeypatch.setattr(_DummyPipeline, "regen_probs_value", regen_probs)
 
     def fake_load_topology(topology_path, modulation_formats_path):
         return _DummyTopology()
@@ -233,14 +389,13 @@ def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: b
     def fake_compute_loss(**kwargs):
         idx = call_count["n"]
         call_count["n"] += 1
-        loss_value, num_violated, num_regen = scripted[idx]
+        loss_value, num_violated, device_count = scripted[idx]
         loss = torch.tensor(loss_value, requires_grad=True)
         metrics = {
             "feasibility_loss": 0.0,
             "weighted_feasibility_loss": 0.0,
-            "regen_loss": 0.0,
             "path_noise_loss": 0.0,
-            "num_regen_soft": num_regen,
+            "device_count": float(device_count),
             "num_infeasible": num_violated,
             "num_violated": num_violated,
             "worst_margin_db": 0.0,
@@ -248,21 +403,73 @@ def _run_main(tmp_path, monkeypatch, *, scripted, regen_probs=None, hard_eval: b
         }
         return loss, metrics
 
-    monkeypatch.setattr(train_mod, "load_topology", fake_load_topology)
-    monkeypatch.setattr(train_mod, "load_qot_model", fake_load_qot_model)
-    monkeypatch.setattr(train_mod, "build_traffic_matrix", fake_build_traffic_matrix)
-    monkeypatch.setattr(train_mod, "preflight_filter", fake_preflight_filter)
-    monkeypatch.setattr(train_mod, "DiffONetPipeline", _DummyPipeline)
-    monkeypatch.setattr(train_mod, "compute_loss", fake_compute_loss)
+    own = monkeypatch is None
+    mp = pytest.MonkeyPatch() if own else monkeypatch
+    try:
+        mp.setattr(train_mod, "load_topology", fake_load_topology)
+        mp.setattr(train_mod, "load_qot_model", fake_load_qot_model)
+        mp.setattr(train_mod, "build_traffic_matrix", fake_build_traffic_matrix)
+        mp.setattr(train_mod, "preflight_filter", fake_preflight_filter)
+        mp.setattr(train_mod, "DiffONetPipeline", _DummyPipeline)
+        mp.setattr(train_mod, "compute_loss", fake_compute_loss)
 
-    config_path = _write_config(tmp_path, epochs=len(scripted), hard_eval=hard_eval, gate=gate)
-    monkeypatch.setattr(sys, "argv", ["train.py", "--config", str(config_path)])
-    train_mod.main()
+        config_path = _write_config(tmp_path, epochs=epochs, **config_kwargs)
+        mp.setattr(sys, "argv", ["train.py", "--config", str(config_path)])
+        train_mod.main()
+    finally:
+        if own:
+            mp.undo()
+
     return torch.load(tmp_path / "checkpoints" / "best_e2e.pt", weights_only=False)
 
 
+def _run_two_epochs_and_load():
+    """Two stubbed epochs in a throwaway directory -> the saved checkpoint."""
+    with tempfile.TemporaryDirectory() as tmp:
+        return _run_training(Path(tmp), scripted=[(1.0, 0, 0.0), (0.5, 0, 0.0)])
+
+
+def _read_csv(path) -> list[list[str]]:
+    with open(path, newline="") as f:
+        return list(csv.reader(f))
+
+
+def _hard(violated, devices, sites, margin, *, oracle_devices=None):
+    """One scripted hard_rollout return value."""
+    if oracle_devices is None:
+        oracle_devices = devices
+    mask = torch.zeros(_DummyTopology.num_nodes, dtype=torch.bool)
+    mask[:sites] = True
+    return {
+        "hard_num_violated": violated,
+        "hard_num_devices": devices,
+        "hard_num_sites": sites,
+        "hard_worst_margin_db": margin,
+        "oracle_devices": oracle_devices,
+        "oracle_gap": devices - oracle_devices,
+        "oracle_infeasible": 0,
+        "site_mask": mask,
+        "alloc_by_node": torch.zeros(1, _DummyTopology.num_nodes),
+    }
+
+
+def _script_hard_rollout(monkeypatch, scripted):
+    calls = {"n": 0}
+
+    def fake_hard_rollout(*a, **kw):
+        out = scripted[min(calls["n"], len(scripted) - 1)]
+        calls["n"] += 1
+        return out
+
+    monkeypatch.setattr(train_mod, "hard_rollout", fake_hard_rollout)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint selection under the constrained objective
+# ---------------------------------------------------------------------------
+
 def test_selection_prefers_fewer_violations(tmp_path, monkeypatch):
-    """A higher-loss, zero-violation epoch must beat a lower-loss, violated one.
+    """A device-hungrier, zero-violation epoch must beat a lean, violated one.
 
     Selection on total loss alone is already wrong under the OLD objective:
     the shipped checkpoints/e2e_ind132/best_e2e.pt is epoch 40 while its own
@@ -271,190 +478,225 @@ def test_selection_prefers_fewer_violations(tmp_path, monkeypatch):
     a constrained formulation lambda is deliberately non-stationary, so total
     loss becomes still less comparable across epochs.
     """
-    #        (total_loss, num_violated, num_regen_soft)
-    scripted = [
-        (5.0, 3, 4),   # epoch 1 — lowest violations so far
-        (1.0, 7, 4),   # epoch 2 — much lower loss, but MORE violated
-        (9.0, 0, 6),   # epoch 3 — highest loss, zero violated -> must win
-    ]
-    ckpt = _run_main(tmp_path, monkeypatch, scripted=scripted)
+    _script_hard_rollout(monkeypatch, [
+        _hard(3, 4, 2, -1.5),    # epoch 1 — fewest devices so far, but violated
+        _hard(7, 4, 2, -3.0),    # epoch 2 — MORE violated
+        _hard(0, 9, 3, +0.2),    # epoch 3 — most devices, zero violated -> wins
+    ])
+    ckpt = _run_training(tmp_path, scripted=[(5.0, 3, 4.0), (1.0, 7, 4.0), (9.0, 0, 6.0)])
     assert ckpt["epoch"] == 3
-    assert ckpt["num_violated"] == 0
-    assert ckpt["total_loss"] == pytest.approx(9.0)
+    assert ckpt["hard_num_violated"] == 0
+    assert ckpt["hard_num_devices"] == 9
 
 
-def test_selection_breaks_violation_ties_on_regenerator_count(tmp_path, monkeypatch):
+def test_selection_key_is_violated_then_devices_then_margin(tmp_path, monkeypatch):
+    """(hard_num_violated, hard_num_devices, -hard_worst_margin_db).
+
+    Epoch 2 improves on epoch 1's violation count and must be checkpointed;
+    epoch 3 is feasible too but uses MORE devices, so it must NOT overwrite
+    it. This is the whole reason the middle slot changed from a site count:
+    under the old key epoch 3 could win by touching fewer NODES while buying
+    more hardware.
+    """
     scripted = [
-        (1.0, 0, 9),   # epoch 1 — zero violated, 9 regens
-        (8.0, 0, 5),   # epoch 2 — zero violated, 5 regens -> must win
-        (0.5, 0, 7),   # epoch 3 — lowest loss, but 7 regens
+        {"hard_num_violated": 1, "hard_num_devices": 0, "hard_num_sites": 0,
+         "hard_worst_margin_db": -1.0, "oracle_devices": 0, "oracle_gap": 0,
+         "oracle_infeasible": 0, "site_mask": torch.zeros(5, dtype=torch.bool),
+         "alloc_by_node": torch.zeros(2, 5)},
+        {"hard_num_violated": 0, "hard_num_devices": 2, "hard_num_sites": 2,
+         "hard_worst_margin_db": +0.4, "oracle_devices": 2, "oracle_gap": 0,
+         "oracle_infeasible": 0,
+         "site_mask": torch.tensor([1, 1, 0, 0, 0], dtype=torch.bool),
+         "alloc_by_node": torch.zeros(2, 5)},
+        {"hard_num_violated": 0, "hard_num_devices": 5, "hard_num_sites": 1,
+         "hard_worst_margin_db": +0.9, "oracle_devices": 2, "oracle_gap": 3,
+         "oracle_infeasible": 0,
+         "site_mask": torch.tensor([1, 0, 0, 0, 0], dtype=torch.bool),
+         "alloc_by_node": torch.zeros(2, 5)},
     ]
-    ckpt = _run_main(tmp_path, monkeypatch, scripted=scripted)
+    _script_hard_rollout(monkeypatch, scripted)
+    _run_training(tmp_path, epochs=3)
+
+    ckpt = torch.load(tmp_path / "checkpoints" / "best_e2e.pt", weights_only=False)
     assert ckpt["epoch"] == 2
-    assert ckpt["num_regen_soft"] == 5
+    assert ckpt["hard_num_devices"] == 2
+    # Epoch 3 has MORE devices but FEWER sites. Under the deleted
+    # hard_num_placed key it would have won.
+    assert ckpt["hard_num_sites"] == 2
 
 
-def test_selection_breaks_full_ties_on_total_loss(tmp_path, monkeypatch):
-    scripted = [
-        (5.0, 0, 4),
-        (2.0, 0, 4),   # identical violations and regens, lower loss -> wins
-        (7.0, 0, 4),
-    ]
-    ckpt = _run_main(tmp_path, monkeypatch, scripted=scripted)
+def test_selection_breaks_full_ties_on_worst_margin(tmp_path, monkeypatch):
+    """Third slot is -hard_worst_margin_db: more headroom wins.
+
+    It used to be loss.item(), which invariants.md itself calls
+    non-comparable across epochs.
+    """
+    _script_hard_rollout(monkeypatch, [
+        _hard(0, 4, 2, +0.1),
+        _hard(0, 4, 2, +0.9),    # identical violations and devices, most headroom
+        _hard(0, 4, 2, +0.5),
+    ])
+    ckpt = _run_training(tmp_path, epochs=3)
     assert ckpt["epoch"] == 2
-    assert ckpt["total_loss"] == pytest.approx(2.0)
+    assert ckpt["hard_worst_margin_db"] == pytest.approx(0.9)
 
 
-def test_duals_are_saved_with_the_checkpoint(tmp_path, monkeypatch):
+def test_selection_key_comes_from_the_hard_rollout_not_the_relaxation(
+    tmp_path, monkeypatch
+):
+    """The bug this fixes: early in training the soft pass is a mean-field
+    relaxation whose partition-weighted expectation is systematically more
+    optimistic than any single allocation, so it reports an unbeatable
+    (violated=0, devices~0) key while the DEPLOYED allocation is empty and
+    infeasible. Script epoch 1 as the soft-optimal epoch and epoch 2 as
+    genuinely better on the hard rollout; epoch 2 must win.
+    """
+    _script_hard_rollout(monkeypatch, [
+        _hard(1, 0, 0, -2.0),    # deployed: empty and infeasible
+        _hard(0, 1, 1, +0.3),    # deployed: one device, feasible
+    ])
+    ckpt = _run_training(
+        tmp_path,
+        # (total_loss, num_violated, device_count) from the SOFT pass
+        scripted=[(1.0, 0, 0.0), (99.0, 5, 4.0)],
+    )
+    assert ckpt["epoch"] == 2
+    assert ckpt["hard_num_violated"] == 0
+    assert ckpt["hard_num_devices"] > 0
+
+
+def test_duals_are_saved_with_the_checkpoint(tmp_path):
     """A run can be resumed or audited only if the dual state is persisted."""
-    ckpt = _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 3)])
+    ckpt = _run_training(tmp_path)
     assert "duals" in ckpt
     assert isinstance(ckpt["duals"], torch.Tensor)
 
 
-def test_selection_key_comes_from_the_hard_placement_not_the_relaxation(
-    tmp_path, monkeypatch
-):
-    """The bug this fixes: at epoch 1 every logit is 0, so the soft pass
-    reports (violated=0, regens=0) — an unbeatable key — while the actual
-    deployed placement is EMPTY and infeasible. Scripting epoch 1 as the
-    soft-optimal epoch and epoch 2 as genuinely better must select epoch 2.
+def test_checkpoint_has_no_gate_keys_and_is_a_hard_break():
+    """Spec decision 7. The old keys must be ABSENT, not merely unused —
+    a reader that falls back to them would reinterpret a device-priced run
+    as a site-priced one."""
+    ckpt = _run_two_epochs_and_load()
+    assert "alloc_head_state" in ckpt
+    assert "gate" not in ckpt
+    assert "regen_logits" not in ckpt
+    assert "regen_log_alpha" not in ckpt
+    assert "hard_num_placed" not in ckpt
 
-    The dummy pipeline's stubbed loss (see _run_main's fake_compute_loss) is
-    a disconnected leaf tensor, so regen_placement.regen_logits never
-    receives a real gradient and can't move on its own within this harness.
-    Script the DEPLOYED placement directly and independently of the soft
-    `scripted` values -- exactly the independence _DummyPipeline's
-    docstring calls "the whole point of the fix" -- by driving
-    RegenPlacement.hard_placement_mask() off a call counter: it is called
-    exactly once per epoch, from hard_placement_metrics's pre-step
-    snapshot. Epoch 1 gets the empty placement the real bug ships (matching
-    every candidate logit starting at 0); epoch 2 gets one candidate node
-    placed.
+
+def test_checkpoint_records_the_site_mask(tmp_path):
+    """So no consumer has to re-derive the deployed set from raw parameters.
+
+    The mask is a DIAGNOSTIC — it is logged and saved, never priced and
+    never in the selection key.
     """
-    masks = [
-        torch.zeros(_DummyTopology.num_nodes, dtype=torch.bool),
-        torch.tensor([False, True, False, False, False]),
+    ckpt = _run_training(tmp_path)
+    assert "site_mask" in ckpt
+    assert ckpt["site_mask"].dtype == torch.bool
+    assert ckpt["site_mask"].numel() == _DummyTopology.num_nodes
+
+
+def test_checkpoint_saves_both_optimizer_states_and_the_head(tmp_path):
+    ckpt = _run_training(tmp_path)
+    assert "opt_edge_state" in ckpt
+    assert "opt_alloc_state" in ckpt
+    assert "opt_regen_state" not in ckpt
+    # Real AllocationHead parameters, not a stub — main() builds the head
+    # itself, only DiffONetPipeline is replaced.
+    assert any(k.startswith("net.") for k in ckpt["alloc_head_state"])
+
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+
+def test_log_csv_header_is_device_priced(tmp_path):
+    _run_training(tmp_path)
+    header = _read_csv(tmp_path / "logs" / "e2e_train_log.csv")[0]
+    assert header == [
+        "epoch", "total_loss", "feasibility_loss", "weighted_feasibility_loss",
+        "device_loss", "path_noise_loss", "device_count",
+        "num_infeasible", "num_violated",
+        "hard_num_violated", "hard_num_devices", "hard_num_sites",
+        "hard_worst_margin_db", "oracle_devices", "oracle_gap",
+        "oracle_infeasible", "worst_margin_db",
+        "lambda_max_observed", "num_at_cap",
+        "tau", "vlastelica_lambda",
+        "alloc_score_mean", "alloc_score_min", "alloc_score_max",
+        "alloc_dropout_p", "lookahead",
+        "ste_clamped_segments", "proxy_qot_rank_corr",
     ]
-    call_count = {"n": 0}
-
-    def fake_hard_placement_mask(self):
-        idx = min(call_count["n"], len(masks) - 1)
-        call_count["n"] += 1
-        return masks[idx]
-
-    monkeypatch.setattr(
-        RegenPlacement, "hard_placement_mask", fake_hard_placement_mask
-    )
-
-    ckpt = _run_main(
-        tmp_path,
-        monkeypatch,
-        # (total_loss, num_violated, num_regen_soft) from the SOFT pass
-        scripted=[(1.0, 0, 0), (99.0, 5, 4)],
-        hard_eval=True,
-    )
-    assert ckpt["epoch"] == 2
-    assert ckpt["hard_num_violated"] == 0
-    assert ckpt["hard_num_placed"] > 0
 
 
-def test_hard_placement_metrics_counts_against_threshold_plus_margin():
-    """num_violated is the margin-inclusive count, matching compute_loss."""
-    import diffopt.train as train_mod
-
-    topology = _DummyTopology()
-    placement = RegenPlacement(topology.num_nodes)
-    with torch.no_grad():
-        placement.regen_logits.copy_(torch.tensor([-1.0, 2.0, -1.0, 3.0, -1.0]))
-    demands = [Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)]
-
-    metrics = train_mod.hard_placement_metrics(
-        _DummyPipeline(), placement, demands, _mod_config(),
-        lambda_=10.0, margin_db=0.5,
-    )
-
-    assert metrics["hard_num_placed"] == 2
-    assert metrics["placement_mask"].tolist() == [False, True, False, True, False]
-    # gsnr_placed = 100.0 is far above any threshold + 0.5
-    assert metrics["hard_num_violated"] == 0
+def test_log_csv_records_a_non_negative_oracle_gap(tmp_path):
+    """The acceptance metric for the whole stage. Non-negative by the
+    oracle's exchange argument — a negative value means hard_rollout and
+    oracle_allocation are scoring chunks differently."""
+    _run_training(tmp_path, scripted=[(1.0, 0, 0.0), (1.0, 0, 0.0)])
+    rows = _read_csv(tmp_path / "logs" / "e2e_train_log.csv")
+    header, body = rows[0], rows[1:]
+    gap = header.index("oracle_gap")
+    assert len(body) == 2
+    for row in body:
+        assert int(row[gap]) >= 0
 
 
-def test_checkpoint_records_the_placement_mask(tmp_path, monkeypatch):
-    """So no consumer has to re-derive the deployed set from raw parameters."""
-    ckpt = _run_main(
-        tmp_path, monkeypatch, scripted=[(1.0, 0, 0)], hard_eval=True
-    )
-    assert "placement_mask" in ckpt
-    assert ckpt["placement_mask"].dtype == torch.bool
-    assert ckpt["placement_mask"].numel() == _DummyTopology.num_nodes
+def test_device_trajectory_csv_records_devices_and_sites(tmp_path):
+    _run_training(tmp_path)
+    rows = _read_csv(tmp_path / "logs" / "placement_trajectory.csv")
+    assert rows[0] == ["epoch", "num_devices", "num_sites", "site_nodes"]
 
 
-def test_hard_eval_disabled_falls_back_to_the_soft_key(tmp_path, monkeypatch):
-    """selection.hard_eval: false must reproduce the old behaviour exactly,
-    so the refactor can be proven a no-op before any arm is measured."""
-    ckpt = _run_main(
-        tmp_path, monkeypatch, scripted=[(1.0, 0, 0), (99.0, 5, 4)],
-        hard_eval=False,
-    )
-    assert ckpt["epoch"] == 1
+def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
+    """Written every epoch, not only on checkpoint improvements — the whole
+    point is to see the oscillation between the epochs that got saved.
 
-
-def _read_log(tmp_path) -> list[dict]:
-    with open(tmp_path / "logs" / "e2e_train_log.csv", newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def test_inert_placements_on_non_candidate_nodes_are_counted(tmp_path, monkeypatch):
-    """`num_regen_soft` counts probability mass on ALL nodes, but only
-    `topology.regen_candidate_nodes` can ever split a path — `segment_path`
-    splits nowhere else, so a placement on any other node is physically inert
-    while still costing `lambda_regen * p`.
-
-    Measured on the shipped checkpoints/e2e_ind132/best_e2e.pt (epoch 40),
-    that contamination is currently ZERO: all 8 placed nodes are candidates,
-    and the 84 non-candidates sit pinned in a 0.0069-wide band at ~-0.817,
-    because they receive only down-pressure from the regen penalty. (-0.817
-    is almost exactly lr_regen * epochs = 0.02 * 40 = 0.80, which is Adam's
-    whole reachable excursion for a steady-sign gradient.)
-
-    It is not guaranteed to STAY zero. `regen_probs` also feed EdgeWeightNet's
-    edge features at both endpoints of every edge, including non-candidates,
-    so feasibility reaches those logits indirectly through routing. That path
-    is worth ~0.007 of logit at today's fixed weight of 10 — but the duals now
-    scale to `dual_max`, and 100x amplification puts it at ~0.7, comparable to
-    the entire +/-1.2 excursion range. Hence the dedicated log column.
-
-    Node 4 is a non-candidate in _DummyTopology, so p=0.9 there must be
-    counted by BOTH columns; node 3 is a candidate, so it lands only in
-    num_regen_soft.
+    Epoch 2 improves over epoch 1 and gets checkpointed; epoch 3 regresses
+    (more devices at the same zero violations) and does NOT — yet must still
+    produce a trajectory row.
     """
-    probs = torch.tensor([0.1, 0.2, 0.3, 0.8, 0.9])   # nodes 3 and 4 placed
-    _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 2)], regen_probs=probs)
-    row = _read_log(tmp_path)[0]
-    assert int(row["num_regen_soft"]) == 2, "nodes 3 and 4 both exceed 0.5"
-    assert int(row["num_regen_noncand"]) == 1, "only node 4 is a non-candidate"
+    _script_hard_rollout(monkeypatch, [
+        _hard(1, 0, 0, -1.0),
+        _hard(0, 2, 2, +0.4),
+        _hard(0, 5, 5, +0.9),
+    ])
+    _run_training(tmp_path, epochs=3)
+
+    rows = _read_csv(tmp_path / "logs" / "placement_trajectory.csv")
+    assert [r[0] for r in rows[1:]] == ["1", "2", "3"]
+    assert [r[1] for r in rows[1:]] == ["0", "2", "5"]     # num_devices
+    assert [r[2] for r in rows[1:]] == ["0", "2", "5"]     # num_sites
+    assert rows[1][3] == ""
+    assert rows[3][3] == "0 1 2 3 4"
+
+    ckpt = torch.load(tmp_path / "checkpoints" / "best_e2e.pt", weights_only=False)
+    assert ckpt["epoch"] == 2
+    assert ckpt["hard_num_devices"] == 2
 
 
-def test_no_inert_placements_reports_zero(tmp_path, monkeypatch):
-    """The expected steady state — everything placed is a candidate."""
-    probs = torch.tensor([0.1, 0.9, 0.2, 0.8, 0.3])   # nodes 1 and 3: both candidates
-    _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 2)], regen_probs=probs)
-    row = _read_log(tmp_path)[0]
-    assert int(row["num_regen_soft"]) == 2
-    assert int(row["num_regen_noncand"]) == 0
+def test_placement_trajectory_records_an_empty_set_without_crashing(tmp_path):
+    """Epoch 1 of a real run allocates nothing — the head starts CLOSED."""
+    _run_training(tmp_path)
+    rows = _read_csv(tmp_path / "logs" / "placement_trajectory.csv")
+    assert rows[1][1] == "0"     # num_devices
+    assert rows[1][2] == "0"     # num_sites
+    assert rows[1][3] == ""      # site_nodes
 
+
+# ---------------------------------------------------------------------------
+# Guards
+# ---------------------------------------------------------------------------
 
 def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch):
     """main() must fail fast — not silently train on zero demands — when a
     non-empty traffic matrix survives build_traffic_matrix but preflight
     excludes every single one of them (e.g. traffic.scale set so high, or so
     mismatched to the topology, that nothing clears the GSNR bar even under
-    the most favourable routing/regen assumptions).
+    the most favourable routing/allocation assumptions).
 
     This is the guard's real purpose, distinct from every other test in this
     module: those use a non-empty raw_matrix that preflight keeps entirely
-    (see _run_main's _dummy_demand), so they exercise the guard's happy
+    (see _run_training's _dummy_demand), so they exercise the guard's happy
     path, not its raise path. Without this test, `if not demands: raise
     ValueError(...)` had zero coverage of the branch it exists for.
     """
@@ -488,107 +730,3 @@ def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch)
 
     with pytest.raises(ValueError, match="Preflight excluded every demand"):
         train_mod.main()
-
-
-def test_placement_trajectory_has_one_row_per_epoch(tmp_path, monkeypatch):
-    """Written every epoch, not only on checkpoint improvements — the whole
-    point is to see the oscillation between the epochs that got saved.
-
-    Uses hard_eval=True to test under the lexicographic hard-placement key
-    (hard_num_violated, hard_num_placed, -hard_worst_margin_db). The mask
-    sequence is designed so epoch 2 improves over epoch 1 and gets checkpointed,
-    but epoch 3 regresses (more placed nodes when zero violations is tied) and
-    does NOT improve — yet must still produce a placement_trajectory.csv row,
-    proving rows are written unconditionally every epoch.
-    """
-    import csv as csv_mod
-
-    # Script masks to drive hard-eval selection independently of soft loss.
-    # hard_placement_mask() is called once per epoch when hard_eval=True.
-    #
-    # Epoch 1: empty → gsnr_unplaced=5.0 < 7.6 threshold → hard_num_violated=1
-    #   hard_num_placed=0 → selection_key (1, 0, X1)
-    # Epoch 2: nodes [1,3] → non-empty → gsnr_placed=100.0 → hard_num_violated=0
-    #   hard_num_placed=2 → selection_key (0, 2, X2) — improves (0 < 1) — CHECKPOINTED
-    # Epoch 3: all 5 nodes → non-empty → gsnr_placed=100.0 → hard_num_violated=0
-    #   hard_num_placed=5 → selection_key (0, 5, X3) — regresses (5 > 2, fewer is better)
-    #   Does NOT improve → must still write a trajectory row (unconditional)
-    masks = [
-        torch.zeros(_DummyTopology.num_nodes, dtype=torch.bool),      # epoch 1: empty
-        torch.tensor([False, True, False, True, False]),              # epoch 2: nodes 1,3 (2 total)
-        torch.tensor([True, True, True, True, True]),                 # epoch 3: all 5 nodes
-    ]
-    call_count = {"n": 0}
-
-    def fake_hard_placement_mask(self):
-        idx = min(call_count["n"], len(masks) - 1)
-        call_count["n"] += 1
-        return masks[idx]
-
-    monkeypatch.setattr(RegenPlacement, "hard_placement_mask", fake_hard_placement_mask)
-
-    # Soft loss values are inert (hard_eval=True uses hard metrics for selection).
-    # Scripted just to satisfy compute_loss call signature.
-    _run_main(
-        tmp_path, monkeypatch,
-        scripted=[(1.0, 1, 0), (1.0, 0, 0), (1.0, 0, 0)],
-        hard_eval=True,
-    )
-
-    path = tmp_path / "logs" / "placement_trajectory.csv"
-    with open(path, newline="") as f:
-        rows = list(csv_mod.DictReader(f))
-
-    # All three epochs must produce rows in the trajectory log.
-    assert [r["epoch"] for r in rows] == ["1", "2", "3"]
-
-    # Verify num_placed counts match actual node lists.
-    assert int(rows[0]["num_placed"]) == 0  # epoch 1 empty
-    assert int(rows[1]["num_placed"]) == 2  # epoch 2: nodes 1,3
-    assert int(rows[2]["num_placed"]) == 5  # epoch 3: all 5 nodes (didn't improve, but still logged)
-
-    # Verify num_placed matches the count of space-separated node indices.
-    for r in rows:
-        if r["placed_nodes"]:
-            assert int(r["num_placed"]) == r["placed_nodes"].count(" ") + 1
-        else:
-            assert int(r["num_placed"]) == 0
-
-    # Verify epoch 2 was selected (best hard-eval key), not epoch 3.
-    ckpt = torch.load(tmp_path / "checkpoints" / "best_e2e.pt", weights_only=False)
-    assert ckpt["epoch"] == 2
-    assert ckpt["hard_num_placed"] == 2  # epoch 2's deployment
-
-
-def test_placement_trajectory_records_an_empty_set_without_crashing(
-    tmp_path, monkeypatch
-):
-    """Epoch 1 of a real run has zero placed nodes (all logits at 0)."""
-    import csv as csv_mod
-
-    _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 0)])
-
-    with open(tmp_path / "logs" / "placement_trajectory.csv", newline="") as f:
-        rows = list(csv_mod.DictReader(f))
-
-    assert rows[0]["num_placed"] == "0"
-    assert rows[0]["placed_nodes"] == ""
-
-
-def test_checkpoint_records_the_active_gate(tmp_path, monkeypatch):
-    ckpt = _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 0)])
-    assert ckpt["gate"] == "sigmoid"
-    assert "regen_logits" in ckpt
-
-
-def test_hard_concrete_checkpoint_uses_log_alpha_key(tmp_path, monkeypatch):
-    """Under gate="hard_concrete" the checkpoint must record the parameter
-    under "regen_log_alpha" and must NOT save a "regen_logits" key at all —
-    reloading a hard_concrete checkpoint's log_alpha values as sigmoid
-    logits (or vice versa) would silently reinterpret them as a different
-    quantity. See scripts/_common.py's build_context gate-mismatch guard,
-    which depends on this key being genuinely absent rather than stale."""
-    ckpt = _run_main(tmp_path, monkeypatch, scripted=[(1.0, 0, 0)], gate="hard_concrete")
-    assert ckpt["gate"] == "hard_concrete"
-    assert "regen_log_alpha" in ckpt
-    assert "regen_logits" not in ckpt

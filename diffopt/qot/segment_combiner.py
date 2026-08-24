@@ -401,7 +401,7 @@ class SegmentCombiner(nn.Module):
         would defeat the batching. The one consequence: a batch of
         all-hard probabilities gets the DP's limiting gradient w.r.t. `p`
         rather than `forward()`'s exact zero. Irrelevant for the callers
-        that pass hard probabilities — `train.py`'s hard_placement_metrics
+        that pass hard probabilities — `train.py`'s hard_rollout
         and `traffic.preflight_filter` — both of which run under
         `torch.no_grad()`.
         """
