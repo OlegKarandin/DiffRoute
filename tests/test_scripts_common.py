@@ -287,6 +287,85 @@ def test_build_context_loads_checkpoint_into_pipeline():
     assert torch.equal(ctx.pipeline.edge_log_weight.detach(), ctx.ckpt["edge_log_weight"])
 
 
+def test_build_context_loads_a_synthetic_checkpoint_into_the_pipeline(monkeypatch, tmp_path):
+    """The loading MECHANISM, pinned UNCONDITIONALLY.
+
+    Its sibling above checks the same thing against a real trained
+    checkpoint, but `checkpoints/` is gitignored — so on a clean clone, in
+    CI, or for anyone who has not just run 60 epochs of training, that test
+    SKIPS and the two assertions that matter never execute. That is exactly
+    how the bug this test exists to pin survived Task 7: the checkpoint key
+    was renamed to `edge_log_weight` while the call stayed
+    `edge_weight_net.load_state_dict(...)`, and nothing went red because
+    nothing exercised the path without a real checkpoint on disk.
+
+    Two distinct failure modes must both go red here:
+
+      wrong mechanism   `ckpt["edge_log_weight"]` is a RAW (E,) tensor, not
+                        a state_dict — `.load_state_dict()` on it raises.
+      wrong target      loading it into anything other than
+                        `pipeline.edge_log_weight` leaves the pipeline
+                        routing on its length-proportional init, silently.
+                        The random draw below can never coincide with that
+                        init, so the equality assertion catches it.
+
+    Stubs load_qot_model the way every other build_context test in this file
+    does, so this needs neither checkpoints/best_qot.pt nor a trained e2e
+    checkpoint.
+    """
+    import scripts._common as common_mod
+    from diffopt.placement.allocation import AllocationHead
+    from diffopt.qot.model import SpanAttentionQoT
+    from diffopt.topology import load_topology
+
+    def fake_load_qot_model(checkpoint_path, cfg, device):
+        return SpanAttentionQoT(max_spans=cfg.get("max_spans_per_segment", 60))
+
+    monkeypatch.setattr(common_mod, "load_qot_model", fake_load_qot_model)
+
+    cfg = yaml.safe_load(_SMALL_TEST_IND132.read_text())
+    topology = load_topology(cfg["topology"], cfg["modulation_formats"])
+    num_edges = len(list(topology.undirected_edges))
+
+    # Randomised, not zeros: the head's output layer initialises to a ZERO
+    # weight and edge_log_weight initialises length-proportionally, so a
+    # zero/default fixture could pass against a load that never happened.
+    torch.manual_seed(1234)
+    head_state = {
+        k: torch.randn_like(v) for k, v in AllocationHead().state_dict().items()
+    }
+    assert head_state, "AllocationHead has no state to load — fixture is vacuous"
+    edge_log_weight = torch.randn(num_edges)
+    ckpt = {
+        "epoch": 7,
+        "alloc_head_state": head_state,
+        "edge_log_weight": edge_log_weight,
+        "vlastelica_lambda": 9.5,
+    }
+    ckpt_path = tmp_path / "best_e2e.pt"
+    torch.save(ckpt, ckpt_path)
+
+    ctx = build_context(cfg, load_e2e_checkpoint=True, checkpoint_path=str(ckpt_path))
+
+    assert torch.equal(ctx.pipeline.edge_log_weight.detach(), edge_log_weight)
+    # Copied in place, so it is still the trainable Parameter the pipeline
+    # routes with — not replaced by a plain tensor no optimizer would see.
+    assert isinstance(ctx.pipeline.edge_log_weight, torch.nn.Parameter)
+    assert ctx.pipeline.edge_log_weight.requires_grad
+
+    loaded = ctx.pipeline.allocation_head.state_dict()
+    for name, value in head_state.items():
+        assert torch.equal(loaded[name], value), f"{name} was not loaded"
+    # The context's head and the pipeline's head must be ONE object, or a
+    # diagnostic would inspect parameters the pipeline never uses.
+    assert ctx.allocation_head is ctx.pipeline.allocation_head
+
+    # The raw dict is handed back so callers can read the checkpoint's own
+    # saved schedule values rather than recomputing them (see schedule_at).
+    assert ctx.ckpt["epoch"] == 7
+    assert ctx.ckpt["vlastelica_lambda"] == 9.5
+
+
 def test_pre_stage_ii_checkpoint_is_rejected_loudly(monkeypatch, tmp_path):
     """A silent fallback is how a site-priced checkpoint gets reported as a
     device-priced result.
