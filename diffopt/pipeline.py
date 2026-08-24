@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from diffopt.demands import Demand
 from diffopt.modulation import ModulationConfig, bar_db_for_demands
@@ -20,7 +21,6 @@ from diffopt.qot.segment_combiner import (
     db_to_linear_noise,
 )
 from diffopt.qot.span_features import SPAN_FEATURE_DIM, span_feature_rows
-from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.surrogate import surrogate_shortest_path
 from diffopt.topology import Edge, Topology
 
@@ -115,12 +115,14 @@ class DiffONetPipeline(nn.Module):
 
     Forward pass:
       2. Read the static per-edge feature buffer (topology + is_candidate
-         indicators at each endpoint; built once in __init__).
-      3. Compute edge weights via EdgeWeightNet.
+         indicators at each endpoint; built once in __init__). Kept for
+         diagnostics; no longer consumed by step 3 (spec decision 6).
+      3. Compute edge weights from the free per-edge parameter
+         edge_log_weight (Softplus, then renormalised to unit mean).
       4. For each demand:
          a. Run surrogate Dijkstra → binary path indicator (differentiable).
          b. Accumulate path_noise_cost = (path_indicator · edge_ase_noise).sum()
-            — this is the live autograd path into EdgeWeightNet.
+            — this is the live autograd path into edge_log_weight.
          c. Reconstruct ordered edge list (using detached indicator).
          d. Segment path at regen candidate nodes.
       5. Run the frozen QoT model on every segment in one batched call.
@@ -148,7 +150,6 @@ class DiffONetPipeline(nn.Module):
         topology: Topology,
         qot_model: SpanAttentionQoT,
         segment_combiner: SegmentCombiner,
-        edge_weight_net: EdgeWeightNet,
         allocation_head: AllocationHead,
         modulation_config: ModulationConfig,
         margin_db: float,
@@ -165,7 +166,6 @@ class DiffONetPipeline(nn.Module):
 
         self.qot_model = qot_model
         self.segment_combiner = segment_combiner
-        self.edge_weight_net = edge_weight_net
         self.allocation_head = allocation_head
         # Run constants, stored the same way channel_loading_fraction and
         # max_spans already are: the bar is a property of the config, not of
@@ -179,6 +179,23 @@ class DiffONetPipeline(nn.Module):
         self._edges: List[Edge] = list(topology.undirected_edges)
         self._num_nodes = topology.num_nodes
         self._regen_candidate_set: Set[int] = set(topology.regen_candidate_nodes)
+
+        # Spec decision 6. Under approach A the edge features are constant,
+        # so EdgeWeightNet(constant) is a fixed function of its own weights —
+        # a reparameterization of E numbers with 5 000-odd parameters and a
+        # curvature landscape nobody chose. The class is retained in
+        # diffopt/routing/edge_weight_net.py so this commit can be reverted
+        # on its own.
+        #
+        # Init at length-proportional weights, i.e. shortest-by-km routing:
+        # the documented baseline, and what preflight_filter screens against.
+        # Uniform init (theta = 0) would tie every edge and hand routing to
+        # Dijkstra's tie-break order — see the adjacency-ordering invariant.
+        km = torch.tensor(
+            [e.length_km for e in self._edges], dtype=torch.float32
+        )
+        target = km / km.mean()
+        self.edge_log_weight = nn.Parameter(torch.log(torch.expm1(target)))
 
         # Register topology-derived tensors as buffers so they move with the model
 
@@ -411,10 +428,13 @@ class DiffONetPipeline(nn.Module):
         device = self._topo_edge_features.device
 
         # 2. Edge features — static, built once in __init__ (approach A).
-        edge_feats = self._static_edge_features
+        # `_static_edge_features` itself is no longer read by routing (see
+        # spec decision 6: edge_log_weight is a free per-edge parameter, not
+        # a function of these features any more); the buffer is kept for
+        # diagnostics and the standardisation invariant tests.
 
-        # 3. Edge weights via EdgeWeightNet — (E,), strictly positive via
-        # Softplus, then renormalised to unit mean.
+        # 3. Edge weights from the free per-edge parameter edge_log_weight —
+        # (E,), strictly positive via Softplus, then renormalised to unit mean.
         #
         # The divisor is deliberately NOT detached. With w = u / mean(u), the
         # loss becomes homogeneous of degree 0 in the raw output u, since
@@ -434,7 +454,7 @@ class DiffONetPipeline(nn.Module):
         # purpose (there the goal is to rescale an error term without adding
         # a gradient path). The two lines look nearly identical and mean
         # opposite things. Do not "make them consistent".
-        raw_edge_weights = self.edge_weight_net(edge_feats).squeeze(-1)
+        raw_edge_weights = F.softplus(self.edge_log_weight)
         edge_weights = raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)
 
         # 4. Route and segment every demand first (no QoT calls yet), so all

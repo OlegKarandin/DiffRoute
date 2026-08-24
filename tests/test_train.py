@@ -34,7 +34,6 @@ from diffopt.pipeline import DiffONetPipeline
 from diffopt.placement.allocation import AllocationHead
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.train import linear_anneal
 from tests.test_pipeline import make_demands, make_hub_topology, make_mod_config, make_pipeline
 
@@ -116,7 +115,6 @@ def _tiny_e2e_setup():
         topology=topology,
         qot_model=SpanAttentionQoT(max_spans=60),
         segment_combiner=SegmentCombiner(),
-        edge_weight_net=EdgeWeightNet(),
         allocation_head=AllocationHead(),
         modulation_config=mod_cfg,
         margin_db=0.5,
@@ -271,7 +269,11 @@ class _DummyPipeline:
     gsnr_value = 100.0
 
     def __init__(self, **kwargs) -> None:
-        pass
+        # main() builds `opt_edge = optim.Adam([pipeline.edge_log_weight], ...)`
+        # and snapshots it pre-step every epoch (spec decision 6, Task 7) — an
+        # unconnected leaf tensor satisfies both without needing this stub's
+        # __call__ to route through it.
+        self.edge_log_weight = torch.zeros(5, requires_grad=True)
 
     def to(self, device):
         return self

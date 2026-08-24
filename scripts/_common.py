@@ -159,7 +159,7 @@ def build_context(
     if load_e2e_checkpoint:
         ckpt_path = Path(checkpoint_path or f"{cfg.get('checkpoint_dir', 'checkpoints')}/best_e2e.pt")
         ckpt = torch.load(ckpt_path, map_location=device)
-        edge_weight_net.load_state_dict(ckpt["edge_weight_net_state"])
+        edge_weight_net.load_state_dict(ckpt["edge_log_weight"])
         # Checkpoints written before 2026-08-21 have no "gate" key and are
         # always sigmoid. Reading the checkpoint's own gate rather than the
         # config's guards against pointing a hard_concrete config at a

@@ -22,7 +22,6 @@ from diffopt.placement.allocation import AllocationHead
 from diffopt.placement.oracle import oracle_allocation, oracle_gap
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.topology import load_topology
 from diffopt.traffic import build_traffic_matrix, preflight_filter, scenario_alpha
 
@@ -215,10 +214,12 @@ def main() -> None:
 
     cfg = yaml.safe_load(Path(args.config).read_text())
 
-    # Seed before any module construction — EdgeWeightNet's init otherwise
-    # varies run to run and changes routing enough to move num_infeasible by
-    # an order of magnitude (measured 5/100 vs 98/100 at epoch 1 on
-    # ind_132), making runs incomparable.
+    # Seed before any module construction. edge_log_weight's init is now
+    # deterministic (length-proportional, spec decision 6), but
+    # AllocationHead's init is not, and an unseeded init otherwise varies
+    # run to run and changes routing/placement enough to move num_infeasible
+    # by an order of magnitude (measured 5/100 vs 98/100 at epoch 1 on
+    # ind_132 under the old EdgeWeightNet), making runs incomparable.
     torch.manual_seed(cfg.get("seed", 42))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -283,7 +284,6 @@ def main() -> None:
     # splits at, which a per-(demand, boundary) variable cannot express —
     # every allocation variable IS a real boundary of a real route.
 
-    edge_weight_net = EdgeWeightNet().to(device)
     pl_cfg = cfg.get("placement", {})
     lookahead: bool = pl_cfg.get("lookahead", True)
     allocation_head = AllocationHead(lookahead=lookahead).to(device)
@@ -292,7 +292,6 @@ def main() -> None:
         topology=topology,
         qot_model=qot_model,
         segment_combiner=segment_combiner,
-        edge_weight_net=edge_weight_net,
         allocation_head=allocation_head,
         modulation_config=mod_cfg,
         margin_db=c_cfg["margin_db"],
@@ -301,7 +300,7 @@ def main() -> None:
     ).to(device)
 
     opt_edge = optim.Adam(
-        edge_weight_net.parameters(),
+        [pipeline.edge_log_weight],
         lr=cfg["training"]["lr_edge_net"],
     )
     opt_alloc = optim.Adam(
@@ -423,9 +422,7 @@ def main() -> None:
             # #3: the log recorded 9 regens for the saved epoch, but the
             # previously-saved (post-step) regen_logits had 10 nodes above
             # threshold once reloaded.
-            edge_weight_net_state_pre_step = {
-                k: v.clone() for k, v in edge_weight_net.state_dict().items()
-            }
+            edge_log_weight_pre_step = pipeline.edge_log_weight.detach().clone()
             alloc_head_state_pre_step = {
                 k: v.clone() for k, v in allocation_head.state_dict().items()
             }
@@ -535,7 +532,7 @@ def main() -> None:
                 torch.save(
                     {
                         "epoch": epoch,
-                        "edge_weight_net_state": edge_weight_net_state_pre_step,
+                        "edge_log_weight": edge_log_weight_pre_step.cpu(),
                         "alloc_head_state": alloc_head_state_pre_step,
                         "opt_edge_state": opt_edge.state_dict(),
                         "opt_alloc_state": opt_alloc.state_dict(),

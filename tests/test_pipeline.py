@@ -33,7 +33,6 @@ from diffopt.pipeline import DiffONetPipeline, segment_path
 from diffopt.placement.allocation import AllocationHead
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.topology import Topology
 
 from multilayer_optical_network.model.optical_topology_import import (
@@ -106,7 +105,6 @@ def make_hub_topology() -> Topology:
 def make_pipeline(topology: Topology) -> DiffONetPipeline:
     qot_model = SpanAttentionQoT(max_spans=60)
     segment_combiner = SegmentCombiner()  # stateless and parameter-free
-    edge_weight_net = EdgeWeightNet()
     # The head is amortized over route-local features, so it takes no
     # topology argument — unlike the (num_nodes,) logit vector it replaces.
     allocation_head = AllocationHead()
@@ -114,7 +112,6 @@ def make_pipeline(topology: Topology) -> DiffONetPipeline:
         topology=topology,
         qot_model=qot_model,
         segment_combiner=segment_combiner,
-        edge_weight_net=edge_weight_net,
         allocation_head=allocation_head,
         modulation_config=make_mod_config(),
         margin_db=0.5,
@@ -194,10 +191,9 @@ def test_gradient_flow_edge_weight_net():
     )
     loss.backward()
 
-    for name, param in pipeline.edge_weight_net.named_parameters():
-        assert param.grad is not None, f"EdgeWeightNet param {name!r} has no grad"
-        assert param.grad.abs().sum().item() > 0, \
-            f"EdgeWeightNet param {name!r} has all-zero grad"
+    assert pipeline.edge_log_weight.grad is not None, "edge_log_weight has no grad"
+    assert pipeline.edge_log_weight.grad.abs().sum().item() > 0, \
+        "edge_log_weight has all-zero grad"
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +297,7 @@ def test_loss_backward_no_nan():
     )
     loss.backward()
 
-    trainable = list(pipeline.edge_weight_net.parameters()) + \
+    trainable = [pipeline.edge_log_weight] + \
                 list(pipeline.allocation_head.parameters())
     for param in trainable:
         if param.grad is not None:
@@ -374,10 +370,9 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
     pi = path_indicators[0]
     pi.retain_grad()
 
-    # Edge features are static (approach A), so this is forward()'s own input.
-    edge_weights = pipeline.edge_weight_net(
-        pipeline._static_edge_features
-    ).squeeze(-1).detach()
+    # edge_log_weight is a free per-edge parameter (spec decision 6), so this
+    # is forward()'s own input, recomputed the same way as forward()'s step 3.
+    edge_weights = torch.nn.functional.softplus(pipeline.edge_log_weight).detach()
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
@@ -423,7 +418,7 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
             duals=torch.ones(1),
         )
         loss.backward()
-        return torch.cat([p.grad.flatten() for p in pipeline.edge_weight_net.parameters()])
+        return pipeline.edge_log_weight.grad.clone()
 
     torch.manual_seed(0)
     pipeline_with_ste = make_pipeline(topo)
@@ -598,8 +593,8 @@ def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
 # ---------------------------------------------------------------------------
 # Test 14/15: edge-weight scale degeneracy (docs/investigations/
 # edge_weight_scale_collapse.md). These tests verify the unit-mean
-# renormalisation specifically: once EdgeWeightNet's raw output is
-# renormalised to unit mean with a live (non-detached) divisor, the loss is
+# renormalisation specifically: once the raw softplus(edge_log_weight) output
+# is renormalised to unit mean with a live (non-detached) divisor, the loss is
 # homogeneous of degree 0 in that raw output for ANY downstream loss, so the
 # scale-direction gradient is exactly zero and "shrink every weight" is not
 # a descent direction. This property holds regardless of what the path-cost
@@ -608,47 +603,42 @@ def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
 # instead of edge_ase_noise. These tests therefore CANNOT detect that
 # regression; test_path_noise_cost_equals_ase_noise_along_route is the
 # dedicated guard for the ASE-denominated path-cost invariant.
+#
+# Since Task 7, `raw` is a local variable inside pipeline.forward (softplus
+# is called inline on the free parameter, not on a submodule that can be
+# forward-hooked or swapped), so these two tests capture/scale it by
+# monkeypatching `diffopt.pipeline.F.softplus` for the duration of the call
+# instead — the same technique, one layer down.
 # ---------------------------------------------------------------------------
 
-class _ScaledNet(torch.nn.Module):
-    """Wraps EdgeWeightNet and multiplies its output by a constant.
-
-    Used to simulate an arbitrarily collapsed (or inflated) weight scale
-    without retraining, so the scale-invariance property can be asserted at
-    the magnitudes that actually occur in a real run.
-    """
-
-    def __init__(self, inner: torch.nn.Module, scale: float) -> None:
-        super().__init__()
-        self.inner = inner
-        self.scale = scale
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.inner(x) * self.scale
-
-
-def test_scale_direction_gradient_is_zero():
+def test_scale_direction_gradient_is_zero(monkeypatch):
     """Euler check: for a degree-0 homogeneous loss, sum_i u_i * dL/du_i == 0
-    exactly, where u is EdgeWeightNet's raw pre-normalisation output.
+    exactly, where u is the raw pre-normalisation softplus(edge_log_weight)
+    output.
 
     This is the fix stated as an equation. It is also the .detach() guard:
     detaching the mean in pipeline.forward deletes autograd's correction term
     and this assertion fails immediately.
     """
+    import diffopt.pipeline as pipeline_module
+
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
     mod_cfg = make_mod_config()
 
     captured = {}
+    original_softplus = pipeline_module.F.softplus
 
-    def hook(_module, _inputs, output):
-        output.retain_grad()
-        captured["raw"] = output
+    def capturing_softplus(x, *args, **kwargs):
+        out = original_softplus(x, *args, **kwargs)
+        out.retain_grad()
+        captured["raw"] = out
+        return out
 
-    handle = pipeline.edge_weight_net.register_forward_hook(hook)
+    monkeypatch.setattr(pipeline_module.F, "softplus", capturing_softplus)
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
     path_noise_costs, gsnr_preds, _, alloc = pipeline(demands, lambda_=5.0)
-    handle.remove()
+    monkeypatch.setattr(pipeline_module.F, "softplus", original_softplus)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
@@ -661,7 +651,7 @@ def test_scale_direction_gradient_is_zero():
     loss.backward()
 
     raw = captured["raw"]
-    assert raw.grad is not None, "raw EdgeWeightNet output received no gradient"
+    assert raw.grad is not None, "raw softplus(edge_log_weight) output received no gradient"
 
     radial = (raw.detach() * raw.grad).sum().item()
     # Relative tolerance against the magnitude of the terms being summed —
@@ -669,14 +659,14 @@ def test_scale_direction_gradient_is_zero():
     term_scale = (raw.detach().abs() * raw.grad.abs()).sum().item()
     assert abs(radial) <= 1e-5 * max(term_scale, 1.0), (
         f"scale-direction gradient is {radial:.6e} (term scale {term_scale:.6e}) "
-        "— expected ~0. The loss is not degree-0 in EdgeWeightNet's raw output, "
+        "— expected ~0. The loss is not degree-0 in the raw softplus output, "
         "so 'shrink every weight' is still a free descent direction."
     )
 
 
-def test_total_loss_invariant_to_edge_weight_scale():
-    """Scaling EdgeWeightNet's output by any positive constant must leave the
-    total loss and every chosen path bit-identical.
+def test_total_loss_invariant_to_edge_weight_scale(monkeypatch):
+    """Scaling the raw softplus(edge_log_weight) output by any positive
+    constant must leave the total loss and every chosen path bit-identical.
 
     Includes 1e-11 — the magnitude weights actually collapsed to in the
     ind_132 run — applying the lesson from
@@ -684,14 +674,19 @@ def test_total_loss_invariant_to_edge_weight_scale():
     original segment-combiner tests passed only because they never covered
     the production scale.
     """
+    import diffopt.pipeline as pipeline_module
+
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
     mod_cfg = make_mod_config()
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+    original_softplus = pipeline_module.F.softplus
 
     def run(scale: float):
-        inner = pipeline.edge_weight_net
-        pipeline.edge_weight_net = _ScaledNet(inner, scale)
+        def scaled_softplus(x, *args, **kwargs):
+            return original_softplus(x, *args, **kwargs) * scale
+
+        monkeypatch.setattr(pipeline_module.F, "softplus", scaled_softplus)
         try:
             path_noise_costs, gsnr_preds, path_indicators, alloc = pipeline(
                 demands, lambda_=5.0
@@ -706,7 +701,7 @@ def test_total_loss_invariant_to_edge_weight_scale():
             )
             return loss.item(), path_indicators[0].detach().clone()
         finally:
-            pipeline.edge_weight_net = inner
+            monkeypatch.setattr(pipeline_module.F, "softplus", original_softplus)
 
     loss_1, path_1 = run(1.0)
     loss_big, path_big = run(1000.0)
@@ -849,7 +844,25 @@ def test_edge_weights_do_not_collapse_over_training():
     # 30 steps -- still an unambiguous discriminator. Verified by hand:
     # mutate pipeline.py that one line, `pytest -k collapse` fails with
     # ratio ~0.41, `git checkout -- diffopt/pipeline.py`, passes again.
-    optimizer = torch.optim.Adam(pipeline.edge_weight_net.parameters(), lr=0.004)
+    #
+    # THIS lr/step calibration is specific to EdgeWeightNet's gradient scale
+    # and was NOT re-verified after Task 7 reparameterized edge_weights as
+    # the free parameter edge_log_weight (spec decision 6). Measured on the
+    # free parameter, this same 30-step/lr=0.004 loop gives ratio exactly
+    # 1.0 on THIS fixture both with and without the divisor-detach mutation
+    # (the two demands here move edge_log_weight so little in 30 steps that
+    # the median doesn't budge either way) -- i.e. this particular
+    # calibration no longer discriminates that regression under the new
+    # parameterization, though it still correctly holds a healthy pipeline
+    # inside the band. test_scale_direction_gradient_is_zero and
+    # test_edge_weights_still_have_the_undetached_unit_mean_divisor are the
+    # tests that catch the divisor-detach regression post-Task-7 (the
+    # former was hand-verified to fail under the same mutation; the latter
+    # was not, since its loss — sum(gsnr) — carries no live gradient into
+    # edge_log_weight at all and passes vacuously either way). Re-sweeping
+    # lr/steps to restore this test's own discriminating power is unstarted
+    # follow-up work, not part of Task 7.
+    optimizer = torch.optim.Adam([pipeline.edge_log_weight], lr=0.004)
 
     demands = [
         Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
@@ -857,19 +870,12 @@ def test_edge_weights_do_not_collapse_over_training():
     ]
 
     def median_raw_weight() -> float:
-        """Median of EdgeWeightNet's RAW output — the quantity that collapsed.
+        """Median of the raw softplus(edge_log_weight) output — the quantity
+        that collapsed under the old EdgeWeightNet parameterization.
         Measured pre-normalisation, since the unit-mean division would hide
-        any scale drift by construction.
-
-        Edge features are static (approach A) and no longer depend on
-        regen_probs, so this reads pipeline._static_edge_features directly
-        instead of rebuilding features from a live regen_probs call — that
-        would measure a different function than the one actually trained
-        below."""
+        any scale drift by construction."""
         with torch.no_grad():
-            return pipeline.edge_weight_net(
-                pipeline._static_edge_features
-            ).squeeze(-1).median().item()
+            return torch.nn.functional.softplus(pipeline.edge_log_weight).median().item()
 
     before = median_raw_weight()
 
@@ -1234,3 +1240,41 @@ def test_regen_placement_is_gone():
     assert not hasattr(p, "RegenPlacement")
     with pytest.raises(ModuleNotFoundError):
         import diffopt.placement.regenerator  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Task 7: EdgeWeightNet -> a free per-edge parameter theta[E]
+# ---------------------------------------------------------------------------
+
+def test_routing_head_is_a_free_per_edge_parameter():
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    e = len(topology.undirected_edges)
+    assert pipeline.edge_log_weight.shape == (e,)
+    assert pipeline.edge_log_weight.requires_grad
+    assert not hasattr(pipeline, "edge_weight_net")
+
+
+def test_theta_initialises_to_shortest_by_km_routing():
+    """Uniform init would tie every edge and make the Dijkstra tie-break the
+    de facto router. Starting at length-proportional weights starts training
+    at the documented shortest-by-km baseline — the same route preflight_filter
+    screens against."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    raw = torch.nn.functional.softplus(pipeline.edge_log_weight)
+    w = raw / raw.mean()
+    km = torch.tensor([e.length_km for e in topology.undirected_edges])
+    assert torch.allclose(w, km / km.mean(), atol=1e-4)
+
+
+def test_edge_weights_still_have_the_undetached_unit_mean_divisor():
+    """Correction #9's degree-0 argument must survive the reparameterization:
+    Euler gives sum_i u_i dL/du_i == 0 only if the divisor is in the graph."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    _, gsnr, _, _ = pipeline(make_demands())
+    loss = sum(gsnr.values())
+    g = torch.autograd.grad(loss, pipeline.edge_log_weight, allow_unused=True)[0]
+    raw = torch.nn.functional.softplus(pipeline.edge_log_weight)
+    assert (raw * g).sum().abs().item() < 1e-4
