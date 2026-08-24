@@ -1,6 +1,7 @@
 """DiffONetPipeline: end-to-end differentiable routing + regenerator placement."""
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -678,20 +679,15 @@ class DiffONetPipeline(nn.Module):
                 demands, self._modulation_config, self._margin_db
             ).to(device)
 
-            if hard_alloc:
-                # Deterministic decisions carry no useful gradient — building
-                # the graph would only retain it. Spec 2.5.
-                with torch.no_grad():
-                    a, a_physics = self.allocation_head.rollout(
-                        seg_noise,
-                        seg_km_matrix,
-                        bar_db,
-                        num_segments,
-                        tau=tau,
-                        hard=hard_alloc,
-                        dropout_p=alloc_dropout_p,
-                    )
-            else:
+            # ONE call site, wrapped in a selected context rather than
+            # duplicated across an if/else. Deterministic decisions carry no
+            # useful gradient, so hard_alloc runs under no_grad and building
+            # the graph would only retain it (spec 2.5) — but that is the
+            # ONLY difference between the two modes, and copying the argument
+            # list to say so invites a kwarg added to one branch and not the
+            # other, i.e. a soft/hard divergence no test would catch.
+            ctx = torch.no_grad() if hard_alloc else contextlib.nullcontext()
+            with ctx:
                 a, a_physics = self.allocation_head.rollout(
                     seg_noise,
                     seg_km_matrix,
