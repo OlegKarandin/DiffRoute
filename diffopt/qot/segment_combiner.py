@@ -88,7 +88,12 @@ import torch.nn as nn
 # count, not treated as a peak. `forward_batched` pays this as one (D, R, J)
 # working set padded to the batch's longest demand: about 2x the total at
 # ind_132 scale, in exchange for J-1 interpreter steps instead of
-# sum_d (N_d - 1). At real topology path lengths — 16-19 segments (ind_132's
+# sum_d (N_d - 1). That (D, R, J) figure is itself an undercount: each
+# boundary-loop iteration also retains its `fits` tensor (shape (D, R, b+1))
+# because autograd's `mul` backward saves the non-differentiable operand, so
+# the actual retained total (u/cut accumulators plus fits, across all J-1
+# iterations) is roughly double the stated (D, R, J) estimate. At real
+# topology path lengths — 16-19 segments (ind_132's
 # km-shortest paths — see docs/investigations/fold_formula_scalability.md)
 # — 2*N^4 is a few hundred KB, so a few hundred demands' worth totals well
 # under 100 MB: not a problem in practice. But before raising
@@ -411,6 +416,10 @@ class SegmentCombiner(nn.Module):
             raise ValueError(
                 f"Expected num_segments of shape {(num_demands,)}, got "
                 f"{tuple(num_segments.shape)}"
+            )
+        if j == 0 or int(num_segments.min()) < 1 or int(num_segments.max()) > j:
+            raise ValueError(
+                f"num_segments must lie in [1, {j}], got {num_segments.tolist()}"
             )
         if j > MAX_EXACT_FOLD_SEGMENTS:
             raise ValueError(

@@ -988,6 +988,23 @@ def test_batched_fold_rejects_a_batch_over_the_segment_cap():
         )
 
 
+def test_batched_fold_rejects_zero_num_segments():
+    """num_segments[d] == 0 must fail loud, not silently return +inf dB for
+    that demand (an all-masked row has zero max-chunk-noise, and
+    -10*log10(0) is +inf -- a fail-open failure that clears any margin
+    constraint). This is currently unreachable from the production
+    pipeline (segment_path() always yields >= 1 segment), but the guard
+    should still turn it into a clean ValueError instead of a bare
+    IndexError deep in the kernel."""
+    combiner = SegmentCombiner()
+    with pytest.raises(ValueError, match=r"num_segments must lie in \[1, 3\]"):
+        combiner.forward_batched(
+            torch.full((2, 3), 20.0),
+            torch.full((2, 2), 0.5),
+            torch.tensor([3, 0], dtype=torch.long),
+        )
+
+
 def test_scalar_dp_entry_point_is_a_d1_slice_of_the_batched_kernel():
     """There is one implementation of the recurrence. This pins that."""
     n = db_to_linear_noise(torch.tensor([12.0, 22.0, 9.0, 18.0]).double())

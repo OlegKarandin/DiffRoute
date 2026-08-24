@@ -93,6 +93,11 @@ class DiffONetPipeline(nn.Module):
 
     The QoT model is frozen at construction via requires_grad_(False), not via
     torch.no_grad(), to avoid accidentally severing regen_probs from the graph.
+    Note requires_grad_(False) only guarantees non-differentiability; the
+    per-segment GSNR memo below additionally requires the model to be
+    deterministic and train/eval-mode-invariant, which holds today only
+    because SpanAttentionQoT hardcodes dropout=0.0 with no other
+    stochastic/mode-dependent layer.
     """
 
     def __init__(
@@ -173,7 +178,12 @@ class DiffONetPipeline(nn.Module):
         # and accum_dist_km makes the tuple direction-sensitive, so this is
         # a tuple key and never a frozenset. The QoT model is frozen at
         # construction, so the mapping never moves during a run — see
-        # docs/architecture/invariants.md, "Physics layer".
+        # docs/architecture/invariants.md, "Physics layer". Being frozen
+        # (requires_grad_(False)) only rules out gradient updates; the memo's
+        # exactness also needs the model to be deterministic and
+        # train/eval-mode-invariant, which holds today only because
+        # SpanAttentionQoT hardcodes dropout=0.0 and has no other
+        # stochastic/mode-dependent layer.
         #
         # Set cache_segment_gsnr=False to bypass it: used by
         # tests/test_pipeline.py to check the memo against the direct path,
@@ -266,7 +276,10 @@ class DiffONetPipeline(nn.Module):
     def clear_segment_gsnr_cache(self) -> None:
         """Drop the memo. Required after replacing `self.qot_model` — the
         memo's exactness rests on the model being frozen for the lifetime
-        of the entries."""
+        of the entries. "Frozen" here means both non-differentiable
+        (requires_grad_(False)) and deterministic/mode-invariant (no
+        stochastic or train/eval-dependent layers) — SpanAttentionQoT's
+        hardcoded dropout=0.0 is what currently makes the latter true."""
         self._segment_gsnr_cache.clear()
 
     # ------------------------------------------------------------------
