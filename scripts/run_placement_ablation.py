@@ -1,73 +1,28 @@
 """Compare placement-signal arms on constrained_stress / ind_132.
 
-Arms (lambda_regen held at 1.0 except where stated, so arms are comparable —
-retuning it is an explicit non-goal: the sweep is exhausted, no price yields
-the feasible optimum):
+Stage II replaced the per-node regenerator gate (`placement.gate`,
+`gate_dropout_p`, `hard_concrete`, `pipeline.lambda_regen`) with a
+per-demand `AllocationHead` priced by `pipeline.lambda_dev` (spec decision
+8). `results/placement_arms.csv` was generated under the old gate-based
+arms; every one of them overrode a config key nothing reads anymore, so
+the arm set is regenerated here rather than re-run. See the comment above
+`ARMS` for what each of the three axes below answers and why.
 
-  baseline           sigmoid, no dropout      — must reproduce today's numbers
-  dropout_0.1        sigmoid, dropout 0.1     — toy: 11 -> 6, feasible, nodes
-                                                {4,5,6,7,9,12}
-  dropout_0.3        sigmoid, dropout 0.3     — toy: 11 -> 6, feasible, nodes
-                                                {3,4,7,9,11,12}
-  l0_lambda1         hard_concrete            — toy: 7 placed, 1 VIOLATED
-  l0_lambda3         hard_concrete, lambda_regen=3.0 — toy: 3 placed, 2 VIOLATED
-  l0_dropout_0.3     hard_concrete + dropout  — untested; see rationale below
-  dropout_0.3_decay  dropout 0.3 + dual_decay — contingency, see below
+`score()` trains nothing itself: it loads the checkpoint the arm's
+training subprocess (`train()`, below) just wrote, rebuilds a
+`DiagContext` from the same config, and scores the DEPLOYED allocation
+with `diffopt.train.hard_rollout` -- the identical rollout `train.py`
+itself uses for checkpoint selection, so this script reports the same
+numbers a training run's own log would, not a second definition of them.
+It no longer calls the old `diagnose_regen_ablation.ablate()`, which
+inspected per-node gate state that no longer exists (the module itself is
+deleted).
 
-The two L0 arms are recorded as "right count, wrong nodes", which undersells
-the failure: both were INFEASIBLE (1 and 2 violated), so lambda=3 hit the
-right cardinality without solving the problem. Its nodes {3,4,5} are adjacent
-on a line network — three regenerations over a short stretch with nodes 6-12
-left bare — and lambda=1's {1,3,4,5,6,7,8} is the same low-end region, so the
-bias is systematic across lambda rather than a bad seed. Both dropout arms,
-by contrast, contain two of the three true nodes (4 and 7) and bracket the
-third (9, 11 around 10), spread across the whole line. Score node IDENTITY,
-not just count.
-
-`l0_dropout_0.3` is not in the write-up's table and is the arm with the
-clearest a-priori case: the two remedies address orthogonal halves. L0
-changes HOW MANY the objective wants (expected count, not probability mass —
-it can express "exactly three" where no lambda_regen under L1-on-mass ever
-could). Dropout changes WHICH ones get gradient. L0 alone cannot fix node
-identity by construction, because identity is decided solely by the
-feasibility term's gradient, which measures exactly 0.0000 on the plateau.
-Note the write-up's tested combination was softplus+dropout, which was worse
-than either alone; that is NOT evidence about this pair, since the softplus
-failure mode was a permanently-active feasibility term bidding the duals up,
-which hard-concrete gates do not do.
-
-The contingency arm exists because update_duals is pure ascent by default and
-gate dropout manufactures violations on purpose. A dual rising when a
-load-bearing node is dropped IS the mechanism, so it must not be suppressed —
-but the ratchet can overrun (that is exactly how the softplus-hinge variant
-failed: a permanently-active feasibility term kept bidding the duals up until
-they overwhelmed lambda_regen). Decision rule: run this arm only if the
-dropout arms show lambda_max_observed materially above baseline.
-
-Note on dual_decay: it was falsified as a remedy for over-provisioning
-(there is no loss barrier for a relaxed dual to lower). Under dropout it has
-a genuinely different job — bleeding off ratchet from violations that were
-manufactured on purpose — so that refutation does not carry over.
-
---- Implementation notes (not part of the plan's docstring text) ---
-
-`l0_lambda3` is the plan's one stated exception to "lambda_regen held at
-1.0": `pipeline.lambda_regen: 3.0`, per the design spec
-(`docs/superpowers/specs/2026-08-21-placement-signal-design.md:262`) and
-the plan's own Global Constraints section. The brief's table shorthand
-"lr 3.0" refers to this `lambda_regen` value, NOT `training.lr_regen`
-(Adam's step size for the regen parameter, unrelated and left at the base
-config's 2.0e-2 for every arm). `dropout_0.3_decay` uses
-`constraint.dual_decay: 0.05`, the same value `open_followups.md` item #3's
-`_dual_decay.yaml` hypothesis test used.
-
-`score()`'s greedy-drop `order_key` for the `hard_concrete` gate uses each
-node's `P(gate open) = sigmoid(log_alpha - beta*log(-gamma/zeta))` — exactly
-the per-node quantity `RegenPlacement.count_penalty()` sums, so "drop the
-node the model itself is least committed to opening first" is the same
-ordering principle as the sigmoid gate's `sigmoid(logit/tau_end)`, just
-through the L0 gate's own probability rather than a temperature-sharpened
-one (hard_concrete ignores `tau` entirely — see `RegenPlacement.get_regen_probs`).
+`device_peak` / `device_final` / `device_plateaued` come from
+`placement_trajectory.csv`'s shape (`trajectory_shape`, below) -- spec
+9.2's check that a run's device count RISES and PLATEAUS rather than
+spiking and descending. See that function's docstring for why the
+endpoint alone can look fine while the process was broken.
 """
 from __future__ import annotations
 
@@ -79,60 +34,54 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Set
 
-import torch
 import yaml
 
 from _common import build_context, fixed_traffic_demands
-from diagnose_regen_ablation import ablate
+from diffopt.train import hard_rollout
 
 # ---------------------------------------------------------------------------
 # Arms
 # ---------------------------------------------------------------------------
 
-ARMS: List[dict] = [
+_BASE_CFG_FOR_CAL = yaml.safe_load(
+    Path("configs/experiment/constrained_stress.yaml").read_text()
+)
+_CAL = _BASE_CFG_FOR_CAL["pipeline"]["lambda_dev"]
+
+# Old arms tested `placement.gate` and `gate_dropout_p`, both deleted. The
+# three axes that matter now:
+#
+#   lambda_dev   the calibration is a measurement with a band, not a point.
+#                +/-3x brackets it, so the sweep answers "is the device count
+#                a property of need or of price?" — the question no
+#                lambda_regen value ever answered under L1-on-sites.
+#   alloc_dropout
+#                gate dropout existed to manufacture node-discriminating
+#                gradient a per-node mask could not otherwise get. A
+#                per-demand variable already has a demand-specific signal,
+#                so this arm tests whether the mechanism is still EARNING
+#                its variance rather than assuming it is.
+#   lookahead    feature 4 is what makes the greedy-optimal rule exactly
+#                representable. Turning it off should raise oracle_gap; if
+#                it does not, the head is not using the representability
+#                the architecture was chosen for.
+ARMS = [
     {"name": "baseline", "overrides": {}},
-    {
-        "name": "dropout_0.1",
-        "overrides": {"placement": {"gate_dropout_p": 0.1}},
-    },
-    {
-        "name": "dropout_0.3",
-        "overrides": {"placement": {"gate_dropout_p": 0.3}},
-    },
-    {
-        "name": "l0_lambda1",
-        "overrides": {"placement": {"gate": "hard_concrete"}},
-    },
-    {
-        "name": "l0_lambda3",
-        "overrides": {
-            "placement": {"gate": "hard_concrete"},
-            "pipeline": {"lambda_regen": 3.0},
-        },
-    },
-    {
-        "name": "l0_dropout_0.3",
-        "overrides": {
-            "placement": {"gate": "hard_concrete", "gate_dropout_p": 0.3},
-        },
-    },
-    {
-        "name": "dropout_0.3_decay",
-        "overrides": {
-            "placement": {"gate_dropout_p": 0.3},
-            "constraint": {"dual_decay": 0.05},
-        },
-    },
+    {"name": "lambda_dev_0.3x", "overrides": {"pipeline": {"lambda_dev": _CAL * 0.3}}},
+    {"name": "lambda_dev_3x",   "overrides": {"pipeline": {"lambda_dev": _CAL * 3.0}}},
+    {"name": "alloc_dropout_0.1", "overrides": {"placement": {"alloc_dropout_p": 0.1}}},
+    {"name": "alloc_dropout_0.3", "overrides": {"placement": {"alloc_dropout_p": 0.3}}},
+    {"name": "no_lookahead", "overrides": {"placement": {"lookahead": False}}},
 ]
 
 ARMS_BY_NAME: Dict[str, dict] = {arm["name"]: arm for arm in ARMS}
 
 CSV_FIELDNAMES = [
-    "arm", "seed", "gate", "gate_dropout_p", "lambda_regen", "dual_decay",
-    "placed", "placed_on_candidates", "hard_num_violated",
-    "minimal_set_size", "minimal_nodes", "over_provisioning_ratio",
-    "churn_last20", "final_equals_selected", "lambda_max_observed",
-    "selected_epoch", "placed_nodes", "baseline_minimal_overlap",
+    "arm", "seed", "lambda_dev", "alloc_dropout_p", "lookahead",
+    "hard_num_violated", "hard_num_devices", "hard_num_sites",
+    "oracle_devices", "oracle_gap", "oracle_infeasible",
+    "hard_worst_margin_db", "device_peak", "device_final", "device_plateaued",
+    "selected_epoch", "final_equals_selected", "lambda_max_observed",
 ]
 
 
@@ -145,9 +94,8 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 
     Nested dicts are merged key-by-key (a `placement` override does not
     clobber sibling `placement` keys the base config already sets, e.g.
-    Task 8/9's `hard_concrete: {beta, gamma, zeta}`); any non-dict value
-    (including a dict overriding a non-dict, or vice versa) replaces the
-    base value outright.
+    `lookahead`); any non-dict value (including a dict overriding a
+    non-dict, or vice versa) replaces the base value outright.
     """
     merged = dict(base)
     for key, value in overrides.items():
@@ -165,7 +113,7 @@ def write_arm_config(base_cfg: dict, arm: dict, seed: int, out_dir: Path) -> Pat
     write the result to `<run_dir>/config.yaml`.
 
     `cfg["seed"]` (model-init seed) is set, NOT `cfg["traffic"]["seed"]` —
-    arms/seeds vary EdgeWeightNet/RegenPlacement init, not the traffic
+    arms/seeds vary AllocationHead/edge_log_weight init, not the traffic
     matrix a checkpoint trains against.
     """
     cfg = _deep_merge(base_cfg, arm["overrides"])
@@ -197,114 +145,123 @@ def train(config_path: Path) -> None:
 # Trajectory analysis
 # ---------------------------------------------------------------------------
 
-def _read_trajectory(trajectory_csv: Path) -> List[Set[int]]:
-    """`placement_trajectory.csv` (Task 4: `epoch,num_placed,placed_nodes`,
-    space-separated node indices) -> one `set[int]` per row, epoch order."""
-    rows: List[Set[int]] = []
-    with open(trajectory_csv, newline="") as f:
-        for row in csv.DictReader(f):
-            raw = row["placed_nodes"].strip()
-            rows.append({int(x) for x in raw.split()} if raw else set())
-    return rows
+def trajectory_shape_from_counts(counts: List[int]) -> dict:
+    """Spec 9.2's trajectory check, on the per-epoch device counts.
 
+    The count must rise from ~0 and PLATEAU. A run that spikes high and then
+    descends is the spec's 2.2 saturation failure in disguise: the head
+    opened everything while lambda_dev could not reach it, then spent the
+    rest of training clawing back. The ENDPOINT of such a run can look
+    perfectly fine while the process was broken, and the same config on a
+    different seed will not reproduce it — which is exactly why the shape is
+    scored and not just the final value.
 
-def churn_last20(trajectory_csv: Path) -> float:
-    """Mean symmetric-difference size between consecutive epochs' placement
-    sets, over the last 20 rows of `trajectory_csv` (or fewer, if the run is
-    shorter). This is the limit-cycle measure: baseline should churn; a
-    remedy that actually breaks the cycle should settle toward 0.
+    plateaued := the peak occurs in the last third of the run
+                 AND final >= 0.9 * peak.
 
-    Handles short trajectories gracefully: fewer than 2 rows total, or a
-    `last 20` window of fewer than 2 rows, both return 0.0 rather than
-    raising (empty statistics, not "no churn observed" -- see caller for how
-    to distinguish the two cases if that matters).
+    Boundary is inclusive (`>=`, not `>`): `counts.index(peak)` returns the
+    FIRST epoch the peak was reached, and a plateau that reaches its max
+    exactly at the last-third boundary and holds it thereafter (e.g. 9
+    epochs, peak first hit at epoch 6 == (2*9)//3, sustained through epoch
+    9) is the textbook rising-and-plateauing shape this function exists to
+    pass, not a spike to flag.
     """
-    rows = _read_trajectory(Path(trajectory_csv))
-    window = rows[-20:] if len(rows) >= 20 else rows
-    if len(window) < 2:
-        return 0.0
-    diffs = [len(window[i] ^ window[i - 1]) for i in range(1, len(window))]
-    return sum(diffs) / len(diffs)
+    if not counts:
+        return {"device_peak": 0, "device_final": 0, "device_plateaued": False}
+    peak = max(counts)
+    peak_epoch = counts.index(peak) + 1
+    final = counts[-1]
+    plateaued = peak_epoch >= (2 * len(counts)) // 3 and final >= 0.9 * peak
+    return {
+        "device_peak": peak,
+        "device_final": final,
+        "device_plateaued": bool(plateaued),
+    }
+
+
+def trajectory_shape(trajectory_csv: Path) -> dict:
+    """trajectory_shape_from_counts over placement_trajectory.csv's
+    num_devices column."""
+    with open(trajectory_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+    return trajectory_shape_from_counts([int(r["num_devices"]) for r in rows])
 
 
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
+def _site_set(field: str) -> Set[int]:
+    """Parse `placement_trajectory.csv`'s space-separated `site_nodes`
+    field into a set of node indices."""
+    field = field.strip()
+    return {int(x) for x in field.split()} if field else set()
+
+
 def score(config_path: Path) -> dict:
     """Build a DiagContext from the checkpoint `config_path`'s training run
-    just produced, run the Task 10 ablation against it, and combine with
-    churn/trajectory checks.
-
-    Does not know about other arms/seeds -- `baseline_minimal_overlap` is
-    filled in by the caller (`main`), which has the cross-arm state this
-    function deliberately does not.
+    just produced, and score it with `train.hard_rollout` -- the same
+    deployed-allocation rollout `train.py` itself uses for checkpoint
+    selection -- combined with the placement_trajectory.csv shape check.
     """
     cfg = yaml.safe_load(Path(config_path).read_text())
     ctx = build_context(cfg, load_e2e_checkpoint=True)
+    ckpt = ctx.ckpt
 
     demands, _excluded = fixed_traffic_demands(ctx)
-    thresholds = {
-        d.id: ctx.mod_cfg.required_snr_threshold(d.bitrate_gbps) for d in demands
-    }
 
-    ckpt = ctx.ckpt
-    R = set(ckpt["placement_mask"].nonzero(as_tuple=True)[0].tolist())
-    candidates = ctx.regen_candidates
-
-    gate = ctx.regen_placement.gate
-    learned_param = ctx.regen_placement._parameter.detach().clone()
-    if gate == "sigmoid":
-        tau_end = cfg["training"]["regen_tau_end"]
-        order_probs = torch.sigmoid(learned_param / tau_end)
-    else:
-        # hard_concrete: no `tau` (`get_regen_probs` ignores it for this
-        # gate -- `beta` plays that role). Use each node's own P(gate open),
-        # the same quantity RegenPlacement.count_penalty() sums -- see the
-        # module docstring's implementation-notes section.
-        hc_cfg = cfg.get("placement", {}).get("hard_concrete", {})
-        beta = hc_cfg.get("beta", 0.5)
-        gamma = hc_cfg.get("gamma", -0.1)
-        zeta = hc_cfg.get("zeta", 1.1)
-        shift = beta * math.log(-gamma / zeta)
-        order_probs = torch.sigmoid(learned_param - shift)
-
-    result = ablate(
-        ctx.pipeline, demands, thresholds, R, candidates,
-        tau=cfg["training"]["regen_tau_end"],
+    # `ckpt["vlastelica_lambda"]` is the checkpoint's own saved value for
+    # the epoch it was selected at (train.py saves on every loss
+    # improvement, not only the final epoch) -- see _common.build_context's
+    # docstring for why this is preferred over recomputing a schedule at a
+    # guessed epoch.
+    hard = hard_rollout(
+        ctx.pipeline, demands, ctx.mod_cfg,
         lambda_=ckpt["vlastelica_lambda"],
-        num_nodes=ctx.topology.num_nodes,
-        order_key=lambda n: order_probs[n].item(),
+        margin_db=cfg["constraint"]["margin_db"],
     )
-    minimal_set = sorted(result["minimal_set"])
 
     trajectory_path = Path(cfg["log_dir"]) / "placement_trajectory.csv"
-    trajectory_rows = _read_trajectory(trajectory_path)
-    final_nodes = trajectory_rows[-1] if trajectory_rows else set()
+    shape = trajectory_shape(trajectory_path)
+
+    with open(trajectory_path, newline="") as f:
+        traj_rows = list(csv.DictReader(f))
+    selected_epoch = ckpt["epoch"]
+    selected_row = next(
+        (r for r in traj_rows if int(r["epoch"]) == selected_epoch), None
+    )
+    final_row = traj_rows[-1] if traj_rows else None
+    # Did training's LAST epoch end in the same deployed state as the
+    # SELECTED (checkpointed, best) epoch? False means training kept going
+    # -- and drifting -- past the best point it ever found, the per-demand
+    # analogue of the old node-identity churn check.
+    final_equals_selected = (
+        final_row is not None and selected_row is not None
+        and _site_set(final_row["site_nodes"]) == _site_set(selected_row["site_nodes"])
+    )
 
     duals = ckpt.get("duals")
     lambda_max_observed = float(duals.max().item()) if duals is not None else math.nan
 
-    placed = len(R)
-    minimal_set_size = len(minimal_set)
     pl_cfg = cfg.get("placement", {})
 
     return {
-        "gate": gate,
-        "gate_dropout_p": pl_cfg.get("gate_dropout_p", 0.0),
-        "lambda_regen": cfg["pipeline"]["lambda_regen"],
-        "dual_decay": cfg.get("constraint", {}).get("dual_decay", 0.0),
-        "placed": placed,
-        "placed_on_candidates": len(R & candidates),
-        "hard_num_violated": ckpt["hard_num_violated"],
-        "minimal_set_size": minimal_set_size,
-        "minimal_nodes": " ".join(str(n) for n in minimal_set),
-        "over_provisioning_ratio": placed / max(1, minimal_set_size),
-        "churn_last20": churn_last20(trajectory_path),
-        "final_equals_selected": final_nodes == R,
+        "lambda_dev": cfg["pipeline"]["lambda_dev"],
+        "alloc_dropout_p": pl_cfg.get("alloc_dropout_p", 0.0),
+        "lookahead": pl_cfg.get("lookahead", True),
+        "hard_num_violated": hard["hard_num_violated"],
+        "hard_num_devices": hard["hard_num_devices"],
+        "hard_num_sites": hard["hard_num_sites"],
+        "oracle_devices": hard["oracle_devices"],
+        "oracle_gap": hard["oracle_gap"],
+        "oracle_infeasible": hard["oracle_infeasible"],
+        "hard_worst_margin_db": hard["hard_worst_margin_db"],
+        "device_peak": shape["device_peak"],
+        "device_final": shape["device_final"],
+        "device_plateaued": shape["device_plateaued"],
+        "selected_epoch": selected_epoch,
+        "final_equals_selected": final_equals_selected,
         "lambda_max_observed": lambda_max_observed,
-        "selected_epoch": ckpt["epoch"],
-        "placed_nodes": " ".join(str(n) for n in sorted(R)),
     }
 
 
@@ -343,9 +300,8 @@ def main() -> None:
         raise ValueError(
             f"Unknown arm(s) {unknown}; choices: {sorted(ARMS_BY_NAME)}"
         )
-    # Iterate in ARMS' own order (not the user's --arms order): baseline is
-    # first there, and baseline_minimal_overlap below needs baseline scored
-    # before any other arm at the same seed.
+    # Iterate in ARMS' own order (not the user's --arms order) so output is
+    # stable regardless of --arms order.
     requested_set = set(requested)
     ordered_arms = [arm for arm in ARMS if arm["name"] in requested_set]
     seeds = [int(s) for s in args.seeds.split(",")]
@@ -357,8 +313,6 @@ def main() -> None:
 
     write_header = not (args.append and out_path.exists())
     mode = "a" if args.append else "w"
-
-    baseline_minimal_by_seed: Dict[int, Set[int]] = {}
 
     with open(out_path, mode, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
@@ -373,39 +327,15 @@ def main() -> None:
                 train(config_path)
                 result = score(config_path)
 
-                placed_nodes = (
-                    {int(x) for x in result["placed_nodes"].split()}
-                    if result["placed_nodes"] else set()
-                )
-                if arm["name"] == "baseline":
-                    minimal_nodes = (
-                        {int(x) for x in result["minimal_nodes"].split()}
-                        if result["minimal_nodes"] else set()
-                    )
-                    baseline_minimal_by_seed[seed] = minimal_nodes
-                    overlap = len(placed_nodes & minimal_nodes)
-                elif seed in baseline_minimal_by_seed:
-                    overlap = len(placed_nodes & baseline_minimal_by_seed[seed])
-                else:
-                    print(
-                        f"  WARNING: 'baseline' arm was not run for seed={seed} "
-                        "(not in --arms) -- baseline_minimal_overlap left blank"
-                    )
-                    overlap = ""
-
-                row = {
-                    "arm": arm["name"],
-                    "seed": seed,
-                    **result,
-                    "baseline_minimal_overlap": overlap,
-                }
+                row = {"arm": arm["name"], "seed": seed, **result}
                 writer.writerow(row)
                 f.flush()
                 print(
-                    f"  placed={result['placed']} minimal={result['minimal_set_size']} "
+                    f"  hard_num_devices={result['hard_num_devices']} "
+                    f"(oracle {result['oracle_devices']}, gap {result['oracle_gap']}) "
                     f"hard_num_violated={result['hard_num_violated']} "
-                    f"churn_last20={result['churn_last20']:.2f} "
-                    f"baseline_minimal_overlap={overlap}"
+                    f"device_plateaued={result['device_plateaued']} "
+                    f"final_equals_selected={result['final_equals_selected']}"
                 )
 
     print(f"\nWrote {out_path}")
