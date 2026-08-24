@@ -216,8 +216,11 @@ class AllocationHead(nn.Module):
             # The PHYSICS decision resets the carry: under dropout the demand
             # really does lose that regenerator, which is the point — it puts
             # the demand back in the hinge's active region, the only region
-            # that produces discriminating gradient.
+            # that produces discriminating gradient. Feature 5 (km_since_cut)
+            # resets the same way: it is the distance since the PREVIOUS cut,
+            # not since the start of the route, or it duplicates feature 6.
             c = c * (1.0 - a_phys)
+            km_since = km_since * (1.0 - a_phys)
 
         if j >= 1:
             c = c + n[:, j - 1] if j > 1 else n[:, 0]

@@ -180,6 +180,44 @@ def test_rollout_is_differentiable_in_seg_noise():
     assert seg_noise.grad.abs().sum().item() > 0
 
 
+def test_km_since_cut_resets_on_a_physics_cut():
+    """Feature 5 is documented as `km_since_cut / KM_SCALE` (module docstring),
+    but the accumulator was never reset on a cut -- it just tracked km_done,
+    identical to what feature 6 already computes. Isolate feature 5 alone via
+    the identity-first-layers trick from
+    test_oracle.py::test_greedy_weights_reproduce_the_oracle, so a threshold
+    on it alone drives the cut decision, then pick two segment lengths where
+    the SECOND decision only cuts if the first cut failed to reset the
+    accumulator: 200km cuts (0.2 > 0.15 threshold); a correctly-reset
+    accumulator then reads 100km (0.1) at the next boundary and does not cut,
+    while a never-reset one reads 300km (0.3) and cuts again.
+    """
+    head = AllocationHead()
+    with torch.no_grad():
+        w = torch.zeros(1, head.net[-1].weight.shape[1])
+        w[0, 5] = 1.0e6
+        head.net[-1].weight.copy_(w)
+        head.net[0].weight.zero_()
+        head.net[0].weight[:ALLOC_FEATURE_DIM, :].copy_(torch.eye(ALLOC_FEATURE_DIM))
+        head.net[0].bias.fill_(50.0)       # keep ReLU in its linear region
+        head.net[2].weight.zero_()
+        head.net[2].weight.copy_(torch.eye(head.net[2].weight.shape[0]))
+        head.net[2].bias.zero_()
+        # Undo the +50 offset that carried through both identity layers, then
+        # place the threshold at km_since/KM_SCALE == 0.15.
+        offset = (-w @ torch.full((w.shape[1], 1), 50.0)).squeeze()
+        head.net[-1].bias.copy_(offset - 0.15 * w[0, 5])
+
+    seg_noise = torch.full((1, 3), 0.01)
+    seg_km = torch.tensor([[200.0, 100.0, 50.0]])
+    bar = torch.tensor([9.5])
+    nseg = torch.tensor([3])
+
+    a, a_phys = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    assert torch.equal(a, torch.tensor([[1.0, 0.0]]))
+    assert torch.equal(a, a_phys)
+
+
 def test_first_segment_has_no_device_gradient_because_the_carry_is_detached():
     """Pins the carry detach (invariants.md, "regen helps is a property of the
     FOLD"). seg_noise column 0 is the ONE column whose only route into any
