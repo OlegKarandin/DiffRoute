@@ -1,16 +1,23 @@
 """DiffONetPipeline: end-to-end differentiable routing + regenerator placement."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 
 from diffopt.demands import Demand
-from diffopt.placement.regenerator import RegenPlacement
+from diffopt.modulation import ModulationConfig, bar_db_for_demands
+from diffopt.placement.allocation import AllocationHead, site_view, total_device_cost
 from diffopt.qot.edge_noise import compute_edge_ase_noise
 from diffopt.qot.model import SpanAttentionQoT
-from diffopt.qot.segment_combiner import SegmentCombiner
+from diffopt.qot.segment_combiner import (
+    GSNR_MAX,
+    GSNR_MIN,
+    SegmentCombiner,
+    db_to_linear_noise,
+)
 from diffopt.qot.span_features import SPAN_FEATURE_DIM, span_feature_rows
 from diffopt.routing.edge_weight_net import EdgeWeightNet
 from diffopt.routing.surrogate import surrogate_shortest_path
@@ -72,6 +79,33 @@ def segment_path(
 
 
 # ---------------------------------------------------------------------------
+# Allocation record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AllocationOutputs:
+    """Everything the allocation half of a forward pass produced.
+
+    Returned as forward()'s fourth value, replacing the bare (num_nodes,)
+    regen_probs tensor. It is a record rather than a tuple because the oracle
+    and the deployment repair are PURE POST-PROCESSING on these fields — they
+    never re-run the pipeline, so every quantity they need has to come back
+    from one call.
+    """
+
+    a: torch.Tensor                   # (D, J-1) priced allocations
+    a_physics: torch.Tensor           # (D, J-1) what the fold actually saw
+    alloc_by_node: torch.Tensor       # (D, N) a scattered onto boundary nodes
+    device_count: torch.Tensor        # scalar, sum_n sum_d
+    site_view: torch.Tensor           # (N,) max_d, diagnostics only
+    seg_gsnr_db: torch.Tensor         # (D, J) STE-blended per-segment GSNR
+    seg_noise: torch.Tensor           # (D, J) the same, as linear noise
+    num_segments: torch.Tensor        # (D,) long
+    boundary_node_ids: torch.Tensor   # (D, J-1) long, -1 where padded
+    demand_ids: List[int]             # row index -> Demand.id
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -79,8 +113,8 @@ class DiffONetPipeline(nn.Module):
     """End-to-end differentiable pipeline for joint routing and regen placement.
 
     Forward pass:
-      1. Compute regen probabilities from RegenPlacement.
-      2. Build per-edge feature vectors (topology + regen probs at endpoints).
+      2. Read the static per-edge feature buffer (topology + is_candidate
+         indicators at each endpoint; built once in __init__).
       3. Compute edge weights via EdgeWeightNet.
       4. For each demand:
          a. Run surrogate Dijkstra → binary path indicator (differentiable).
@@ -88,11 +122,19 @@ class DiffONetPipeline(nn.Module):
             — this is the live autograd path into EdgeWeightNet.
          c. Reconstruct ordered edge list (using detached indicator).
          d. Segment path at regen candidate nodes.
-         e. Run frozen QoT model on each segment → scalar GSNR.
-         f. Combine segment GSNRs via SegmentCombiner with boundary probs.
+      5. Run the frozen QoT model on every segment in one batched call.
+      6. Roll the AllocationHead along each demand's boundaries → a per-
+         (demand, boundary) allocation, then fold every demand in one
+         SegmentCombiner call using those allocations as boundary
+         probabilities.
+
+    Step numbering starts at 2 because step 1 — "compute regen probabilities
+    from RegenPlacement" — is gone: there is no per-node probability vector
+    any more, only per-(demand, boundary) allocations produced in step 6.
 
     The QoT model is frozen at construction via requires_grad_(False), not via
-    torch.no_grad(), to avoid accidentally severing regen_probs from the graph.
+    torch.no_grad(), to avoid accidentally severing the allocation head from
+    the graph.
     Note requires_grad_(False) only guarantees non-differentiability; the
     per-segment GSNR memo below additionally requires the model to be
     deterministic and train/eval-mode-invariant, which holds today only
@@ -106,7 +148,9 @@ class DiffONetPipeline(nn.Module):
         qot_model: SpanAttentionQoT,
         segment_combiner: SegmentCombiner,
         edge_weight_net: EdgeWeightNet,
-        regen_placement: RegenPlacement,
+        allocation_head: AllocationHead,
+        modulation_config: ModulationConfig,
+        margin_db: float,
         channel_loading_fraction: float = 0.5,
         max_spans: int = 60,
         edge_ase_noise: Optional[torch.Tensor] = None,
@@ -121,7 +165,13 @@ class DiffONetPipeline(nn.Module):
         self.qot_model = qot_model
         self.segment_combiner = segment_combiner
         self.edge_weight_net = edge_weight_net
-        self.regen_placement = regen_placement
+        self.allocation_head = allocation_head
+        # Run constants, stored the same way channel_loading_fraction and
+        # max_spans already are: the bar is a property of the config, not of
+        # a call, and computing it inside forward keeps every caller's
+        # signature short. bar_db_for_demands is the single definition.
+        self._modulation_config = modulation_config
+        self._margin_db = margin_db
         self.channel_loading_fraction = channel_loading_fraction
         self.max_spans = max_spans
         self._topology = topology
@@ -322,72 +372,42 @@ class DiffONetPipeline(nn.Module):
         demands: List[Demand],
         tau: float = 1.0,
         lambda_: float = 10.0,
-        regen_probs_override: Optional[torch.Tensor] = None,
-        gate_dropout_p: float = 0.0,
+        *,
+        hard_alloc: bool = False,
+        alloc_dropout_p: float = 0.0,
     ) -> Tuple[
         Dict[int, torch.Tensor],   # path_noise_costs
         Dict[int, torch.Tensor],   # gsnr_preds
         Dict[int, torch.Tensor],   # path_indicators (for diagnostics)
-        torch.Tensor,              # regen_probs (num_nodes,)
+        "AllocationOutputs",       # the allocation half of this pass
     ]:
         """Run the full differentiable pipeline for a list of demands.
 
         Args:
             demands:  List of Demand namedtuples (id, src, dst, bitrate_gbps).
-            tau:      Regen placement temperature. Passed per-call, never stored.
+            tau:      Allocation decision temperature — sharpness of
+                      sigmoid(score / tau). Passed per-call, never stored.
             lambda_:  Vlastelica perturbation strength. Passed per-call.
-            regen_probs_override: (num_nodes,) probabilities to use INSTEAD of
-                      RegenPlacement's. Lets a caller evaluate a specific
-                      placement — e.g. train.py's hard-placement selection
-                      pass, or diagnose_regen_ablation.py's leave-one-out
-                      sweep — without mutating regen_logits and restoring
-                      them afterwards. Flows to both consumers (edge features
-                      and boundary probabilities) and is echoed back as the
-                      fourth return value, so `regen_probs` always describes
-                      what the forward pass actually used.
-            gate_dropout_p: Training-only probability of zeroing each node's
-                      gate in the PHYSICS path. The returned regen_probs are
-                      always undropped, so `lambda_regen`'s penalty is priced
-                      on the real probabilities — otherwise the price per
-                      regenerator fluctuates with the mask. Ignored under
-                      .eval() and whenever regen_probs_override is given.
+            hard_alloc: Take deterministic decisions a_k = 1 if score_k > 0
+                      and run the whole rollout under torch.no_grad(). NOT a
+                      threshold applied to the soft pass: under hard
+                      decisions the head's carry is the EXACT chunk noise, so
+                      the rollout is self-consistent physics, and the two
+                      passes are allowed to disagree. Spec 2.5.
+            alloc_dropout_p: Training-only probability of zeroing a PHYSICS
+                      allocation. `AllocationOutputs.a` (what lambda_dev
+                      prices) is always undropped; only `a_physics` (what the
+                      fold sees and what resets the carry) is masked, so the
+                      price per device does not fluctuate with the mask.
+                      Ignored under .eval() and whenever hard_alloc is set.
 
         Returns:
             path_noise_costs: demand_id → scalar accumulated-ASE-noise tensor, live in autograd graph.
             gsnr_preds:      demand_id → scalar GSNR tensor (dB).
             path_indicators: demand_id → (E,) binary tensor (for logging/debug).
-            regen_probs:     (num_nodes,) tensor from RegenPlacement.
+            alloc_outputs:   AllocationOutputs — see that dataclass.
         """
         device = self._topo_edge_features.device
-
-        # 1. Regen probabilities — shape (num_nodes,), requires_grad=True
-        # unless overridden.
-        if regen_probs_override is not None:
-            # An explicit placement the caller wants evaluated (hard-eval
-            # selection, leave-one-out ablation). Dropout must NOT touch it:
-            # masking a placement someone asked to measure would make the
-            # measurement random.
-            regen_probs = regen_probs_override
-            regen_probs_physics = regen_probs_override
-        else:
-            regen_probs = self.regen_placement.get_regen_probs(tau)
-            if self.training and gate_dropout_p > 0.0:
-                # Gate dropout. Once every demand clears threshold + margin,
-                # relu(bar - gsnr) is flat and d(feasibility)/d(logit) is
-                # exactly 0 on every node — the only surviving force is
-                # lambda_regen's L1 push, which is identical on every node by
-                # construction, and identical pressure cannot sort a
-                # load-bearing node from a redundant one. Dropping gates
-                # manufactures violations on purpose, putting demands back in
-                # the hinge's ACTIVE region, the only region that produces
-                # node-discriminating gradient. See
-                # docs/investigations/regen_over_provisioning.md Finding 2.
-                keep = (torch.rand_like(regen_probs) >= gate_dropout_p).to(
-                    regen_probs.dtype
-                )
-                regen_probs_physics = regen_probs * keep
-            else:
-                regen_probs_physics = regen_probs
 
         # 2. Edge features — static, built once in __init__ (approach A).
         edge_feats = self._static_edge_features
@@ -578,6 +598,7 @@ class DiffONetPipeline(nn.Module):
         segment_gsnr_flat: List[torch.Tensor] = []
         seg_rows: List[int] = []
         seg_cols: List[int] = []
+        seg_km_flat: List[float] = []
         boundary_node_ids: List[int] = []
         bnd_rows: List[int] = []
         bnd_cols: List[int] = []
@@ -607,6 +628,9 @@ class DiffONetPipeline(nn.Module):
                 segment_gsnr_flat.append(segment_gsnr)
                 seg_rows.append(row)
                 seg_cols.append(col)
+                seg_km_flat.append(
+                    sum(self._edges[eid].length_km for eid in seg_edge_ids)
+                )
 
             for col, node in enumerate(demand_boundary_nodes[demand.id]):
                 boundary_node_ids.append(node)
@@ -622,33 +646,116 @@ class DiffONetPipeline(nn.Module):
             long_ = dict(dtype=torch.long, device=device)
 
             # index_put on a zeros tensor rather than in-place assignment:
-            # out-of-place keeps the autograd path to segment_gsnr_flat and
-            # to regen_probs_physics explicit, and the (row, col) pairs are
-            # unique so accumulate=False is right.
+            # out-of-place keeps the autograd path to segment_gsnr_flat
+            # explicit, and the (row, col) pairs are unique so
+            # accumulate=False is right.
             gsnr_matrix = torch.zeros(num_demands, j_max, device=device).index_put(
                 (torch.tensor(seg_rows, **long_), torch.tensor(seg_cols, **long_)),
                 torch.stack(segment_gsnr_flat),
             )
 
-            prob_matrix = torch.zeros(num_demands, max(j_max - 1, 0), device=device)
+            # Per-segment linear noise for the allocation carry.
+            #
+            # NOTE this is db_to_linear_noise of the STE-BLENDED segment
+            # GSNR, not the raw ASE proxy the spec's section 2 pseudocode
+            # writes. The blended value is already "QoT forward value, proxy
+            # gradient", so the carry's forward value is exactly the quantity
+            # SegmentCombiner folds while its backward is still the proxy's —
+            # which is what keeps d(devices)/d(path_indicator) nonzero
+            # (spec section 4, "job 2"). With the raw proxy the carry would be
+            # ASE-only and median-normalised, and neither
+            # "carry equals true chunk noise" nor the oracle representability
+            # test could hold. See this plan's Deviations section 2.
+            seg_noise = db_to_linear_noise(
+                gsnr_matrix.clamp(GSNR_MIN, GSNR_MAX)
+            )
+            seg_km_matrix = torch.zeros(num_demands, j_max, device=device).index_put(
+                (torch.tensor(seg_rows, **long_), torch.tensor(seg_cols, **long_)),
+                torch.tensor(seg_km_flat, dtype=torch.float32, device=device),
+            )
+            num_segments = torch.tensor(seg_counts, **long_)
+            bar_db = bar_db_for_demands(
+                demands, self._modulation_config, self._margin_db
+            ).to(device)
+
+            if hard_alloc:
+                # Deterministic decisions carry no useful gradient — building
+                # the graph would only retain it. Spec 2.5.
+                with torch.no_grad():
+                    a, a_physics = self.allocation_head.rollout(
+                        seg_noise,
+                        seg_km_matrix,
+                        bar_db,
+                        num_segments,
+                        tau=tau,
+                        hard=hard_alloc,
+                        dropout_p=alloc_dropout_p,
+                    )
+            else:
+                a, a_physics = self.allocation_head.rollout(
+                    seg_noise,
+                    seg_km_matrix,
+                    bar_db,
+                    num_segments,
+                    tau=tau,
+                    hard=hard_alloc,
+                    dropout_p=alloc_dropout_p,
+                )
+
+            # Scatter a onto (D, N) so the cost is written sum_n sum_d and
+            # site_view falls out for free. -1 marks a padded column.
+            bnd_matrix = torch.full(
+                (num_demands, max(j_max - 1, 0)), -1, **long_
+            )
             if boundary_node_ids:
-                # ONE gather into regen_probs_physics, not one per boundary:
-                # the per-boundary list comprehension this replaces built
-                # sum_d (N_d - 1) separate 0-dim views every forward.
-                boundary_values = regen_probs_physics[
-                    torch.tensor(boundary_node_ids, **long_)
-                ]
-                prob_matrix = prob_matrix.index_put(
+                bnd_matrix = bnd_matrix.index_put(
                     (torch.tensor(bnd_rows, **long_), torch.tensor(bnd_cols, **long_)),
-                    boundary_values,
+                    torch.tensor(boundary_node_ids, **long_),
+                )
+            alloc_by_node = torch.zeros(num_demands, self._num_nodes, device=device)
+            real = bnd_matrix >= 0
+            if real.any():
+                rows_idx = torch.arange(num_demands, device=device).unsqueeze(1)
+                alloc_by_node = alloc_by_node.index_put(
+                    (rows_idx.expand_as(bnd_matrix)[real], bnd_matrix[real]),
+                    a[real],
+                    accumulate=True,      # one demand can cut twice at one node
                 )
 
             path_gsnrs = self.segment_combiner.forward_batched(
-                gsnr_matrix,
-                prob_matrix,
-                torch.tensor(seg_counts, **long_),
+                gsnr_matrix, a_physics, num_segments
             )
             for row, demand in enumerate(demands):
                 gsnr_preds[demand.id] = path_gsnrs[row]
 
-        return path_noise_costs, gsnr_preds, path_indicators, regen_probs
+            alloc_outputs = AllocationOutputs(
+                a=a,
+                a_physics=a_physics,
+                alloc_by_node=alloc_by_node,
+                device_count=total_device_cost(alloc_by_node),
+                site_view=site_view(alloc_by_node),
+                seg_gsnr_db=gsnr_matrix,
+                seg_noise=seg_noise,
+                num_segments=num_segments,
+                boundary_node_ids=bnd_matrix,
+                demand_ids=[d.id for d in demands],
+            )
+        else:
+            # No demands: every per-demand tensor is empty in its row
+            # dimension. site_view is written out rather than derived,
+            # because max over a zero-length dim is an error, not 0.
+            empty_dd = torch.zeros(0, 0, device=device)
+            alloc_outputs = AllocationOutputs(
+                a=empty_dd,
+                a_physics=empty_dd,
+                alloc_by_node=torch.zeros(0, self._num_nodes, device=device),
+                device_count=torch.zeros((), device=device),
+                site_view=torch.zeros(self._num_nodes, device=device),
+                seg_gsnr_db=empty_dd,
+                seg_noise=empty_dd,
+                num_segments=torch.zeros(0, dtype=torch.long, device=device),
+                boundary_node_ids=torch.zeros(0, 0, dtype=torch.long, device=device),
+                demand_ids=[],
+            )
+
+        return path_noise_costs, gsnr_preds, path_indicators, alloc_outputs

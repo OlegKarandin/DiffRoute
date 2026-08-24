@@ -30,7 +30,7 @@ from diffopt.demands import Demand
 from diffopt.loss import compute_loss
 from diffopt.modulation import ModulationConfig
 from diffopt.pipeline import DiffONetPipeline, segment_path
-from diffopt.placement.regenerator import RegenPlacement
+from diffopt.placement.allocation import AllocationHead
 from diffopt.qot.model import SpanAttentionQoT
 from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.routing.edge_weight_net import EdgeWeightNet
@@ -107,14 +107,32 @@ def make_pipeline(topology: Topology) -> DiffONetPipeline:
     qot_model = SpanAttentionQoT(max_spans=60)
     segment_combiner = SegmentCombiner()  # stateless and parameter-free
     edge_weight_net = EdgeWeightNet()
-    regen_placement = RegenPlacement(topology.num_nodes)
+    # The head is amortized over route-local features, so it takes no
+    # topology argument — unlike the (num_nodes,) logit vector it replaces.
+    allocation_head = AllocationHead()
     return DiffONetPipeline(
         topology=topology,
         qot_model=qot_model,
         segment_combiner=segment_combiner,
         edge_weight_net=edge_weight_net,
-        regen_placement=regen_placement,
+        allocation_head=allocation_head,
+        modulation_config=make_mod_config(),
+        margin_db=0.5,
     )
+
+
+def make_demands() -> list[Demand]:
+    """The standard three-demand set for the hub topology.
+
+    0->4 and 1->4 both cross node 3 (the sole regen candidate), so each has
+    exactly one boundary; 0->3 terminates there, so it has none. That mix is
+    what makes the ragged (D, J) padding real rather than rectangular.
+    """
+    return [
+        Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
+        Demand(id=1, src=0, dst=3, bitrate_gbps=400.0),
+        Demand(id=2, src=1, dst=4, bitrate_gbps=400.0),
+    ]
 
 
 def make_mod_config() -> ModulationConfig:
@@ -140,7 +158,7 @@ def test_forward_pass_shapes():
         Demand(id=1, src=0, dst=3, bitrate_gbps=400.0),
         Demand(id=2, src=1, dst=4, bitrate_gbps=400.0),
     ]
-    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline(demands)
+    path_noise_costs, gsnr_preds, path_indicators, alloc = pipeline(demands)
 
     assert len(gsnr_preds) == 3
     assert len(path_noise_costs) == 3
@@ -151,7 +169,7 @@ def test_forward_pass_shapes():
         assert path_noise_costs[did].shape == torch.Size([])   # scalar
         assert path_indicators[did].shape == torch.Size([len(topo.undirected_edges)])
 
-    assert regen_probs.shape == torch.Size([topo.num_nodes])
+    assert alloc.site_view.shape == torch.Size([topo.num_nodes])
 
 
 # ---------------------------------------------------------------------------
@@ -164,13 +182,13 @@ def test_gradient_flow_edge_weight_net():
     mod_cfg = make_mod_config()
 
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    path_noise_costs, gsnr_preds, _, alloc = pipeline(demands, lambda_=5.0)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=regen_probs,
+        regen_probs=alloc.site_view,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
@@ -183,34 +201,6 @@ def test_gradient_flow_edge_weight_net():
 
 
 # ---------------------------------------------------------------------------
-# Test 3: regen_logits gradient flows via boundary_probs
-# ---------------------------------------------------------------------------
-
-def test_gradient_flow_regen_logits():
-    topo = make_hub_topology()
-    pipeline = make_pipeline(topo)
-    mod_cfg = make_mod_config()
-
-    # Demand 0→4 routes through node 3 (regen candidate) → boundary prob used
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
-
-    loss, _ = compute_loss(
-        gsnr_preds=gsnr_preds,
-        path_noise_costs=path_noise_costs,
-        demands=demands,
-        regen_probs=regen_probs,
-        modulation_config=mod_cfg,
-        duals=torch.ones(len(demands)),
-    )
-    loss.backward()
-
-    logits = pipeline.regen_placement.regen_logits
-    assert logits.grad is not None, "regen_logits.grad is None"
-    assert logits.grad.abs().sum().item() > 0, "regen_logits.grad is all-zero"
-
-
-# ---------------------------------------------------------------------------
 # Test 4: QoT model parameters have no gradient after backward
 # ---------------------------------------------------------------------------
 
@@ -220,13 +210,13 @@ def test_qot_frozen():
     mod_cfg = make_mod_config()
 
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands)
+    path_noise_costs, gsnr_preds, _, alloc = pipeline(demands)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=regen_probs,
+        regen_probs=alloc.site_view,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
@@ -249,7 +239,7 @@ def test_single_segment_identity():
     pipeline = make_pipeline(topo)
 
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
-    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline([demand])
+    path_noise_costs, gsnr_preds, path_indicators, _ = pipeline([demand])
 
     # Find which edges are on the path
     indicator = path_indicators[0].detach()
@@ -299,20 +289,20 @@ def test_loss_backward_no_nan():
         Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
         Demand(id=1, src=0, dst=3, bitrate_gbps=400.0),
     ]
-    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    path_noise_costs, gsnr_preds, _, alloc = pipeline(demands, lambda_=5.0)
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=regen_probs,
+        regen_probs=alloc.site_view,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
     loss.backward()
 
     trainable = list(pipeline.edge_weight_net.parameters()) + \
-                [pipeline.regen_placement.regen_logits]
+                list(pipeline.allocation_head.parameters())
     for param in trainable:
         if param.grad is not None:
             assert torch.isfinite(param.grad).all(), \
@@ -331,7 +321,7 @@ def test_ste_preserves_forward_value():
     pipeline = make_pipeline(topo)
 
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
-    _, gsnr_preds, path_indicators, regen_probs = pipeline([demand])
+    _, gsnr_preds, path_indicators, alloc = pipeline([demand])
 
     indicator = path_indicators[0].detach()
     active_eids = [e for e in range(indicator.shape[0]) if indicator[e].item() > 0.5]
@@ -346,7 +336,12 @@ def test_ste_preserves_forward_value():
         with torch.no_grad():
             direct_gsnrs.append(pipeline.qot_model(span_feats, padding_mask)[0])
 
-    boundary_probs = [regen_probs[n].detach() for n in boundary_nodes]
+    # The allocation is per (demand, boundary) now, so the boundary
+    # probabilities come from the head's own physics decisions for this
+    # demand's row, not from a per-node lookup.
+    boundary_probs = [
+        alloc.a_physics[0, k].detach() for k in range(len(boundary_nodes))
+    ]
     expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs)
 
     assert abs(gsnr_preds[0].item() - expected_gsnr.item()) < 1e-4, (
@@ -374,21 +369,19 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
     )
 
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
-    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline([demand], lambda_=5.0)
+    path_noise_costs, gsnr_preds, path_indicators, alloc = pipeline([demand], lambda_=5.0)
 
     pi = path_indicators[0]
     pi.retain_grad()
 
-    edge_feats = torch.cat([
-        pipeline._topo_edge_features,
-        regen_probs[pipeline._edge_src_ids].unsqueeze(1).detach(),
-        regen_probs[pipeline._edge_dst_ids].unsqueeze(1).detach(),
-    ], dim=1)
-    edge_weights = pipeline.edge_weight_net(edge_feats).squeeze(-1).detach()
+    # Edge features are static (approach A), so this is forward()'s own input.
+    edge_weights = pipeline.edge_weight_net(
+        pipeline._static_edge_features
+    ).squeeze(-1).detach()
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
-        regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
+        regen_probs=alloc.site_view, modulation_config=always_infeasible_cfg,
         duals=torch.ones(1),
     )
     loss.backward()
@@ -423,10 +416,10 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
     demand = Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)
 
     def run(pipeline: DiffONetPipeline) -> torch.Tensor:
-        path_noise_costs, gsnr_preds, _, regen_probs = pipeline([demand], lambda_=5.0)
+        path_noise_costs, gsnr_preds, _, alloc = pipeline([demand], lambda_=5.0)
         loss, _ = compute_loss(
             gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
-            regen_probs=regen_probs, modulation_config=always_infeasible_cfg,
+            regen_probs=alloc.site_view, modulation_config=always_infeasible_cfg,
             duals=torch.ones(1),
         )
         loss.backward()
@@ -538,9 +531,9 @@ def test_batched_qot_matches_per_segment_direct_calls():
         Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
         Demand(id=1, src=1, dst=4, bitrate_gbps=400.0),  # via node 3 -> 2 segments
     ]
-    _, gsnr_preds, path_indicators, regen_probs = pipeline(demands)
+    _, gsnr_preds, path_indicators, alloc = pipeline(demands)
 
-    for demand in demands:
+    for row, demand in enumerate(demands):
         indicator = path_indicators[demand.id].detach()
         active_eids = [e for e in range(indicator.shape[0]) if indicator[e].item() > 0.5]
 
@@ -555,7 +548,9 @@ def test_batched_qot_matches_per_segment_direct_calls():
             with torch.no_grad():
                 direct_gsnrs.append(pipeline.qot_model(span_feats, padding_mask)[0])
 
-        boundary_probs = [regen_probs[n].detach() for n in boundary_nodes]
+        boundary_probs = [
+            alloc.a_physics[row, k].detach() for k in range(len(boundary_nodes))
+        ]
         expected_gsnr = pipeline.segment_combiner(direct_gsnrs, boundary_probs)
 
         assert abs(gsnr_preds[demand.id].item() - expected_gsnr.item()) < 1e-4, (
@@ -652,14 +647,14 @@ def test_scale_direction_gradient_is_zero():
 
     handle = pipeline.edge_weight_net.register_forward_hook(hook)
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+    path_noise_costs, gsnr_preds, _, alloc = pipeline(demands, lambda_=5.0)
     handle.remove()
 
     loss, _ = compute_loss(
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=regen_probs,
+        regen_probs=alloc.site_view,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
     )
@@ -698,14 +693,14 @@ def test_total_loss_invariant_to_edge_weight_scale():
         inner = pipeline.edge_weight_net
         pipeline.edge_weight_net = _ScaledNet(inner, scale)
         try:
-            path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
+            path_noise_costs, gsnr_preds, path_indicators, alloc = pipeline(
                 demands, lambda_=5.0
             )
             loss, _ = compute_loss(
                 gsnr_preds=gsnr_preds,
                 path_noise_costs=path_noise_costs,
                 demands=demands,
-                regen_probs=regen_probs,
+                regen_probs=alloc.site_view,
                 modulation_config=mod_cfg,
                 duals=torch.ones(len(demands)),
             )
@@ -880,12 +875,12 @@ def test_edge_weights_do_not_collapse_over_training():
 
     for _ in range(30):
         optimizer.zero_grad()
-        path_noise_costs, gsnr_preds, _, regen_probs = pipeline(demands, lambda_=5.0)
+        path_noise_costs, gsnr_preds, _, alloc = pipeline(demands, lambda_=5.0)
         loss, _ = compute_loss(
             gsnr_preds=gsnr_preds,
             path_noise_costs=path_noise_costs,
             demands=demands,
-            regen_probs=regen_probs,
+            regen_probs=alloc.site_view,
             modulation_config=mod_cfg,
             duals=torch.ones(len(demands)),
         )
@@ -902,111 +897,6 @@ def test_edge_weights_do_not_collapse_over_training():
     assert after < before * 2.0, (
         f"median raw edge weight exploded {before:.6e} -> {after:.6e}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Test: regen_probs_override parameter
-# ---------------------------------------------------------------------------
-
-def test_regen_probs_override_replaces_the_placement_module():
-    """An override must reach BOTH consumers of regen_probs: EdgeWeightNet's
-    edge features and SegmentCombiner's boundary probabilities. Comparing
-    all-zeros against all-ones is the cheapest way to prove it reaches the
-    second one — a path with a regenerator at every candidate has a strictly
-    better GSNR than the same path with none."""
-    topology = make_hub_topology()
-    pipeline = make_pipeline(topology)
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-
-    zeros = torch.zeros(topology.num_nodes)
-    ones = torch.ones(topology.num_nodes)
-
-    _, gsnr_none, _, probs_none = pipeline(demands, tau=1.0, regen_probs_override=zeros)
-    _, gsnr_all, _, probs_all = pipeline(demands, tau=1.0, regen_probs_override=ones)
-
-    assert torch.equal(probs_none, zeros)
-    assert torch.equal(probs_all, ones)
-    assert gsnr_all[0].item() > gsnr_none[0].item()
-
-
-def test_regen_probs_override_none_is_a_no_op():
-    """The default path must be unchanged: same probs as get_regen_probs(tau)."""
-    topology = make_hub_topology()
-    pipeline = make_pipeline(topology)
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-
-    _, _, _, probs = pipeline(demands, tau=0.7)
-    expected = pipeline.regen_placement.get_regen_probs(0.7)
-
-    assert torch.equal(probs, expected)
-
-
-# ---------------------------------------------------------------------------
-# Test: gate dropout
-# ---------------------------------------------------------------------------
-
-def test_gate_dropout_leaves_the_returned_probs_undropped():
-    """The lambda_regen penalty is computed from the RETURNED probs. If the
-    mask reached them, the price per regenerator would fluctuate with the
-    mask — adding noise exactly where signal is wanted."""
-    topology = make_hub_topology()
-    pipeline = make_pipeline(topology)
-    pipeline.train()
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-
-    torch.manual_seed(0)
-    _, _, _, probs = pipeline(demands, tau=1.0, gate_dropout_p=0.9)
-
-    assert torch.allclose(probs, pipeline.regen_placement.get_regen_probs(1.0))
-
-
-def test_gate_dropout_changes_the_physics():
-    """Dropping 100% of gates must give the same GSNR as no regenerators."""
-    topology = make_hub_topology()
-    pipeline = make_pipeline(topology)
-    pipeline.train()
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    with torch.no_grad():
-        pipeline.regen_placement.regen_logits.fill_(10.0)
-
-    _, dropped, _, _ = pipeline(demands, tau=1.0, gate_dropout_p=1.0)
-    zeros = torch.zeros(topology.num_nodes)
-    _, none_placed, _, _ = pipeline(demands, tau=1.0, regen_probs_override=zeros)
-
-    assert abs(dropped[0].item() - none_placed[0].item()) < 1e-4
-
-
-def test_gate_dropout_is_inactive_in_eval_mode():
-    topology = make_hub_topology()
-    pipeline = make_pipeline(topology)
-    pipeline.eval()
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    with torch.no_grad():
-        pipeline.regen_placement.regen_logits.fill_(10.0)
-
-    _, a, _, _ = pipeline(demands, tau=1.0, gate_dropout_p=1.0)
-    _, b, _, _ = pipeline(demands, tau=1.0, gate_dropout_p=0.0)
-
-    assert abs(a[0].item() - b[0].item()) < 1e-6
-
-
-def test_gate_dropout_does_not_apply_to_an_override():
-    """An override is an explicit placement the caller wants evaluated —
-    the hard-eval selection pass. Masking it would make selection random."""
-    topology = make_hub_topology()
-    pipeline = make_pipeline(topology)
-    pipeline.train()
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-    ones = torch.ones(topology.num_nodes)
-
-    _, with_dropout, _, _ = pipeline(
-        demands, tau=1.0, regen_probs_override=ones, gate_dropout_p=1.0
-    )
-    _, without, _, _ = pipeline(
-        demands, tau=1.0, regen_probs_override=ones, gate_dropout_p=0.0
-    )
-
-    assert abs(with_dropout[0].item() - without[0].item()) < 1e-6
 
 
 def test_segment_gsnr_memo_serves_a_repeated_forward_without_calling_the_qot_model():
@@ -1092,24 +982,6 @@ def test_clear_segment_gsnr_cache_forces_recomputation():
     assert len(pipeline._segment_gsnr_cache) == 0
 
 
-def test_memoised_forward_still_carries_gradient_to_regen_logits():
-    """The memo replaces a live model output with a rebuilt constant
-    tensor. That is safe only because the QoT value was already
-    gradient-free (frozen model, static features) and the STE routes the
-    gradient through the proxy. This is the regression guard for getting
-    that wrong."""
-    topology = make_hub_topology()
-    pipeline = make_pipeline(topology)
-    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
-
-    _, gsnr, _, _ = pipeline(demands, tau=1.0)
-    gsnr[0].backward()
-
-    grad = pipeline.regen_placement.regen_logits.grad
-    assert grad is not None
-    assert grad.abs().sum().item() > 0.0
-
-
 def test_segment_gsnr_cache_eviction_does_not_read_from_cleared_cache(monkeypatch):
     """Cache eviction check must happen AFTER reading from cache, not before.
     This regression test lowers the cache max and verifies (a) no KeyError on
@@ -1159,18 +1031,21 @@ def test_pipeline_gsnr_matches_a_per_demand_combiner_loop():
 
     topology = make_hub_topology()
     pipeline = make_pipeline(topology)
+    # Break the closed-at-init plateau so the boundary probabilities are
+    # genuinely fractional and demand-dependent — otherwise every row would
+    # fold at the same sigmoid(-3) and the equivalence would be vacuous.
+    torch.manual_seed(0)
     with torch.no_grad():
-        pipeline.regen_placement.regen_logits.copy_(
-            torch.tensor([0.3, -0.7, 0.1, 1.2, -0.4])
-        )
+        pipeline.allocation_head.net[-1].weight.normal_(std=0.5)
+        pipeline.allocation_head.net[-1].bias.zero_()
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
                Demand(id=1, src=2, dst=4, bitrate_gbps=400.0),
                Demand(id=2, src=1, dst=3, bitrate_gbps=400.0)]
 
     with torch.no_grad():
-        _, gsnr_preds, path_indicators, regen_probs = pipeline(demands, tau=1.0)
+        _, gsnr_preds, path_indicators, alloc = pipeline(demands, tau=1.0)
 
-        for demand in demands:
+        for row, demand in enumerate(demands):
             ordered = pipeline._reconstruct_path(
                 path_indicators[demand.id], demand.src, demand.dst
             )
@@ -1183,7 +1058,8 @@ def test_pipeline_gsnr_matches_a_per_demand_combiner_loop():
                 feats, mask = pipeline._extract_span_features(seg, gsnr_preds[0].device)
                 segment_gsnrs.append(pipeline.qot_model(feats, mask)[0])
             expected = pipeline.segment_combiner(
-                segment_gsnrs, [regen_probs[n] for n in boundary_nodes]
+                segment_gsnrs,
+                [alloc.a_physics[row, k] for k in range(len(boundary_nodes))],
             )
             assert abs(gsnr_preds[demand.id].item() - expected.item()) < 1e-4
 
@@ -1221,10 +1097,14 @@ def test_pipeline_handles_an_empty_demand_list():
     topology = make_hub_topology()
     pipeline = make_pipeline(topology)
 
-    costs, gsnr, indicators, probs = pipeline([], tau=1.0)
+    costs, gsnr, indicators, alloc = pipeline([], tau=1.0)
 
     assert costs == {} and gsnr == {} and indicators == {}
-    assert probs.shape == (topology.num_nodes,)
+    assert alloc.demand_ids == []
+    assert alloc.a.shape == (0, 0)
+    assert alloc.alloc_by_node.shape == (0, topology.num_nodes)
+    assert alloc.site_view.shape == (topology.num_nodes,)
+    assert alloc.device_count.item() == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1246,7 +1126,6 @@ def test_edge_features_are_static_and_carry_candidate_indicators():
         assert feats[eid, 6].item() == pytest.approx(float(edge.dst in candidates))
 
 
-@pytest.mark.xfail(reason="allocation_head lands in Task 4", strict=True)
 def test_edge_features_do_not_move_when_the_allocation_head_moves():
     """The circularity is gone: no learned quantity reaches the router's
     input. This is what makes approach A permanent rather than a tuning
@@ -1258,3 +1137,100 @@ def test_edge_features_do_not_move_when_the_allocation_head_moves():
         for p in pipeline.allocation_head.parameters():
             p.add_(torch.randn_like(p))
     assert torch.equal(pipeline._static_edge_features, before)
+
+
+# ---------------------------------------------------------------------------
+# Per-demand allocation
+# ---------------------------------------------------------------------------
+
+def test_forward_returns_allocation_outputs_with_consistent_shapes():
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+    _, _, _, alloc = pipeline(demands)
+
+    d = len(demands)
+    j = alloc.seg_gsnr_db.shape[1]
+    assert alloc.a.shape == (d, max(j - 1, 0))
+    assert alloc.seg_noise.shape == (d, j)
+    assert alloc.num_segments.shape == (d,)
+    assert alloc.alloc_by_node.shape == (d, topology.num_nodes)
+    assert alloc.site_view.shape == (topology.num_nodes,)
+    assert alloc.demand_ids == [x.id for x in demands]
+
+
+def test_device_count_is_the_sum_of_allocations():
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    _, _, _, alloc = pipeline(make_demands())
+    assert alloc.device_count.item() == pytest.approx(alloc.a.sum().item(), rel=1e-5)
+    assert alloc.device_count.item() == pytest.approx(
+        alloc.alloc_by_node.sum().item(), rel=1e-5
+    )
+
+
+def test_device_count_is_route_differentiable():
+    """Spec section 8 item 5 and section 4's "job 2": d(devices)/d(path_indicator)
+    must be nonzero, which is what lets Vlastelica's re-solve search for a
+    route that needs fewer regenerators."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    with torch.no_grad():                       # break the closed-init plateau
+        pipeline.allocation_head.net[-1].weight.normal_(std=0.5)
+    _, _, indicators, alloc = pipeline(make_demands())
+    grads = torch.autograd.grad(
+        alloc.device_count, list(indicators.values()), allow_unused=True
+    )
+    assert any(g is not None and g.abs().sum().item() > 0 for g in grads)
+
+
+def test_hard_alloc_is_not_a_threshold_on_the_soft_pass():
+    """Spec 2.5. Under hard decisions the carry is the EXACT chunk noise, so
+    the hard rollout is self-consistent physics; thresholding a mean-field
+    pass is not. They must therefore be allowed to differ."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].weight.normal_(std=2.0)
+        pipeline.allocation_head.net[-1].bias.zero_()
+    demands = make_demands()
+    _, _, _, soft = pipeline(demands, tau=1.0)
+    with torch.no_grad():
+        _, _, _, hard = pipeline(demands, hard_alloc=True)
+    assert set(hard.a.unique().tolist()) <= {0.0, 1.0}
+    assert not hard.a.requires_grad
+
+
+def test_hard_alloc_carry_equals_the_combiners_own_fold():
+    """Spec section 8 item 3, at the pipeline level: the head's carry and the
+    combiner must agree on what a chunk's noise is, or oracle_gap measures a
+    units mismatch instead of the head."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].weight.normal_(std=2.0)
+        pipeline.allocation_head.net[-1].bias.zero_()
+        _, gsnr_preds, _, alloc = pipeline(make_demands(), hard_alloc=True)
+    from diffopt.qot.segment_combiner import linear_noise_to_db
+
+    carried = linear_noise_to_db(pipeline.allocation_head.last_max_chunk_noise)
+    folded = torch.stack([gsnr_preds[i] for i in alloc.demand_ids])
+    assert torch.allclose(carried, folded, atol=1e-3)
+
+
+def test_site_view_is_derived_and_never_priced():
+    """Spec decision 4: kept for diagnostics, never in the objective."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    _, _, _, alloc = pipeline(make_demands())
+    assert torch.equal(alloc.site_view, alloc.alloc_by_node.max(dim=0).values)
+    assert alloc.site_view.sum().item() <= alloc.device_count.item() + 1e-5
+
+
+def test_regen_placement_is_gone():
+    """Spec section 7. A stale import is how a deleted objective comes back."""
+    import diffopt.pipeline as p
+
+    assert not hasattr(p, "RegenPlacement")
+    with pytest.raises(ModuleNotFoundError):
+        import diffopt.placement.regenerator  # noqa: F401

@@ -54,3 +54,22 @@ class ModulationConfig:
     @property
     def bitrate_options(self) -> List[float]:
         return sorted(self._snr_table.keys())
+
+
+def bar_db_for_demands(demands, modulation_config, margin_db: float) -> "torch.Tensor":
+    """(D,) tensor of `threshold(bitrate_d) + margin_db`, in demand order.
+
+    One definition of "the bar", shared by the loss's hinge, the allocation
+    head's features 1/2/4, the oracle's feasibility test and hard_rollout's
+    violation count. Four places computing `threshold + margin` inline is
+    four places to drift, and a drifted bar makes oracle_gap unreadable.
+    """
+    import torch
+
+    return torch.tensor(
+        [
+            modulation_config.required_snr_threshold(d.bitrate_gbps) + margin_db
+            for d in demands
+        ],
+        dtype=torch.float32,
+    )

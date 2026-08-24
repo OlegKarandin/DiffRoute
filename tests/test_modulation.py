@@ -51,3 +51,17 @@ def test_bitrate_options_count(mod_cfg):
     assert len(options) == 11
     assert min(options) == 300.0
     assert max(options) == 800.0
+
+
+def test_bar_db_for_demands_is_threshold_plus_margin_in_demand_order(mod_cfg):
+    from diffopt.demands import Demand
+    from diffopt.modulation import bar_db_for_demands
+
+    cfg = mod_cfg
+    demands = [Demand(0, 1, 2, 400.0), Demand(1, 3, 4, 800.0)]
+    bars = bar_db_for_demands(demands, cfg, margin_db=0.5)
+    assert bars.shape == (2,)
+    for i, d in enumerate(demands):
+        assert bars[i].item() == pytest.approx(
+            cfg.required_snr_threshold(d.bitrate_gbps) + 0.5
+        )
