@@ -8,10 +8,61 @@ as bidirectional and returns a binary indicator over the original edge IDs.
 from __future__ import annotations
 
 import heapq
-from collections import deque
+from collections import OrderedDict, deque
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+
+# Adjacency STRUCTURE cache. Only edge_weights change between calls: the
+# node -> [(neighbour, edge_id)] mapping is a pure function of edge_index
+# and num_nodes, and Topology is immutable after construction
+# (Topology.undirected_edges is a cached_property with an explicit
+# "nothing mutates after populate_optical" argument). Rebuilding it inside
+# every dijkstra()/spfa() call cost 2E appends plus 3E int()/float()
+# conversions -- 692 calls per epoch on ind_132's 346 demands, one Dijkstra
+# forward and one SPFA backward each, doubled again by train.py's
+# hard-evaluation pass.
+#
+# Keyed on edge_index's raw BYTES, not on the array object: surrogate.py
+# materialises a fresh numpy array per call via .detach().cpu().numpy(), so
+# an identity key would never hit. Bounded because diagnostics sweep
+# synthetic graphs; real runs hold exactly one topology.
+#
+# ORDERING IS LOAD-BEARING. adj[u] must stay in ascending edge-id order,
+# interleaving the u->v and v->u directions exactly as the original
+# `for eid in range(E)` loop produced it. Relaxation uses strict `<`, so a
+# tie between two equal-cost predecessors resolves to whichever edge id
+# comes first; a differently-ordered CSR returns a different (still
+# shortest) path and silently moves every downstream number.
+_MAX_CACHED_TOPOLOGIES = 8
+_adjacency_cache: "OrderedDict[Tuple[bytes, int], List[List[Tuple[int, int]]]]" = (
+    OrderedDict()
+)
+
+
+def _adjacency(edge_index: np.ndarray, num_nodes: int) -> List[List[Tuple[int, int]]]:
+    """node -> [(neighbour, edge_id), ...], ascending edge id. Cached.
+
+    Returns the SHARED cached list. Callers must treat it as read-only —
+    mutating it corrupts every later call on the same topology.
+    """
+    edge_index = np.asarray(edge_index)
+    key = (edge_index.tobytes(), num_nodes)
+    cached = _adjacency_cache.get(key)
+    if cached is not None:
+        return cached
+
+    adj: List[List[Tuple[int, int]]] = [[] for _ in range(num_nodes)]
+    for eid in range(edge_index.shape[1]):
+        u, v = int(edge_index[0, eid]), int(edge_index[1, eid])
+        adj[u].append((v, eid))
+        adj[v].append((u, eid))
+
+    _adjacency_cache[key] = adj
+    while len(_adjacency_cache) > _MAX_CACHED_TOPOLOGIES:
+        _adjacency_cache.popitem(last=False)
+    return adj
 
 
 def spfa(
@@ -29,12 +80,11 @@ def spfa(
 
     Returns (E,) binary float32 path indicator, or None if no path exists.
     """
-    adj: List[List[Tuple[float, int, int]]] = [[] for _ in range(num_nodes)]
-    for eid in range(edge_index.shape[1]):
-        u, v = int(edge_index[0, eid]), int(edge_index[1, eid])
-        w = float(edge_weights[eid])
-        adj[u].append((w, v, eid))
-        adj[v].append((w, u, eid))
+    adj = _adjacency(edge_index, num_nodes)
+    # One C-level conversion of the whole weight vector, so the relaxation
+    # loop indexes Python floats rather than numpy scalars.
+    weights = np.asarray(edge_weights, dtype=np.float64).tolist()
+    num_edges = np.asarray(edge_index).shape[1]
 
     dist = np.full(num_nodes, np.inf)
     prev_node = np.full(num_nodes, -1, dtype=int)
@@ -45,13 +95,13 @@ def spfa(
     queue: deque = deque([src])
     in_queue[src] = True
     relaxations = 0
-    max_relaxations = num_nodes * edge_index.shape[1]  # cycle-detection guard
+    max_relaxations = num_nodes * num_edges  # cycle-detection guard
 
     while queue:
         u = queue.popleft()
         in_queue[u] = False
-        for w, v, eid in adj[u]:
-            nd = dist[u] + w
+        for v, eid in adj[u]:
+            nd = dist[u] + weights[eid]
             if nd < dist[v]:
                 dist[v] = nd
                 prev_node[v] = u
@@ -67,7 +117,7 @@ def spfa(
     if dist[dst] == np.inf:
         return None
 
-    path_indicator = np.zeros(edge_index.shape[1], dtype=np.float32)
+    path_indicator = np.zeros(num_edges, dtype=np.float32)
     node = dst
     while prev_edge[node] != -1:
         path_indicator[prev_edge[node]] = 1.0
@@ -104,13 +154,9 @@ def dijkstra(
     (E,) binary numpy array: 1 if edge is on the shortest path, else 0.
     Returns None if no path exists.
     """
-    # Build adjacency list: node -> list of (neighbour, weight, edge_id)
-    adj: List[List[Tuple[float, int, int]]] = [[] for _ in range(num_nodes)]
-    for eid in range(edge_index.shape[1]):
-        u, v = int(edge_index[0, eid]), int(edge_index[1, eid])
-        w = float(edge_weights[eid])
-        adj[u].append((w, v, eid))
-        adj[v].append((w, u, eid))
+    adj = _adjacency(edge_index, num_nodes)
+    weights = np.asarray(edge_weights, dtype=np.float64).tolist()
+    num_edges = np.asarray(edge_index).shape[1]
 
     # Dijkstra
     dist = np.full(num_nodes, np.inf)
@@ -125,8 +171,8 @@ def dijkstra(
             continue
         if u == dst:
             break
-        for w, v, eid in adj[u]:
-            nd = dist[u] + w
+        for v, eid in adj[u]:
+            nd = dist[u] + weights[eid]
             if nd < dist[v]:
                 dist[v] = nd
                 prev_node[v] = u
@@ -137,7 +183,7 @@ def dijkstra(
         return None  # no path
 
     # Reconstruct path edges
-    path_indicator = np.zeros(edge_index.shape[1], dtype=np.float32)
+    path_indicator = np.zeros(num_edges, dtype=np.float32)
     node = dst
     while prev_edge[node] != -1:
         path_indicator[prev_edge[node]] = 1.0

@@ -49,6 +49,10 @@ class DijkstraSurrogate(torch.autograd.Function):
         ctx._dst = dst
         ctx._num_nodes = num_nodes
         ctx._lambda = lambda_
+        # Backward needs the same numpy edge_index. Converting it there
+        # repeats a .detach().cpu().numpy() per demand per step for a
+        # tensor that is a registered buffer and never changes.
+        ctx._ei_np = ei_np
 
         return path
 
@@ -63,7 +67,6 @@ class DijkstraSurrogate(torch.autograd.Function):
         # Perturbed weights: c_target = w + lambda * grad_output
         w_np = edge_weights.detach().cpu().numpy().astype(np.float64)
         g_np = grad_output.detach().cpu().numpy().astype(np.float64)
-        ei_np = edge_index.detach().cpu().numpy()
 
         # Vlastelica (ICLR 2020, Theorem 3.1): perturb by +λ*ŷ where ŷ = -∂L/∂z.
         # Since grad_output = ∂L/∂z (PyTorch convention), ŷ = -grad_output, so
@@ -71,7 +74,7 @@ class DijkstraSurrogate(torch.autograd.Function):
         c_target = w_np + lambda_ * g_np
 
         # Use SPFA in backward: perturbed weights can be negative
-        path_target_np = spfa(c_target, ei_np, src, dst, num_nodes)
+        path_target_np = spfa(c_target, ctx._ei_np, src, dst, num_nodes)
         if path_target_np is None:
             # If perturbed graph has no path, use zero gradient
             path_target_np = path.detach().cpu().numpy().astype(np.float64)

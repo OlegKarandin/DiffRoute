@@ -140,3 +140,76 @@ def test_spfa_detects_a_negative_cycle_even_when_dst_does_not_touch_it():
     edge_weights = np.array([1.0, -3.0, 10.0])
 
     assert spfa(edge_weights, edge_index, src=0, dst=3, num_nodes=4) is None
+
+
+def test_adjacency_structure_is_cached_across_calls():
+    """The structure is a pure function of (edge_index, num_nodes). Callers
+    hand in a FRESH numpy array every time -- surrogate.py materialises one
+    per forward and one per backward via .detach().cpu().numpy() -- so the
+    cache must key on the array's CONTENT, not its identity."""
+    from diffopt.routing import shortest_path as sp
+
+    sp._adjacency_cache.clear()
+    edge_index = _edges([(0, 1), (1, 2), (0, 2)])
+
+    first = sp._adjacency(edge_index, 3)
+    second = sp._adjacency(np.array(edge_index, copy=True), 3)
+
+    assert first is second
+    assert len(sp._adjacency_cache) == 1
+
+
+def test_adjacency_is_in_ascending_edge_id_order():
+    """Load-bearing, and the reason this is not a free refactor. The old
+    code filled adj[u] inside `for eid in range(E)`, interleaving the u->v
+    and v->u directions in edge-id order. Relaxation uses strict `<`, so a
+    tie between two equal-cost predecessors resolves to whichever edge id
+    was visited first. Reordering silently changes which path is returned
+    on a tied graph."""
+    from diffopt.routing import shortest_path as sp
+
+    sp._adjacency_cache.clear()
+    adj = sp._adjacency(_edges([(0, 1), (0, 2), (1, 2)]), 3)
+
+    assert adj[0] == [(1, 0), (2, 1)]
+    assert adj[1] == [(0, 0), (2, 2)]
+    assert adj[2] == [(0, 1), (1, 2)]
+
+
+def test_tied_shortest_paths_resolve_to_the_lowest_edge_id():
+    """The concrete regression guard for the ordering above. A square with
+    two equal-cost routes 0->1->3 and 0->2->3: Dijkstra pops node 1 before
+    node 2 (heap tie broken by node id) and settles node 3 through edge 2,
+    so edges 0 and 2 are on the path and edges 1 and 3 are not. Pinning the
+    literal indicator is the point -- an assertion that 'some 2-hop path'
+    was found would not catch a reordering."""
+    edge_index = _edges([(0, 1), (0, 2), (1, 3), (2, 3)])
+    weights = np.array([1.0, 1.0, 1.0, 1.0])
+
+    path = dijkstra(weights, edge_index, 0, 3, 4)
+
+    np.testing.assert_array_equal(path, np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32))
+
+
+def test_cached_structure_does_not_freeze_the_weights():
+    """The structure is cached; the weights are not. Two calls on the same
+    edge_index with different weights must return different paths."""
+    edge_index = _edges([(0, 1), (0, 2), (1, 3), (2, 3)])
+
+    cheap_top = dijkstra(np.array([1.0, 9.0, 1.0, 9.0]), edge_index, 0, 3, 4)
+    cheap_bottom = dijkstra(np.array([9.0, 1.0, 9.0, 1.0]), edge_index, 0, 3, 4)
+
+    np.testing.assert_array_equal(cheap_top, np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32))
+    np.testing.assert_array_equal(cheap_bottom, np.array([0.0, 1.0, 0.0, 1.0], dtype=np.float32))
+
+
+def test_adjacency_cache_is_bounded():
+    """A diagnostic sweeping many synthetic graphs must not grow the cache
+    without limit. Real use has one topology per process."""
+    from diffopt.routing import shortest_path as sp
+
+    sp._adjacency_cache.clear()
+    for n in range(sp._MAX_CACHED_TOPOLOGIES + 3):
+        sp._adjacency(_edges([(0, 1), (1, 2)]) + n, 3 + n)
+
+    assert len(sp._adjacency_cache) == sp._MAX_CACHED_TOPOLOGIES
