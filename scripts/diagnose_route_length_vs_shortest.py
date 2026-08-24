@@ -64,7 +64,7 @@ final_epoch = t_cfg["epochs_e2e"]
 demands = demands_for(ctx, seed=final_epoch)
 print(f"{len(demands)} demands (seed={final_epoch}, matching training's final epoch)\n")
 
-tau_end = t_cfg["regen_tau_end"]
+tau_end = t_cfg["alloc_tau_end"]
 vlastelica_lambda = ctx.ckpt["vlastelica_lambda"]
 
 with torch.no_grad():

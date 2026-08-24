@@ -2,17 +2,19 @@
 
 Checks two things the smoke-run output does not reveal:
 
-1. Regen probability distribution
-   The training log prints regen_loss = regen_probs.sum(), which starts at
-   num_nodes * sigmoid(0) = num_nodes * 0.5 and decreases. The number
-   "2.54 regens" is NOT a count of placed regenerators — it is the sum of
-   all per-node probabilities. This script shows the full distribution.
+1. Allocation distribution
+   The training log prints device_count = sum_n sum_d a[d, n], the SOFT
+   (mean-field) device count. It is not a count of deployed regenerators —
+   it is the sum of all per-(demand, boundary) allocation probabilities, and
+   it moves with tau even on frozen scores. This script shows the full
+   distribution behind that one number, plus the site_view (max over
+   demands) that is logged and never priced.
 
 2. Hamming distance in the Vlastelica backward
    For the surrogate to provide routing-change signal, the perturbed solve
    must find a DIFFERENT path. Since correction #6, grad_output =
    ∂L/∂path_indicator is dominated by the straight-through per-edge
-   ASE-noise proxy (threshold-gated, regen-modulated), not by edge_weights;
+   ASE-noise proxy (threshold-gated), not by edge_weights;
    and since correction #9, the path_noise_cost term it is added to is
    denominated in edge_ase_noise rather than edge_weights. Neither term is
    proportional to edge_weights, so a zero Hamming distance here no longer
@@ -70,7 +72,7 @@ def main() -> None:
 
     lambda_cost = cfg["pipeline"]["lambda_cost"]
     # Start-of-training values (epoch 1): matches this script's own
-    # historical tau=regen_tau_start / undecayed vlastelica_lambda when no
+    # historical tau=alloc_tau_start / undecayed vlastelica_lambda when no
     # --checkpoint overrides them.
     tau, lambda_ = schedule_at(cfg, epoch=1)
 
@@ -78,18 +80,21 @@ def main() -> None:
 
     # ------------------------------------------------ intercept grad_output
     # edge_weights_of independently recomputes exactly what pipeline.forward
-    # will compute internally for edge_weights (same live edge_weight_net /
-    # regen_placement, same tau) -- no monkeypatch needed to capture it.
-    # The hook below is only for grad_output on each path_indicator, which
-    # edge_weights_of has no access to.
+    # will compute internally for edge_weights (the same live
+    # edge_log_weight, same normalisation) -- no monkeypatch needed to
+    # capture it. The hook below is only for grad_output on each
+    # path_indicator, which edge_weights_of has no access to.
     captured_edge_weights = edge_weights_of(ctx, tau).detach().clone()
     captured_grad_output: Dict[int, torch.Tensor] = {}
 
     original_forward = pipeline.forward
 
-    def instrumented_forward(demands, tau=1.0, lambda_=10.0):
-        path_noise_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out = \
-            original_forward(demands, tau=tau, lambda_=lambda_)
+    def instrumented_forward(demands, *fwd_args, **fwd_kwargs):
+        # *args/**kwargs, not a copied signature: pipeline.forward grew
+        # hard_alloc/alloc_dropout_p, and a shim that pins the old parameter
+        # list would silently drop any kwarg added after it.
+        path_noise_costs_out, gsnr_preds_out, path_inds_out, alloc_out = \
+            original_forward(demands, *fwd_args, **fwd_kwargs)
 
         for did, pi in path_inds_out.items():
             def make_hook(demand_id):
@@ -98,21 +103,21 @@ def main() -> None:
                 return hook
             pi.register_hook(make_hook(did))
 
-        return path_noise_costs_out, gsnr_preds_out, path_inds_out, regen_probs_out
+        return path_noise_costs_out, gsnr_preds_out, path_inds_out, alloc_out
 
     pipeline.forward = instrumented_forward
 
     # --------------------------------------------------------- forward + backward
-    path_noise_costs, gsnr_preds, path_indicators, regen_probs = pipeline(
+    path_noise_costs, gsnr_preds, path_indicators, alloc = pipeline(
         demands, tau=tau, lambda_=lambda_
     )
     loss, metrics = compute_loss(
         gsnr_preds=gsnr_preds,
         path_noise_costs=path_noise_costs,
         demands=demands,
-        regen_probs=regen_probs,
+        device_count=alloc.device_count,
         modulation_config=mod_cfg,
-        lambda_regen=cfg["pipeline"]["lambda_regen"],
+        lambda_dev=cfg["pipeline"]["lambda_dev"],
         duals=torch.full((len(demands),), cfg["constraint"]["dual_init"]),
         margin_db=cfg["constraint"]["margin_db"],
         lambda_cost=lambda_cost,
@@ -125,20 +130,29 @@ def main() -> None:
 
     # ================================================================ REPORT 1
     print("=" * 65)
-    print("1. REGENERATOR PROBABILITY DISTRIBUTION")
+    print("1. ALLOCATION DISTRIBUTION")
     print("=" * 65)
-    rp = regen_probs.detach().numpy()
-    print(f"  num_nodes         : {len(rp)}")
-    print(f"  regen_probs.sum() : {rp.sum():.4f}  (printed as 'regen=' in training log)")
-    print(f"  num nodes > 0.5   : {int((rp > 0.5).sum())}  (num_regen_soft metric)")
-    print(f"  num nodes > 0.9   : {int((rp > 0.9).sum())}")
-    print(f"  min / mean / max  : {rp.min():.3f} / {rp.mean():.3f} / {rp.max():.3f}")
-    sorted_probs = np.sort(rp)[::-1]
-    top5 = sorted_probs[:5]
-    print(f"  top-5 probs       : {' '.join(f'{v:.3f}' for v in top5)}")
-    regen_candidates = sorted(ctx.regen_candidates)
-    print(f"  regen candidates  : nodes {regen_candidates}")
-    print(f"  their probs       : {' '.join(f'{rp[n]:.3f}' for n in regen_candidates)}")
+    # Only the REAL (demand, boundary) variables: padded columns are forced
+    # to exactly 0 by the rollout and would drag every statistic below
+    # toward zero in proportion to how ragged the routes happen to be.
+    real = alloc.boundary_node_ids >= 0
+    a = alloc.a.detach()[real].numpy()
+    sv = alloc.site_view.detach().numpy()
+    print(f"  demands             : {alloc.a.shape[0]}   "
+          f"(demand, boundary) variables: {len(a)}")
+    print(f"  device_count        : {alloc.device_count.item():.4f}  "
+          f"(printed as 'device_count' in the training log)")
+    print(f"  num a > 0.5         : {int((a > 0.5).sum())}")
+    print(f"  num a > 0.9         : {int((a > 0.9).sum())}")
+    if len(a):
+        print(f"  min / mean / max    : {a.min():.3f} / {a.mean():.3f} / {a.max():.3f}")
+        top5 = np.sort(a)[::-1][:5]
+        print(f"  top-5 allocations   : {' '.join(f'{v:.3f}' for v in top5)}")
+    print(f"  site_view > 0.5     : {int((sv > 0.5).sum())} node(s)  "
+          f"(DIAGNOSTIC ONLY — never priced, never in the selection key)")
+    touched = [n for n in sorted(ctx.regen_candidates) if sv[n] > 0.5]
+    print(f"  regen candidates    : {len(ctx.regen_candidates)} nodes, "
+          f"{len(touched)} of them above 0.5: {touched}")
 
     # ================================================================ REPORT 2
     print()
@@ -210,22 +224,30 @@ def main() -> None:
     # ================================================================ REPORT 3
     print()
     print("=" * 65)
-    print("3. GRADIENT BREAKDOWN (EdgeWeightNet)")
+    print("3. GRADIENT BREAKDOWN (routing parameter and allocation head)")
     print("=" * 65)
-    total_grad_norm = sum(
-        p.grad.norm().item() for p in pipeline.edge_weight_net.parameters()
+    theta = pipeline.edge_log_weight
+    theta_grad = theta.grad
+    theta_norm = theta_grad.norm().item() if theta_grad is not None else 0.0
+    print(f"  edge_log_weight grad norm: {theta_norm:.4e}   "
+          f"(E={theta.numel()} free per-edge parameters, spec decision 6)")
+    if theta_grad is not None:
+        print(f"    nonzero on {int((theta_grad != 0).sum())}/{theta.numel()} edges  "
+              f"max|g|={theta_grad.abs().max().item():.4e}")
+
+    head_grad_norm = sum(
+        p.grad.norm().item() for p in pipeline.allocation_head.parameters()
         if p.grad is not None
     )
-    print(f"  Total grad norm (EdgeWeightNet params): {total_grad_norm:.4e}")
-    print(f"  regen_logits grad norm: "
-          f"{pipeline.regen_placement.regen_logits.grad.norm().item():.4e}")
+    print(f"  allocation head grad norm (all params): {head_grad_norm:.4e}")
     print()
-    print("  edge_weights.grad (from EdgeWeightNet.parameters().grad):")
-    ew_grad_norms = []
-    for name, p in pipeline.edge_weight_net.named_parameters():
+    print("  per-parameter grad norms (AllocationHead):")
+    for name, p in pipeline.allocation_head.named_parameters():
         g_norm = p.grad.norm().item() if p.grad is not None else 0.0
-        ew_grad_norms.append((name, g_norm))
         print(f"    {name:30s} grad_norm={g_norm:.4e}")
+    print("    (a zero on every HIDDEN layer is the closed init, not a bug: "
+          "the output\n     layer starts at zero weight, so d(score)/d(hidden) "
+          "is exactly 0 — spec 2.2)")
 
 
 if __name__ == "__main__":

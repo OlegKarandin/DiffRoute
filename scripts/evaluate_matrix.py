@@ -9,18 +9,15 @@ Answers the three questions the validation plan asks (spec §6):
   step 6 — how does a trained checkpoint score on the HELD-OUT matrix?
            (--holdout, which swaps traffic.seed for traffic.holdout_seed)
 
-Placement is hard-saturated: regen_logits are replaced with +/-20 so
-sigmoid gives probabilities within 1e-8 of 0 or 1. Every number in the design
-spec's evidence section was measured this way, so reports from this script are
-directly comparable to them. Reporting at a soft, mid-anneal tau instead would
-describe a placement that is never deployed.
+Placement is evaluated by `train.hard_rollout` — the same deterministic
+rollout checkpoint selection uses, so a report from this script and a
+training log row describe the same object.
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-import torch
 import yaml
 
 # `scripts/` is not a package (no __init__.py) — every diagnose_*.py uses this
@@ -28,6 +25,7 @@ import yaml
 # directory on sys.path. Do not "fix" this to `from scripts._common import`.
 from _common import add_common_args, build_context, schedule_at
 from diffopt.qot.segment_combiner import SegmentCombiner
+from diffopt.train import hard_rollout
 from diffopt.traffic import (
     build_traffic_matrix,
     preflight_filter,
@@ -35,10 +33,6 @@ from diffopt.traffic import (
     shortest_path_edges_by_km,
     traffic_matrix_checksum,
 )
-
-# Large enough that sigmoid(+/-20) is within 1e-8 of 1/0 at tau=1, small
-# enough to stay far from float32 overflow.
-_HARD_LOGIT = 20.0
 
 
 def main() -> None:
@@ -103,27 +97,29 @@ def main() -> None:
             print(f"    d{d.id}: {d.src}->{d.dst} @ {d.bitrate_gbps:.0f}G, "
                   f"shortfall {shortfall:.2f} dB")
 
-    # Hard-saturate the placement.
-    with torch.no_grad():
-        logits = ctx.regen_placement.regen_logits
-        placed = (logits > 0)
-        logits.copy_(torch.where(
-            placed,
-            torch.full_like(logits, _HARD_LOGIT),
-            torch.full_like(logits, -_HARD_LOGIT),
-        ))
-    candidates = set(ctx.topology.regen_candidate_nodes)
-    placed_nodes = sorted(int(n) for n in placed.nonzero(as_tuple=True)[0].tolist())
-    placed_candidates = [n for n in placed_nodes if n in candidates]
-    print(f"\nPlacement (hard-saturated): {len(placed_nodes)} nodes, "
-          f"{len(placed_candidates)} of them regen candidates: {placed_candidates}")
-
+    # The deployed allocation, from the same deterministic rollout
+    # checkpoint selection uses. `gsnr_preds` below comes out of this very
+    # pass — a second, soft forward would describe a different allocation
+    # than the counts printed here.
     _, vlastelica_lambda = schedule_at(cfg, cfg["training"]["epochs_e2e"])
+    hard = hard_rollout(
+        ctx.pipeline, demands, ctx.mod_cfg,
+        lambda_=vlastelica_lambda, margin_db=c_cfg["margin_db"],
+    )
+    sites = sorted(hard["site_mask"].nonzero(as_tuple=True)[0].tolist())
+    print(f"\nDeployed allocation (hard rollout):")
+    print(f"  devices: {hard['hard_num_devices']}   "
+          f"oracle minimum: {hard['oracle_devices']}   "
+          f"gap: {hard['oracle_gap']}")
+    print(f"  sites touched: {hard['hard_num_sites']} {sites}")
+    print(f"  violated: {hard['hard_num_violated']}   "
+          f"worst margin: {hard['hard_worst_margin_db']:+.2f} dB")
+    if hard["oracle_infeasible"]:
+        print(f"  !! {hard['oracle_infeasible']} demand(s) have NO feasible "
+              f"allocation on their learned route — a routing failure, not "
+              f"an allocation one")
 
-    with torch.no_grad():
-        _, gsnr_preds, _, _ = ctx.pipeline(
-            demands, tau=1.0, lambda_=vlastelica_lambda,
-        )
+    gsnr_preds = hard["gsnr_preds"]
 
     margins = []
     violated = []

@@ -204,6 +204,12 @@ def hard_rollout(
         "oracle_infeasible": int((~oracle.feasible).sum().item()),
         "site_mask": site_mask.cpu(),
         "alloc_by_node": alloc.alloc_by_node.cpu(),
+        # The per-demand path GSNRs this rollout measured. Returned so a
+        # report can quote margins from the SAME deployed pass that produced
+        # the device/site counts above: a second forward would be a soft one
+        # and would describe a different allocation, which is precisely the
+        # mismatch scripts/evaluate_matrix.py used to have.
+        "gsnr_preds": {did: g.detach().cpu() for did, g in gsnr_preds.items()},
     }
 
 

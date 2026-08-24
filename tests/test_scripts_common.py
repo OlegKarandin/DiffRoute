@@ -38,8 +38,7 @@ def _context_for(topo, pipeline) -> DiagContext:
         mod_cfg=make_mod_config(),
         qot_model=pipeline.qot_model,
         pipeline=pipeline,
-        edge_weight_net=pipeline.edge_weight_net,
-        regen_placement=pipeline.regen_placement,
+        allocation_head=pipeline.allocation_head,
         edges=list(topo.undirected_edges),
         regen_candidates=set(topo.regen_candidate_nodes),
         ckpt=None,
@@ -54,37 +53,42 @@ def test_edge_weights_of_matches_pipeline_forward(monkeypatch):
     """The single most important guarantee: a diagnostic must route on the
     same weights the pipeline routes on.
 
-    Both halves of this test capture a value the pipeline itself produced
-    during a REAL pipeline(...) call — neither recomputes pipeline.py's
-    normalisation formula independently:
+    `expected_normalised` comes from monkeypatching
+    diffopt.pipeline.surrogate_shortest_path to record its first positional
+    argument on its first call — that argument IS the `edge_weights` tensor
+    pipeline.forward routes on (diffopt/pipeline.py's
+    `surrogate_shortest_path(edge_weights, ...)` call), captured as the
+    pipeline actually computed it, not reimplemented from the normalisation
+    formula in a second place.
 
-    - `expected_raw` comes from a register_forward_hook on edge_weight_net
-      (the tensor as EdgeWeightNet produced it).
-    - `expected_normalised` comes from monkeypatching
-      diffopt.pipeline.surrogate_shortest_path to record its first
-      positional argument on its first call — that argument IS the
-      `edge_weights` tensor pipeline.forward routes on
-      (diffopt/pipeline.py's `surrogate_shortest_path(edge_weights, ...)`
-      call), captured as the pipeline actually computed it, not
-      reimplemented from the normalisation formula in a second place.
+    There is no EdgeWeightNet to hang a register_forward_hook on any more
+    (spec decision 6 made routing a free per-edge parameter), so the raw
+    half is checked by its DEFINING relation to the captured tensor instead:
+    `normalised=False` must return the pre-normalisation quantity, i.e. the
+    one that becomes the captured tensor after unit-mean division. That
+    still fails if edge_weights_of silently returns the normalised tensor
+    for both, and it still does not restate pipeline.py's formula.
 
-    If pipeline.py:311's normalisation formula ever changes (e.g. the
-    divisor's clamp epsilon, or reintroducing the .detach() correction #9
-    exists to forbid) without a matching update to edge_weights_of, this
-    test must go red — see docs/investigations for the regression this
-    guards against.
+    If pipeline.py's normalisation ever changes (e.g. the divisor's clamp
+    epsilon, or reintroducing the .detach() correction #9 exists to forbid)
+    without a matching update to edge_weights_of, this test must go red —
+    see docs/investigations for the regression this guards against.
     """
     topo = make_hub_topology()
     pipeline = make_pipeline(topo)
     ctx = _context_for(topo, pipeline)
     tau = 0.7
 
+    # edge_log_weight is initialised so that softplus(theta) == km/mean(km),
+    # whose mean is EXACTLY 1 — at which point raw and normalised coincide
+    # and the distinction this test exists to catch is not exercised at all.
+    # Displace it the way a training step would, so mean(raw) != 1.
+    with torch.no_grad():
+        pipeline.edge_log_weight.add_(
+            torch.linspace(0.5, 2.0, pipeline.edge_log_weight.numel())
+        )
+
     captured = {}
-
-    def hook(_module, _inputs, output):
-        captured["raw"] = output.detach().clone()
-
-    handle = pipeline.edge_weight_net.register_forward_hook(hook)
 
     original_surrogate = pipeline_mod.surrogate_shortest_path
 
@@ -97,17 +101,19 @@ def test_edge_weights_of_matches_pipeline_forward(monkeypatch):
 
     demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
     pipeline(demands, tau=tau)
-    handle.remove()
 
-    expected_raw = captured["raw"].squeeze(-1)
     expected_normalised = captured["normalised"]
 
     got_normalised = edge_weights_of(ctx, tau, normalised=True)
     got_raw = edge_weights_of(ctx, tau, normalised=False)
 
-    assert torch.allclose(got_raw, expected_raw, atol=1e-6), (
-        "edge_weights_of(normalised=False) does not match the raw EdgeWeightNet "
-        "output pipeline.forward actually computed"
+    assert (got_raw > 0).all(), "raw edge weights must be strictly positive (Softplus)"
+    assert torch.allclose(
+        got_raw / got_raw.mean(), expected_normalised, atol=1e-6
+    ), (
+        "edge_weights_of(normalised=False) is not the pre-normalisation tensor: "
+        "dividing it by its own mean does not reproduce the tensor "
+        "pipeline.forward actually routed on"
     )
     assert torch.allclose(got_normalised, expected_normalised, atol=1e-6), (
         "edge_weights_of(normalised=True) does not match the exact tensor "
@@ -152,8 +158,8 @@ def test_schedule_at_matches_train_py_annealing():
 
     for epoch in [1, 5, 10, 25, 40, 60, 61]:
         expected_tau = linear_anneal(
-            epoch, t_cfg["regen_tau_start"], t_cfg["regen_tau_end"],
-            t_cfg["regen_tau_anneal_start_epoch"], t_cfg["regen_tau_anneal_end_epoch"],
+            epoch, t_cfg["alloc_tau_start"], t_cfg["alloc_tau_end"],
+            t_cfg["alloc_tau_anneal_start_epoch"], t_cfg["alloc_tau_anneal_end_epoch"],
         )
         # Replicate train.py's per-epoch update loop literally: lambda starts
         # at vlastelica_lambda and is decayed-then-clamped once per epoch
@@ -250,9 +256,9 @@ def test_build_context_seeds_before_module_construction(monkeypatch):
     ctx_a = build_context(cfg, load_e2e_checkpoint=False)
     ctx_b = build_context(cfg, load_e2e_checkpoint=False)
 
-    for pa, pb in zip(ctx_a.edge_weight_net.parameters(), ctx_b.edge_weight_net.parameters()):
+    for pa, pb in zip(ctx_a.allocation_head.parameters(), ctx_b.allocation_head.parameters()):
         assert torch.equal(pa, pb)
-    assert torch.equal(ctx_a.regen_placement.regen_logits, ctx_b.regen_placement.regen_logits)
+    assert torch.equal(ctx_a.pipeline.edge_log_weight, ctx_b.pipeline.edge_log_weight)
 
 
 def test_build_context_loads_checkpoint_into_pipeline():
@@ -263,34 +269,40 @@ def test_build_context_loads_checkpoint_into_pipeline():
 
     ctx = build_context(cfg, load_e2e_checkpoint=True)
     assert ctx.ckpt is not None
-    assert "edge_weight_net_state" in ctx.ckpt
+    assert "alloc_head_state" in ctx.ckpt
+    assert "edge_log_weight" in ctx.ckpt
 
-    # The loaded state must be what pipeline.edge_weight_net actually holds —
-    # not merely returned alongside it.
-    loaded_first_param = next(iter(ctx.ckpt["edge_weight_net_state"].values()))
-    pipeline_first_param = next(iter(ctx.pipeline.edge_weight_net.state_dict().values()))
-    assert torch.equal(loaded_first_param, pipeline_first_param)
-    assert torch.equal(ctx.regen_placement.regen_logits, ctx.ckpt["regen_logits"])
+    # The loaded state must be what the pipeline actually holds — not merely
+    # returned alongside it.
+    loaded_first_param = next(iter(ctx.ckpt["alloc_head_state"].values()))
+    head_first_param = next(iter(ctx.pipeline.allocation_head.state_dict().values()))
+    assert torch.equal(loaded_first_param, head_first_param)
+
+    # edge_log_weight is a RAW (E,) tensor in the checkpoint, not a
+    # state_dict, and its target is a bare nn.Parameter. Loading it with
+    # .load_state_dict() (the shape of the call this replaced) would raise;
+    # loading it into the wrong object would silently leave the pipeline
+    # routing on its length-proportional init.
+    assert torch.is_tensor(ctx.ckpt["edge_log_weight"])
+    assert torch.equal(ctx.pipeline.edge_log_weight.detach(), ctx.ckpt["edge_log_weight"])
 
 
-def test_build_context_raises_on_gate_mismatch(monkeypatch, tmp_path):
-    """build_context reads the CHECKPOINT's own gate, not the config's, and
-    must refuse to load when they disagree — reinterpreting a hard_concrete
-    checkpoint's log_alpha values as sigmoid logits (or vice versa) would be
-    silently wrong, not merely different. `_SMALL_TEST_IND132` has no
-    `placement` section, so its RegenPlacement defaults to "sigmoid"; a
-    checkpoint claiming "hard_concrete" must be rejected against it.
+def test_pre_stage_ii_checkpoint_is_rejected_loudly(monkeypatch, tmp_path):
+    """A silent fallback is how a site-priced checkpoint gets reported as a
+    device-priced result.
 
-    Stubs load_qot_model the same way test_build_context_seeds_before_
-    module_construction does, so this doesn't require a real QoT checkpoint
-    on a clean clone. The e2e checkpoint itself is a hand-built fake — this
-    test only needs its "gate" and matching parameter key to be self
-    consistent, not a real trained placement.
+    Pre-Stage-II checkpoints were SELECTED under an objective that prices
+    sites, so their numbers are not comparable to anything this pipeline
+    reports. Any of the three keys that only a RegenPlacement run could have
+    written must abort the load with the retrain instruction.
+
+    Stubs load_qot_model the same way its sibling build_context tests do, so
+    this doesn't require a real QoT checkpoint on a clean clone — the
+    rejection has to happen before anything reads the (absent)
+    alloc_head_state, and the stub keeps that the only thing under test.
     """
     import scripts._common as common_mod
     from diffopt.qot.model import SpanAttentionQoT
-    from diffopt.routing.edge_weight_net import EdgeWeightNet
-    from diffopt.topology import load_topology
 
     def fake_load_qot_model(checkpoint_path, cfg, device):
         return SpanAttentionQoT(max_spans=cfg.get("max_spans_per_segment", 60))
@@ -298,64 +310,33 @@ def test_build_context_raises_on_gate_mismatch(monkeypatch, tmp_path):
     monkeypatch.setattr(common_mod, "load_qot_model", fake_load_qot_model)
 
     cfg = yaml.safe_load(_SMALL_TEST_IND132.read_text())
-    assert "placement" not in cfg, "fixture must default build_context's gate to sigmoid"
 
-    topology = load_topology(cfg["topology"], cfg["modulation_formats"])
-    fake_ckpt = {
-        "edge_weight_net_state": EdgeWeightNet().state_dict(),
-        "gate": "hard_concrete",
-        "regen_log_alpha": torch.zeros(topology.num_nodes),
-    }
-    ckpt_path = tmp_path / "fake_hard_concrete_ckpt.pt"
-    torch.save(fake_ckpt, ckpt_path)
-
-    with pytest.raises(ValueError) as exc_info:
-        build_context(cfg, load_e2e_checkpoint=True, checkpoint_path=str(ckpt_path))
-
-    message = str(exc_info.value)
-    assert "hard_concrete" in message
-    assert "sigmoid" in message
+    ckpt = {"edge_weight_net_state": {}, "gate": "sigmoid",
+            "regen_logits": torch.zeros(5)}
+    torch.save(ckpt, tmp_path / "best_e2e.pt")
+    with pytest.raises(ValueError, match="pre-Stage-II checkpoint"):
+        build_context(cfg, checkpoint_path=str(tmp_path / "best_e2e.pt"))
 
 
-def _D(i):
-    return Demand(id=i, src=0, dst=1, bitrate_gbps=400.0)
+@pytest.mark.parametrize("legacy_key", ["regen_logits", "regen_log_alpha", "gate"])
+def test_every_pre_stage_ii_marker_is_rejected(monkeypatch, tmp_path, legacy_key):
+    """Each of the three markers alone must be enough. A sigmoid run wrote
+    `regen_logits`, a hard_concrete run wrote `regen_log_alpha` and no
+    `regen_logits`, and both wrote `gate` — so checking only one key would
+    let the other flavour through."""
+    import scripts._common as common_mod
+    from diffopt.qot.model import SpanAttentionQoT
 
+    def fake_load_qot_model(checkpoint_path, cfg, device):
+        return SpanAttentionQoT(max_spans=cfg.get("max_spans_per_segment", 60))
 
-def test_ablate_finds_the_redundant_node():
-    """A three-node placement where node 2 is a duplicate of node 1's
-    coverage must report node 2 redundant and a minimal set of two."""
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-    from diagnose_regen_ablation import ablate
+    monkeypatch.setattr(common_mod, "load_qot_model", fake_load_qot_model)
 
-    # Demand 0 needs any of {1, 2}; demand 1 needs {3}.
-    covers = {0: {1, 2}, 1: {3}}
-
-    class FakePipeline:
-        def __call__(self, demands, tau=None, lambda_=None, regen_probs_override=None):
-            active = set(regen_probs_override.nonzero(as_tuple=True)[0].tolist())
-            gsnr = {
-                d: torch.tensor(20.0 if covers[d] & active else 0.0)
-                for d in covers
-            }
-            return {}, gsnr, {}, regen_probs_override
-
-    result = ablate(
-        FakePipeline(),
-        demands=[_D(0), _D(1)],
-        thresholds={0: 10.0, 1: 10.0},
-        placed={1, 2, 3},
-        candidates={1, 2, 3, 4},
-        tau=0.1, lambda_=10.0,
-        num_nodes=5,
-        order_key=lambda n: float(n),
-    )
-
-    assert result["baseline_infeasible"] == set()
-    assert 2 in result["redundant"] or 1 in result["redundant"]
-    assert len(result["minimal_set"]) == 2
-    assert 3 in result["minimal_set"]
+    cfg = yaml.safe_load(_SMALL_TEST_IND132.read_text())
+    value = "sigmoid" if legacy_key == "gate" else torch.zeros(5)
+    torch.save({legacy_key: value}, tmp_path / "best_e2e.pt")
+    with pytest.raises(ValueError, match="pre-Stage-II checkpoint"):
+        build_context(cfg, checkpoint_path=str(tmp_path / "best_e2e.pt"))
 
 
 def test_build_context_max_spans_from_config_not_hardcoded(monkeypatch):

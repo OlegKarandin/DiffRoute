@@ -1,4 +1,12 @@
-"""Diagnostic: why have EdgeWeightNet's edge weights collapsed to ~zero?
+"""Diagnostic: why have the routing edge weights collapsed to ~zero?
+
+Since spec decision 6 the routing weight is `softplus(edge_log_weight)`, a
+free per-edge parameter, not an EdgeWeightNet over static features. Every
+check below is unchanged in meaning — they are all about the (E,) weight
+vector and the loss's behaviour in it — but the gradient decomposition now
+differentiates w.r.t. `pipeline.edge_log_weight` and converts to
+d/d(raw weight) by the chain rule (dw/dtheta = sigmoid(theta)) rather than
+hanging a register_forward_hook on a module that no longer exists.
 
 Follow-up #2 in docs/investigations/open_followups.md measured the symptom
 (86% of ind_132's 168 edges below 1e-6, corr(weight, length_km) = -0.17,
@@ -7,7 +15,7 @@ explicitly flagged as unconfirmed: that `path_cost_loss`'s gradient
 dominates the STE-routed feasibility gradient on the edges that collapse.
 
 This script began as that doc's stated "Next step" — the `edge_weights`
-analogue of `diagnose_regen_gradient.py` — to characterize the collapse.
+analogue of `diagnose_alloc_gradient.py` — to characterize the collapse.
 The fix has since landed (unit-mean renormalisation with a live divisor,
 redenominating `path_cost_loss` in the fixed `edge_ase_noise` buffer instead
 of learned `edge_weights`, standardised static topology features), so this
@@ -17,7 +25,7 @@ longer reads `edge_weights` at all, so nothing is left to differentiate
 directly); check F's perturbation ratio reads O(1-10), not the pre-fix
 7.9e6 (weights pinned to unit mean can no longer be swamped by a
 fixed-scale Vlastelica perturbation); check G's scale-direction derivative
-reads ~0 for every loss term (the loss is degree-0 in EdgeWeightNet's raw
+reads ~0 for every loss term (the loss is degree-0 in the raw Softplus
 output, so "shrink everything" is no longer a free descent direction);
 check D's Spearman rank-corr(init, trained) sits well below +0.999 (training
 is rearranging relative order, not just uniformly rescaling); and
@@ -65,7 +73,7 @@ def grad_of(term: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
 
 
 def describe(name: str, w: np.ndarray, lens: np.ndarray) -> None:
-    # frac<1e-6 / frac<1e-3 were calibrated against pre-fix RAW EdgeWeightNet
+    # frac<1e-6 / frac<1e-3 were calibrated against pre-fix RAW EdgeWeightNet-era
     # output, which could (and did) collapse toward the Softplus floor with
     # no lower bound. Post-fix, `w` here is the unit-mean-normalised weight
     # (see edge_weights_of below) — the unit-mean renormalisation pins its mean to exactly 1,
@@ -95,7 +103,9 @@ def main() -> None:
     # ---- untrained context (training's actual starting point) --------------
     # build_context seeds with cfg.get("seed", 42) before any module
     # construction, matching train.py's own ordering, so this is
-    # bit-identical to training's epoch-0 EdgeWeightNet/RegenPlacement.
+    # bit-identical to training's epoch-0 state. edge_log_weight's init is
+    # deterministic anyway (length-proportional, i.e. shortest-by-km
+    # routing); the seed only matters for the allocation head.
     ctx_init = build_context(cfg, load_e2e_checkpoint=False)
 
     # ---- trained context ------------------------------------------------
@@ -110,7 +120,7 @@ def main() -> None:
     print(f"checkpoint={ckpt_path} (epoch {ctx.ckpt['epoch']}, loss={ctx.ckpt['total_loss']:.4f})")
     print(f"nodes={topo.num_nodes} edges={n_edges}  "
           f"lambda_cost={p_cfg['lambda_cost']} dual_init={c_cfg['dual_init']} margin_db={c_cfg['margin_db']} "
-          f"lambda_regen={p_cfg['lambda_regen']}\n")
+          f"lambda_dev={p_cfg['lambda_dev']}\n")
 
     final_epoch = t_cfg["epochs_e2e"]
     tau, _ = schedule_at(cfg, epoch=final_epoch)
@@ -152,7 +162,7 @@ def main() -> None:
         if p1 is not None and p2 is not None and np.array_equal(p1, p2):
             identical += 1
     print(f"  routes identical under w vs 0.5*w: {identical}/{len(demands)} demands")
-    print(f"  => feasibility_loss and regen_loss are UNCHANGED by the rescale (Dijkstra's")
+    print(f"  => feasibility_loss and device_count are UNCHANGED by the rescale (Dijkstra's")
     print(f"     argmin is scale-invariant). Post-fix, path_noise_loss no longer reads")
     print(f"     edge_weights at all -- it reads the fixed edge_ase_noise buffer -- so it")
     print(f"     is UNCHANGED by this rescale too, not merely 'scales by exactly 0.5' as")
@@ -169,9 +179,9 @@ def main() -> None:
     #
     # NOT via edge_weights_of: it runs under torch.no_grad() and returns a
     # detached snapshot by construction (see its docstring), so it cannot
-    # supply the graph-connected raw tensor these checks differentiate
-    # through. A live register_forward_hook during an actual pipeline(...)
-    # call is the only way to get that.
+    # supply a graph-connected tensor. `pipeline.edge_log_weight` IS the
+    # graph-connected object now — the parameter routing is a function of —
+    # so these checks differentiate w.r.t. it directly.
     # =====================================================================
     for label, ctx_i, tau_i, vl_i, dem_i in [
         ("UNTRAINED (epoch 0)", ctx_init, *schedule_at(cfg, epoch=1),
@@ -180,36 +190,35 @@ def main() -> None:
     ]:
         pl = ctx_i.pipeline
         print("=" * 78)
-        print(f"B/C/F. GRADIENT DECOMPOSITION ON EdgeWeightNet's RAW output "
+        print(f"B/C/F. GRADIENT DECOMPOSITION ON THE RAW Softplus weight "
               f"(pre-normalisation, NOT the normalised routing weight) - {label}")
         print("=" * 78)
 
-        captured = {}
+        # g_feas/g_dev/g_cost below are gradients w.r.t. the RAW weight
+        # w = softplus(theta), not w.r.t. the unit-mean-normalised
+        # `edge_weights` pipeline.forward actually routes on. The only
+        # graph-connected handle is the parameter theta itself, so each
+        # gradient is taken w.r.t. theta and divided by dw/dtheta =
+        # sigmoid(theta) to express it per unit of w. The math is unaffected
+        # (raw and normalised differ by a constant factor per forward call,
+        # and Check G's zero-crossing identity holds for either), but
+        # readers should not mistake this section's numbers for gradients
+        # w.r.t. the actual routing weight.
+        theta = pl.edge_log_weight
+        # sigmoid(theta) in (0, 1) and never 0 in float32 for the values
+        # reachable here (theta is initialised near 0 and moved by Adam at
+        # lr 1e-3); clamped anyway so a pathological run divides by a floor
+        # instead of producing inf.
+        dw_dtheta = torch.sigmoid(theta).detach().clamp_min(1e-12)
+        w_raw = F.softplus(theta).detach()
 
-        # Hooked here on purpose: g_feas/g_regen/g_cost below are gradients
-        # w.r.t. this RAW hook output (`w_t`), not w.r.t. the unit-mean-
-        # normalised `edge_weights` pipeline.forward actually routes on. That
-        # normalised tensor is already detached by the time it would reach a
-        # hook site outside forward(), so only the raw, still-autograd-
-        # connected output can be differentiated through here. The math is
-        # unaffected (raw and normalised differ by a constant factor per
-        # forward call, and Check G's zero-crossing identity holds for
-        # either), but readers should not mistake this section's numbers for
-        # gradients w.r.t. the actual routing weight.
-        def hook(_mod, _inp, out):
-            out.retain_grad()
-            captured["w"] = out
-
-        h = pl.edge_weight_net.register_forward_hook(hook)
-        path_noise_costs, gsnr_preds, path_inds, regen_probs = pl(
+        path_noise_costs, gsnr_preds, path_inds, alloc = pl(
             dem_i, tau=tau_i, lambda_=vl_i)
-        h.remove()
-        w_t = captured["w"]
-        # Mirror edge_weights_of's unit-mean renormalisation: the raw hook
-        # output is EdgeWeightNet's pre-normalisation Softplus output, not
-        # what pipeline.forward actually routes with, and the unit-mean renormalisation makes
-        # the loss degree-0 in that raw scale, so it can drift freely.
-        w_t_norm = w_t.detach().squeeze(-1) / w_t.detach().squeeze(-1).mean().clamp_min(1e-12)
+        # Mirror edge_weights_of's unit-mean renormalisation: `w_raw` is the
+        # pre-normalisation Softplus output, not what pipeline.forward
+        # actually routes with, and the unit-mean renormalisation makes the
+        # loss degree-0 in that raw scale, so it can drift freely.
+        w_t_norm = w_raw / w_raw.mean().clamp_min(1e-12)
 
         feas = torch.zeros(1)
         n_infeas = 0
@@ -224,13 +233,13 @@ def main() -> None:
         # only after update_duals starts adjusting them per demand), so this
         # single-scalar substitution is only valid at epoch 0.
         L_feas = c_cfg["dual_init"] * feas.squeeze()
-        L_regen = p_cfg["lambda_regen"] * regen_probs.sum()
+        L_dev = p_cfg["lambda_dev"] * alloc.device_count
         L_cost = p_cfg["lambda_cost"] * sum(path_noise_costs.values())
 
-        g_feas = grad_of(L_feas, w_t).squeeze(-1)
-        g_regen = grad_of(L_regen, w_t).squeeze(-1)
-        g_cost = grad_of(L_cost, w_t).squeeze(-1)
-        g_tot = g_feas + g_regen + g_cost
+        g_feas = grad_of(L_feas, theta) / dw_dtheta
+        g_dev = grad_of(L_dev, theta) / dw_dtheta
+        g_cost = grad_of(L_cost, theta) / dw_dtheta
+        g_tot = g_feas + g_dev + g_cost
 
         # C. Post-fix, the path-cost term is denominated in edge_ase_noise, so
         # its analytic direct d/d(edge_weights) is identically zero — every
@@ -245,7 +254,7 @@ def main() -> None:
 
         print(f"  demands={len(dem_i)}  infeasible={n_infeas}  tau={tau_i:.3f} "
               f"vlastelica_lambda={vl_i:.3f}")
-        print(f"  L_feas={L_feas.item():.4f}  L_regen={L_regen.item():.4f}  "
+        print(f"  L_feas={L_feas.item():.4f}  L_dev={L_dev.item():.4f}  "
               f"L_cost={L_cost.item():.6f}\n")
 
         def gstat(nm, g):
@@ -257,7 +266,7 @@ def main() -> None:
         gstat("  |- direct d/dw", g_cost_direct)
         gstat("  |- via surrogate", g_cost_surrogate)
         gstat("grad feasibility (STE)", g_feas)
-        gstat("grad regen_count", g_regen)
+        gstat("grad device_count", g_dev)
         gstat("grad TOTAL", g_tot)
 
         l1c, l1f = g_cost.abs().sum().item(), g_feas.abs().sum().item()
@@ -274,23 +283,23 @@ def main() -> None:
         # drove the collapse: path_cost (the pre-fix name for this term) was
         # degree-1 homogeneous in edge_weights, so Euler's theorem gave
         # dL/dc == L itself -- a permanent positive shrink pressure -- while
-        # feasibility/regen were already scale-invariant (Dijkstra's argmin
+        # feasibility/device_count were already scale-invariant (Dijkstra's argmin
         # ignores global scale, so dL/dc == 0 for those).
         # Post-fix, path_noise is denominated in the fixed edge_ase_noise
         # buffer, so it is degree-0 in edge_weights too: dL/dc should now
-        # read ~0 for every term, same as feasibility/regen always did.
+        # read ~0 for every term, same as feasibility/device_count always did.
         wv_ = w_t_norm
         print("\n  G. scale-direction derivative  dL(c*w)/dc |_(c=1) = sum_e g_e*w_e:")
         for nm, g, ref in [("path_noise", g_cost, L_cost.item()),
                            ("feasibility", g_feas, None),
-                           ("regen_count", g_regen, None),
+                           ("device_count", g_dev, None),
                            ("TOTAL", g_tot, None)]:
             d = float((g * wv_).sum())
             extra = (f"   (L_cost itself = {ref:.6e}; "
                      f"pre-fix Euler check, expected to disagree now)") if ref is not None else ""
             print(f"     {nm:<14} dL/dc = {d:+.6e}{extra}")
         print("     -> post-fix ALL terms should read ~0: the loss is degree-0 in")
-        print("        EdgeWeightNet's raw output, so no shrink direction exists.")
+        print("        the raw Softplus output, so no shrink direction exists.")
         print("        (pre-fix: path_cost +7.198e-02, feasibility +3.164e-01 at epoch 0)")
 
         # F. Vlastelica perturbation scale vs weight scale

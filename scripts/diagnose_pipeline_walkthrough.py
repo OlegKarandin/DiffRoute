@@ -74,9 +74,31 @@ with torch.no_grad():
               f"-> STAGE 4e QoT = {g:6.2f} dB  (noise {n:.5f})")
     print(f"    (path total {tot} spans; max_spans={pipe.max_spans})")
 
-    rp = pipe.regen_placement.get_regen_probs(1.0)
+    # STAGE 4f/5: the allocation is per (demand, boundary) now, so there is
+    # no per-node probability vector to index by boundary node. Run the real
+    # forward for THIS demand and read its row out of AllocationOutputs —
+    # `a[0, k]` is the allocation on this route's k-th boundary, in the same
+    # order `segment_path` returned `bnodes`.
+    _, gsnr_preds, _, alloc = pipe([d], tau=1.0, lambda_=vlastelica_lambda)
+    n_bnd = len(bnodes)
+    bp = [alloc.a[0, k] for k in range(n_bnd)]
+    print(f"\nSTAGE 4e/6  AllocationHead.rollout -> a[demand, boundary]")
+    print(f"    boundary nodes {bnodes}")
+    print(f"    a             {[f'{p.item():.3f}' for p in bp]}")
+    print(f"    device_count (sum over demands and boundaries) = "
+          f"{alloc.device_count.item():.3f}")
+    # site_view = max_d a[d, n]. DIAGNOSTIC ONLY — never priced, never in
+    # the selection key. Thresholded at 0.5 to read it as "a site would be
+    # built here"; at the closed init every boundary sits at sigmoid(-3)
+    # ~ 0.047, so an unthresholded count would report every boundary node.
+    sv = alloc.site_view
+    touched = (sv > 0.5).nonzero(as_tuple=True)[0].tolist()
+    print(f"    site_view (diagnostic only, never priced): "
+          f"{len(touched)} node(s) above 0.5 {touched}   "
+          f"max={sv.max().item():.3f}")
+    print(f"    path GSNR from the real forward = {gsnr_preds[d.id].item():6.2f} dB")
+
     gs = [pipe.qot_model(*pipe._extract_span_features(s, ctx.device))[0] for s in segs]
-    bp = [rp[n] for n in bnodes]
     print(f"\nSTAGE 4f  SegmentCombiner(segment_gsnrs, boundary_probs={[f'{p:.2f}' for p in bp]})")
     out = pipe.segment_combiner(gs, bp)
     print(f"    -> path GSNR = {out.item():6.2f} dB")

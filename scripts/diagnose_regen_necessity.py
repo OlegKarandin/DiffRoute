@@ -33,9 +33,11 @@ from _common import add_common_args, build_context, demands_for
 ap = argparse.ArgumentParser()
 add_common_args(ap, with_checkpoint=False)
 # Overrides for this script's own historical defaults: 400 demands (not
-# cfg["num_demands"]=100) at a fixed seed=7 -- diagnose_regen_ablation.py's
-# own --seed default explicitly documents "matches diagnose_regen_necessity.py",
-# so this default must stay 7, not add_common_args' generic default of 1.
+# cfg["num_demands"]=100) at a fixed seed=7. The now-deleted
+# diagnose_regen_ablation.py pinned its own --seed default to 7 "to match
+# diagnose_regen_necessity.py"; the pairing is gone but the seed stays 7 so
+# this script's numbers remain comparable to every reading in the
+# investigation record, not add_common_args' generic default of 1.
 ap.set_defaults(num_demands=400, seed=7)
 args = ap.parse_args()
 

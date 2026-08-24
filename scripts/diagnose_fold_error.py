@@ -2,14 +2,23 @@
 
 Permanent guard against the fold-correctness bug class investigated in
 docs/investigations/regen_over_provisioning.md, and the script that
-reproduces that write-up's headline table. Loads a trained e2e checkpoint,
-hard-saturates its learned regenerator placement to +/-30 (same convention
-as scripts/diagnose_regen_ablation.py), then intercepts every
-(segment_gsnrs, boundary_probs) SegmentCombiner is handed during ONE forward
-pass over the checkpoint's own fixed traffic matrix
+reproduces that write-up's headline table. Loads a trained e2e checkpoint
+and runs ONE forward pass over that checkpoint's own fixed traffic matrix
 (scripts/_common.py's fixed_traffic_demands, at
-schedule_at(cfg, cfg["training"]["epochs_e2e"])). Each intercepted call is
-then re-folded three different ways and compared:
+schedule_at(cfg, cfg["training"]["epochs_e2e"])), then re-folds every
+demand's (segment GSNRs, boundary allocations) three different ways and
+compares them.
+
+There is no placement to hard-saturate any more. The pre-Stage-II version
+of this script pinned a per-node logit vector to +/-30 so "placed" was
+unambiguous; a per-(demand, boundary) head has no such vector, and its soft
+allocations `alloc.a` are read straight off `AllocationOutputs` — which is
+strictly better here, because a genuinely FRACTIONAL boundary probability
+is exactly the regime the shipped fold's exactness claim is about. Under
+the old saturation every probability was within 1e-8 of 0 or 1 and the
+shipped-vs-exact delta was ~0 by construction.
+
+The three folds:
 
   1. `_legacy_single_accumulator_fold` — a local, clearly-labelled copy of
      the pre-fix recurrence (a single accumulator that takes a soft_max at
@@ -28,8 +37,8 @@ then re-folded three different ways and compared:
      hard-rounded p (p >= 0.5 -> cut), i.e. the reference both of the above
      are measured against.
 
-Only demands whose route crosses at least one placed (hard-rounded p=1)
-regenerator are scored: when no boundary on a route ever cuts, chunking is
+Only demands with at least one hard-rounded cut (a >= 0.5) on their route
+are scored: when no boundary on a route ever cuts, chunking is
 a no-op and the legacy and shipped folds trivially agree with the exact
 fold by construction (plain noise addition) — including those demands
 would dilute the reported error toward zero without saying anything about
@@ -47,11 +56,9 @@ import statistics
 from typing import List, Tuple
 
 import torch
-import torch.nn as nn
 import yaml
 
 from diffopt.qot.segment_combiner import (
-    SegmentCombiner,
     db_to_linear_noise,
     linear_noise_to_db,
     soft_max,
@@ -70,12 +77,9 @@ with open(args.config) as f:
     cfg = yaml.safe_load(f)
 ctx = build_context(cfg, load_e2e_checkpoint=True, checkpoint_path=args.checkpoint)
 pipe = ctx.pipeline
-topo = ctx.topology
-regen_placement = ctx.regen_placement
 t_cfg = cfg["training"]
 
 tau, vlastelica_lambda = schedule_at(cfg, t_cfg["epochs_e2e"])
-tau_end = t_cfg["regen_tau_end"]
 
 # The soft_max temperature the historical anneal ended at. Pinned as a
 # literal because it no longer exists in the config or the schedule -- the
@@ -84,22 +88,11 @@ tau_end = t_cfg["regen_tau_end"]
 # historical value, not a current one.
 _LEGACY_TEMPERATURE = 0.01
 
-# Hard-saturate the learned placement to +/-30, same convention as
-# diagnose_regen_ablation.py, so "placed" vs "not placed" is unambiguous
-# and the forward pass below routes/regenerates on a fully hard decision.
-learned_logits = regen_placement.regen_logits.detach().clone()
-learned_probs = torch.sigmoid(learned_logits / tau_end)
-R = set((learned_probs > 0.5).nonzero(as_tuple=True)[0].tolist())
-with torch.no_grad():
-    regen_placement.regen_logits.copy_(
-        torch.tensor([30.0 if n in R else -30.0 for n in range(topo.num_nodes)])
-    )
-
 ckpt_label = args.checkpoint or f"{cfg.get('checkpoint_dir', 'checkpoints')}/best_e2e.pt"
-print(f"Checkpoint {ckpt_label}: |R|={len(R)} regens placed ({sorted(R)})")
 
 demands, excluded = fixed_traffic_demands(ctx)
 tr_cfg = cfg["traffic"]
+print(f"Checkpoint {ckpt_label} (epoch {ctx.ckpt['epoch']})")
 print(
     f"{len(demands)} demands ({tr_cfg['scenario']}, seed={tr_cfg['seed']}), "
     f"{len(excluded)} excluded by preflight, schedule epoch={t_cfg['epochs_e2e']} "
@@ -108,54 +101,37 @@ print(
 
 
 # ---------------------------------------------------------------------------
-# Recording shim
+# One forward pass; the fold inputs come straight off AllocationOutputs
 # ---------------------------------------------------------------------------
+#
+# No recording shim any more. Before the allocation head existed, the only
+# way to see what SegmentCombiner had been handed was to wrap it; now
+# `AllocationOutputs` returns exactly those tensors -- `seg_gsnr_db` is the
+# padded (D, J) matrix pipeline.forward folds, `a` is the (D, J-1)
+# allocation matrix it folds with, and `num_segments` says where each row's
+# padding starts. Reading them directly removes a whole class of
+# shim-vs-reality drift.
+#
+# `a` (the PRICED allocation), not `a_physics`: they differ only under
+# alloc_dropout, which is a training-time perturbation this script does not
+# and must not enable.
 
-class _RecordingCombiner(nn.Module):
-    """Wraps the real SegmentCombiner and records the per-demand
-    (segment_gsnrs_db, regen_probs_at_boundaries) pairs it is handed during
-    a forward pass, so the same calls train.py's own pipeline.forward would
-    make can be re-folded three ways after the fact.
-
-    pipeline.forward folds every demand in ONE forward_batched call as of
-    the 2026-08-23 mechanical speedups, so this shim un-pads that call back
-    into the per-demand lists the three fold implementations below expect.
-    `forward` is still wrapped because scripts and tests that hold a
-    SegmentCombiner directly keep using it."""
-
-    def __init__(self, inner: SegmentCombiner):
-        super().__init__()
-        self.inner = inner
-        self.calls: List[Tuple[List[torch.Tensor], List[torch.Tensor]]] = []
-
-    def forward(self, segment_gsnrs_db, regen_probs_at_boundaries):
-        self.calls.append((
-            [g.detach().clone() for g in segment_gsnrs_db],
-            [p.detach().clone() for p in regen_probs_at_boundaries],
-        ))
-        return self.inner(segment_gsnrs_db, regen_probs_at_boundaries)
-
-    def forward_batched(self, segment_gsnrs_db, boundary_probs, num_segments):
-        for row in range(segment_gsnrs_db.shape[0]):
-            n_seg = int(num_segments[row].item())
-            self.calls.append((
-                [segment_gsnrs_db[row, k].detach().clone() for k in range(n_seg)],
-                [boundary_probs[row, k].detach().clone() for k in range(n_seg - 1)],
-            ))
-        return self.inner.forward_batched(
-            segment_gsnrs_db, boundary_probs, num_segments
-        )
-
-
-recorder = _RecordingCombiner(pipe.segment_combiner)
-pipe.segment_combiner = recorder
 with torch.no_grad():
-    pipe(demands, tau=tau, lambda_=vlastelica_lambda)
-pipe.segment_combiner = recorder.inner  # restore the real module
+    _, _, _, alloc = pipe(demands, tau=tau, lambda_=vlastelica_lambda)
 
-assert len(recorder.calls) == len(demands), (
-    f"expected one SegmentCombiner call per demand, got {len(recorder.calls)} "
-    f"for {len(demands)} demands"
+calls: List[Tuple[List[torch.Tensor], List[torch.Tensor]]] = []
+for row in range(len(demands)):
+    n_seg = int(alloc.num_segments[row].item())
+    calls.append((
+        [alloc.seg_gsnr_db[row, k].detach().clone() for k in range(n_seg)],
+        [alloc.a[row, k].detach().clone() for k in range(n_seg - 1)],
+    ))
+
+# Row order follows `alloc.demand_ids`, which pipeline.forward builds by
+# enumerating `demands` in order -- assert it rather than trust it, since
+# every delta below is attributed to a demand by this pairing.
+assert alloc.demand_ids == [d.id for d in demands], (
+    "AllocationOutputs row order does not match the demand list"
 )
 
 
@@ -214,14 +190,14 @@ legacy_deltas: List[float] = []
 shipped_deltas: List[float] = []
 rows = []  # (demand_id, n_segments, n_cuts, max_chunk_len, legacy_delta, shipped_delta)
 
-for demand, (gsnrs, probs) in zip(demands, recorder.calls):
+for demand, (gsnrs, probs) in zip(demands, calls):
     hard_cuts = [p.item() >= 0.5 for p in probs]
     if not any(hard_cuts):
-        continue  # route never crosses a placed regenerator; folds agree trivially
+        continue  # no cut on this route; folds agree trivially
 
     exact_db = _exact_hard_chunk_fold(gsnrs, hard_cuts)
     legacy_db = _legacy_single_accumulator_fold(gsnrs, probs, _LEGACY_TEMPERATURE)
-    shipped_db = recorder.inner(gsnrs, probs).item()
+    shipped_db = pipe.segment_combiner(gsnrs, probs).item()
 
     legacy_delta = legacy_db - exact_db
     shipped_delta = shipped_db - exact_db
@@ -243,8 +219,11 @@ for demand, (gsnrs, probs) in zip(demands, recorder.calls):
     ))
 
 n_cross = len(rows)
-print(f"{n_cross}/{len(demands)} demands' route crosses at least one placed regenerator "
-      f"(scored below); {len(demands) - n_cross} never cross one and are excluded "
+print(f"allocation: {alloc.device_count.item():.2f} soft devices, "
+      f"{int((alloc.a >= 0.5).sum())} hard-rounded cuts over "
+      f"{int(alloc.a.numel())} (demand, boundary) variables")
+print(f"{n_cross}/{len(demands)} demands have at least one hard-rounded cut "
+      f"(scored below); {len(demands) - n_cross} have none and are excluded "
       f"(folds agree trivially there)\n")
 
 
@@ -284,6 +263,6 @@ for row in sorted(rows, key=lambda r: -abs(r[4]))[:10]:
         f"max_chunk_len={max_len:>2}  legacy={legacy_delta:+.3f} dB  shipped={shipped_delta:+.3f} dB"
     )
 
-# Restore the checkpoint's learned (soft) logits, not the hard-saturated ones.
-with torch.no_grad():
-    regen_placement.regen_logits.copy_(learned_logits)
+# Nothing to restore: this script never mutates a parameter. The
+# save/restore that used to live here existed only to undo the +/-30
+# saturation of the per-node logit vector, which no longer exists.
