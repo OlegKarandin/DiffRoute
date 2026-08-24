@@ -17,6 +17,14 @@ from diffopt.routing.surrogate import surrogate_shortest_path
 from diffopt.topology import Edge, Topology
 
 
+# The memo holds one float per distinct (ordered edge-id tuple, batch
+# width). Routes move during training, so the set grows; the bound exists
+# so a long run cannot turn a speedup into a memory leak. Clearing wholesale
+# rather than evicting LRU is deliberate: the working set is "the segments
+# of the current routing", which turns over as a block.
+_SEGMENT_GSNR_CACHE_MAX = 100_000
+
+
 # ---------------------------------------------------------------------------
 # Module-level helper
 # ---------------------------------------------------------------------------
@@ -97,6 +105,7 @@ class DiffONetPipeline(nn.Module):
         channel_loading_fraction: float = 0.5,
         max_spans: int = 60,
         edge_ase_noise: Optional[torch.Tensor] = None,
+        cache_segment_gsnr: bool = True,
     ) -> None:
         super().__init__()
 
@@ -157,6 +166,22 @@ class DiffONetPipeline(nn.Module):
                 f"expected ({len(self._edges)},)"
             )
         self.register_buffer("_edge_ase_noise", edge_ase_noise)
+
+        # Memo for step 5. A segment's QoT input is a pure function of its
+        # ORDERED edge-id tuple: span_feature_rows reads only frozen Edge
+        # fields plus the fixed config constant channel_loading_fraction,
+        # and accum_dist_km makes the tuple direction-sensitive, so this is
+        # a tuple key and never a frozenset. The QoT model is frozen at
+        # construction, so the mapping never moves during a run — see
+        # docs/architecture/invariants.md, "Physics layer".
+        #
+        # Set cache_segment_gsnr=False to bypass it: used by
+        # tests/test_pipeline.py to check the memo against the direct path,
+        # and appropriate for any caller that swaps qot_model without
+        # calling clear_segment_gsnr_cache().
+        self.cache_segment_gsnr = cache_segment_gsnr
+        self._segment_gsnr_cache: Dict[Tuple[Tuple[int, ...], int], float] = {}
+
         self._proxy_eps = 1e-12
 
     # ------------------------------------------------------------------
@@ -237,6 +262,12 @@ class DiffONetPipeline(nn.Module):
         padding_mask[0, :n_spans] = True   # True = real span (inverted inside QoT model)
 
         return span_feats, padding_mask
+
+    def clear_segment_gsnr_cache(self) -> None:
+        """Drop the memo. Required after replacing `self.qot_model` — the
+        memo's exactness rests on the model being frozen for the lifetime
+        of the entries."""
+        self._segment_gsnr_cache.clear()
 
     # ------------------------------------------------------------------
     # Forward
@@ -408,22 +439,30 @@ class DiffONetPipeline(nn.Module):
                 all_segments.append(seg_edge_ids)
                 segment_owner_demand_id.append(demand.id)
 
-        # 5. One batched QoT call over every segment from every demand,
-        # padded only to this batch's true max span count (not the
-        # architectural max_spans=60) — real segments run <=12 spans,
-        # median ~7, so padding to 60 wastes ~98% of attention compute on
-        # masked positions (docs/investigations/open_followups.md #1).
-        # Safe because TransformerEncoder's src_key_padding_mask excludes
-        # padded positions from attention and the mean-pool divides only by
+        # 5. One batched QoT call over every segment that is NOT already
+        # memoised, padded only to this batch's true max span count (not the
+        # architectural max_spans=60) — real segments run <=12 spans, median
+        # ~7, so padding to 60 wastes ~98% of attention compute on masked
+        # positions (docs/investigations/open_followups.md #1). Safe because
+        # TransformerEncoder's src_key_padding_mask excludes padded
+        # positions from attention and the mean-pool divides only by
         # real-span count, so a narrower shared width changes nothing but
         # the wasted columns.
-        all_segment_rows = [
-            span_feature_rows(self._topology, seg, channel_loading_fraction=self.channel_loading_fraction)
-            for seg in all_segments
+        #
+        # batch_max_spans is computed over ALL segments, hits included, so
+        # the miss batch is padded to exactly the width the un-memoised code
+        # would have used. Together with the width being part of the memo
+        # key, a hit is bitwise what a recompute would have given.
+        seg_keys = [tuple(seg) for seg in all_segments]
+        # Span count without building the rows — the rows are only needed
+        # for misses, and building them for every segment is the cost this
+        # memo exists to avoid.
+        seg_n_spans = [
+            sum(self._edges[eid].num_spans for eid in seg) for seg in all_segments
         ]
 
         if all_segments:
-            batch_max_spans = max(1, max(len(rows) for rows in all_segment_rows))
+            batch_max_spans = max(1, max(seg_n_spans))
             if batch_max_spans > self.max_spans:
                 raise ValueError(
                     f"Routed a transparent segment of {batch_max_spans} spans, but "
@@ -432,18 +471,50 @@ class DiffONetPipeline(nn.Module):
                     f"Either shorten the route or regenerate datasets and retrain "
                     f"with a larger max_spans."
                 )
-            n_total = len(all_segments)
-            batched_span_feats = torch.zeros(n_total, batch_max_spans, SPAN_FEATURE_DIM, device=device)
-            batched_padding_mask = torch.zeros(n_total, batch_max_spans, dtype=torch.bool, device=device)
-            for i, rows in enumerate(all_segment_rows):
-                n_spans = len(rows)
-                if n_spans > 0:
-                    batched_span_feats[i, :n_spans] = torch.tensor(rows, dtype=torch.float32, device=device)
-                    batched_padding_mask[i, :n_spans] = True
-            # Forward value only — this has zero live gradient w.r.t. any
-            # path_indicator (span_feats comes from static topology data,
-            # and seg_edge_ids was derived via path_indicator.detach()).
-            batched_qot_gsnr = self.qot_model(batched_span_feats, batched_padding_mask)
+
+            cache = self._segment_gsnr_cache if self.cache_segment_gsnr else {}
+            miss_positions = [
+                i for i, key in enumerate(seg_keys)
+                if (key, batch_max_spans) not in cache
+            ]
+
+            if miss_positions:
+                n_miss = len(miss_positions)
+                batched_span_feats = torch.zeros(
+                    n_miss, batch_max_spans, SPAN_FEATURE_DIM, device=device
+                )
+                batched_padding_mask = torch.zeros(
+                    n_miss, batch_max_spans, dtype=torch.bool, device=device
+                )
+                for row, i in enumerate(miss_positions):
+                    rows = span_feature_rows(
+                        self._topology, all_segments[i],
+                        channel_loading_fraction=self.channel_loading_fraction,
+                    )
+                    n_spans = len(rows)
+                    if n_spans > 0:
+                        batched_span_feats[row, :n_spans] = torch.tensor(
+                            rows, dtype=torch.float32, device=device
+                        )
+                        batched_padding_mask[row, :n_spans] = True
+                # Forward value only — this has zero live gradient w.r.t. any
+                # path_indicator (span_feats comes from static topology data,
+                # and seg_edge_ids was derived via path_indicator.detach()).
+                # That is also what makes storing plain floats safe: there is
+                # no graph to sever.
+                miss_gsnr = self.qot_model(
+                    batched_span_feats, batched_padding_mask
+                ).tolist()
+                for row, i in enumerate(miss_positions):
+                    cache[(seg_keys[i], batch_max_spans)] = miss_gsnr[row]
+
+                if len(self._segment_gsnr_cache) > _SEGMENT_GSNR_CACHE_MAX:
+                    self._segment_gsnr_cache.clear()
+
+            batched_qot_gsnr = torch.tensor(
+                [cache[(key, batch_max_spans)] for key in seg_keys],
+                dtype=torch.float32, device=device,
+            )
         else:
             batched_qot_gsnr = torch.zeros(0, device=device)
 

@@ -994,3 +994,104 @@ def test_gate_dropout_does_not_apply_to_an_override():
     )
 
     assert abs(with_dropout[0].item() - without[0].item()) < 1e-6
+
+
+def test_segment_gsnr_memo_serves_a_repeated_forward_without_calling_the_qot_model():
+    """Same demands, same (untrained, so unchanged) edge weights -> same
+    routes -> same segments. The second forward must hit the memo for every
+    one of them, so the QoT model is not called at all."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
+               Demand(id=1, src=1, dst=4, bitrate_gbps=400.0)]
+
+    calls = {"n": 0}
+    real_forward = SpanAttentionQoT.forward
+
+    def counting_forward(self, span_features, padding_mask):
+        calls["n"] += 1
+        return real_forward(self, span_features, padding_mask)
+
+    with torch.no_grad():
+        _, first, _, _ = pipeline(demands, tau=1.0)
+        SpanAttentionQoT.forward = counting_forward
+        try:
+            _, second, _, _ = pipeline(demands, tau=1.0)
+        finally:
+            SpanAttentionQoT.forward = real_forward
+
+    assert calls["n"] == 0
+    for d in demands:
+        assert torch.equal(first[d.id], second[d.id])
+
+
+def test_segment_gsnr_memo_produces_the_same_gsnr_as_no_memo():
+    """The exactness claim, checked rather than argued. Two pipelines built
+    from the same seed, one with the memo disabled: bitwise-equal GSNR."""
+    topology = make_hub_topology()
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    torch.manual_seed(0)
+    cached = make_pipeline(topology)
+    torch.manual_seed(0)
+    uncached = make_pipeline(topology)
+    uncached.cache_segment_gsnr = False
+
+    with torch.no_grad():
+        _, with_memo, _, _ = cached(demands, tau=1.0)
+        _, without_memo, _, _ = uncached(demands, tau=1.0)
+
+    assert torch.equal(with_memo[0], without_memo[0])
+    assert len(cached._segment_gsnr_cache) > 0
+    assert len(uncached._segment_gsnr_cache) == 0
+
+
+def test_segment_gsnr_memo_key_is_the_ordered_edge_tuple_and_the_batch_width():
+    """The width belongs in the key. Padded columns are masked out of
+    attention and out of the mean-pool, so a different batch width is the
+    same number mathematically -- but the reduction runs over a different
+    axis length, and only pinning the width makes a hit bitwise identical
+    to what the un-memoised code would have produced."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+
+    with torch.no_grad():
+        pipeline([Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)], tau=1.0)
+
+    key = next(iter(pipeline._segment_gsnr_cache))
+    edge_tuple, width = key
+    assert isinstance(edge_tuple, tuple)
+    assert all(isinstance(eid, int) for eid in edge_tuple)
+    assert isinstance(width, int) and width >= 1
+
+
+def test_clear_segment_gsnr_cache_forces_recomputation():
+    """Anything that swaps pipeline.qot_model must be able to invalidate."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    with torch.no_grad():
+        pipeline(demands, tau=1.0)
+    assert len(pipeline._segment_gsnr_cache) > 0
+
+    pipeline.clear_segment_gsnr_cache()
+    assert len(pipeline._segment_gsnr_cache) == 0
+
+
+def test_memoised_forward_still_carries_gradient_to_regen_logits():
+    """The memo replaces a live model output with a rebuilt constant
+    tensor. That is safe only because the QoT value was already
+    gradient-free (frozen model, static features) and the STE routes the
+    gradient through the proxy. This is the regression guard for getting
+    that wrong."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    _, gsnr, _, _ = pipeline(demands, tau=1.0)
+    gsnr[0].backward()
+
+    grad = pipeline.regen_placement.regen_logits.grad
+    assert grad is not None
+    assert grad.abs().sum().item() > 0.0
