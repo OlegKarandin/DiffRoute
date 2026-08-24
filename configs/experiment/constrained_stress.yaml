@@ -127,9 +127,16 @@ training:
   vlastelica_lambda_min: 1.0
   vlastelica_lambda_decay: 0.995
   alloc_tau_start: 1.0
-  alloc_tau_end: 0.1
+  # tau_end was 0.1 and the anneal ended at epoch 40. At tau = 0.1 the usable
+  # score band is |s| < 0.5 while the head's scores span [-8.7, +2.9], so a
+  # wrong-way excursion pushes the sigmoid past float32 saturation with zero
+  # gradient left to recover with — measured 2026-08-24 as an irreversible
+  # training collapse on this config. Nothing downstream needs a small tau:
+  # selection, oracle_gap and deployment all read hard_rollout, a sign test on
+  # the score. See .superpowers/.../task12-investigation.md (fix B).
+  alloc_tau_end: 0.3
   alloc_tau_anneal_start_epoch: 10
-  alloc_tau_anneal_end_epoch: 40
+  alloc_tau_anneal_end_epoch: 55   # companion to tau_end, same reasoning
 
 # Checkpoint selection always reads the DEPLOYED allocation (train.py's
 # hard_rollout), never the relaxation the gradient flows through. There is
