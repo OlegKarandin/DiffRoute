@@ -112,6 +112,14 @@ def db_to_linear_noise(gsnr_db: torch.Tensor) -> torch.Tensor:
                      -gsnr_db / 10.0)
 
 
+# The band inside which a segment GSNR is trusted. Outside it, _safe_noise's
+# clamp has exactly zero gradient, so an STE blend on such a segment silently
+# stops contributing. The allocation head and the oracle clamp identically —
+# they must agree with the fold on what a chunk's noise is, or oracle_gap
+# stops measuring the head and starts measuring a units mismatch.
+GSNR_MIN, GSNR_MAX = -5.0, 35.0
+
+
 def linear_noise_to_db(noise_linear: torch.Tensor) -> torch.Tensor:
     """Convert normalised noise power back to GSNR in dB: -10 * log10(noise)."""
     return -10.0 * torch.log10(noise_linear)
@@ -292,9 +300,6 @@ class SegmentCombiner(nn.Module):
                 f"got {len(regen_probs_at_boundaries)}"
             )
 
-        # Clamp inputs to prevent float32 overflow on extreme values
-        GSNR_MIN, GSNR_MAX = -5.0, 35.0
-
         def _safe_noise(g_db: torch.Tensor) -> torch.Tensor:
             g_clamped = g_db.clamp(GSNR_MIN, GSNR_MAX)
             # Use float64 for accumulation precision
@@ -432,8 +437,6 @@ class SegmentCombiner(nn.Module):
                 f"docs/investigations/fold_formula_scalability.md."
             )
 
-        # Same clamp band as forward(); same float64 accumulation.
-        GSNR_MIN, GSNR_MAX = -5.0, 35.0
         device = segment_gsnrs_db.device
         positions = torch.arange(j, device=device)
 
