@@ -1135,3 +1135,80 @@ def test_segment_gsnr_cache_eviction_does_not_read_from_cleared_cache(monkeypatc
     assert len(gsnr_dict2) == 2, f"Expected 2 demands in output, got {len(gsnr_dict2)}"
     # Verify both demands have GSNR predictions (not None or missing).
     assert all(gsnr_dict2[d.id] is not None for d in demands2), "All demands should have GSNR"
+
+
+def test_pipeline_gsnr_matches_a_per_demand_combiner_loop():
+    """The batched fold's equivalence, checked at the level that matters:
+    the pipeline's own output. Rebuilds each demand's segments from its
+    path indicator and folds them one at a time, the way forward() did
+    before batching."""
+    from diffopt.pipeline import segment_path
+
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    with torch.no_grad():
+        pipeline.regen_placement.regen_logits.copy_(
+            torch.tensor([0.3, -0.7, 0.1, 1.2, -0.4])
+        )
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0),
+               Demand(id=1, src=2, dst=4, bitrate_gbps=400.0),
+               Demand(id=2, src=1, dst=3, bitrate_gbps=400.0)]
+
+    with torch.no_grad():
+        _, gsnr_preds, path_indicators, regen_probs = pipeline(demands, tau=1.0)
+
+        for demand in demands:
+            ordered = pipeline._reconstruct_path(
+                path_indicators[demand.id], demand.src, demand.dst
+            )
+            segments, boundary_nodes = segment_path(
+                ordered, demand.src, pipeline._regen_candidate_set,
+                pipeline._edges, demand.dst,
+            )
+            segment_gsnrs = []
+            for seg in segments:
+                feats, mask = pipeline._extract_span_features(seg, gsnr_preds[0].device)
+                segment_gsnrs.append(pipeline.qot_model(feats, mask)[0])
+            expected = pipeline.segment_combiner(
+                segment_gsnrs, [regen_probs[n] for n in boundary_nodes]
+            )
+            assert abs(gsnr_preds[demand.id].item() - expected.item()) < 1e-4
+
+
+def test_pipeline_folds_every_demand_in_one_combiner_call():
+    """The speedup itself. Three demands, one forward_batched call."""
+    from diffopt.qot.segment_combiner import SegmentCombiner as _Combiner
+
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = [Demand(id=i, src=s, dst=d, bitrate_gbps=400.0)
+               for i, (s, d) in enumerate([(0, 4), (2, 4), (1, 3)])]
+
+    calls = {"n": 0}
+    real = _Combiner.forward_batched
+
+    def counting(self, segment_gsnrs_db, boundary_probs, num_segments):
+        calls["n"] += 1
+        return real(self, segment_gsnrs_db, boundary_probs, num_segments)
+
+    _Combiner.forward_batched = counting
+    try:
+        with torch.no_grad():
+            pipeline(demands, tau=1.0)
+    finally:
+        _Combiner.forward_batched = real
+
+    assert calls["n"] == 1
+
+
+def test_pipeline_handles_an_empty_demand_list():
+    """train.py raises before this can happen, but forward() has always
+    tolerated it and the batched path introduces a torch.stack on a
+    possibly-empty list."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+
+    costs, gsnr, indicators, probs = pipeline([], tau=1.0)
+
+    assert costs == {} and gsnr == {} and indicators == {}
+    assert probs.shape == (topology.num_nodes,)

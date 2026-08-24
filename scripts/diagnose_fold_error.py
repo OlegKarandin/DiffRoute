@@ -112,10 +112,16 @@ print(
 # ---------------------------------------------------------------------------
 
 class _RecordingCombiner(nn.Module):
-    """Wraps the real SegmentCombiner and records every
-    (segment_gsnrs_db, regen_probs_at_boundaries) pair it is handed during
+    """Wraps the real SegmentCombiner and records the per-demand
+    (segment_gsnrs_db, regen_probs_at_boundaries) pairs it is handed during
     a forward pass, so the same calls train.py's own pipeline.forward would
-    make can be re-folded three ways after the fact."""
+    make can be re-folded three ways after the fact.
+
+    pipeline.forward folds every demand in ONE forward_batched call as of
+    the 2026-08-23 mechanical speedups, so this shim un-pads that call back
+    into the per-demand lists the three fold implementations below expect.
+    `forward` is still wrapped because scripts and tests that hold a
+    SegmentCombiner directly keep using it."""
 
     def __init__(self, inner: SegmentCombiner):
         super().__init__()
@@ -128,6 +134,17 @@ class _RecordingCombiner(nn.Module):
             [p.detach().clone() for p in regen_probs_at_boundaries],
         ))
         return self.inner(segment_gsnrs_db, regen_probs_at_boundaries)
+
+    def forward_batched(self, segment_gsnrs_db, boundary_probs, num_segments):
+        for row in range(segment_gsnrs_db.shape[0]):
+            n_seg = int(num_segments[row].item())
+            self.calls.append((
+                [segment_gsnrs_db[row, k].detach().clone() for k in range(n_seg)],
+                [boundary_probs[row, k].detach().clone() for k in range(n_seg - 1)],
+            ))
+        return self.inner.forward_batched(
+            segment_gsnrs_db, boundary_probs, num_segments
+        )
 
 
 recorder = _RecordingCombiner(pipe.segment_combiner)

@@ -524,16 +524,31 @@ class DiffONetPipeline(nn.Module):
             batched_qot_gsnr = torch.zeros(0, device=device)
 
         # 6. Scatter the batched QoT output back per demand, blend with the
-        # STE proxy per segment, and combine each demand's segments.
+        # STE proxy per segment, then fold EVERY demand in one call.
+        #
+        # Pre-batching this was one SegmentCombiner call per demand, each
+        # running a Python loop over that demand's boundaries — about 2 400
+        # interpreter steps per epoch on constrained_stress, doubled by
+        # train.py's hard-evaluation pass. Batched it is J_max - 1.
         path_noise_costs: Dict[int, torch.Tensor] = {}
         gsnr_preds: Dict[int, torch.Tensor] = {}
         path_indicators: Dict[int, torch.Tensor] = {}
         flat_idx = 0
 
-        for demand in demands:
+        segment_gsnr_flat: List[torch.Tensor] = []
+        seg_rows: List[int] = []
+        seg_cols: List[int] = []
+        boundary_node_ids: List[int] = []
+        bnd_rows: List[int] = []
+        bnd_cols: List[int] = []
+        seg_counts: List[int] = []
+
+        for row, demand in enumerate(demands):
             path_indicator = demand_path_indicators[demand.id]
-            segment_gsnrs: List[torch.Tensor] = []
-            for seg_edge_ids in demand_segments[demand.id]:
+            segments = demand_segments[demand.id]
+            seg_counts.append(len(segments))
+
+            for col, seg_edge_ids in enumerate(segments):
                 qot_gsnr = batched_qot_gsnr[flat_idx]
                 flat_idx += 1
 
@@ -549,14 +564,51 @@ class DiffONetPipeline(nn.Module):
                 # that clamp (segment_combiner.py's _safe_noise has zero
                 # gradient outside the clamped band).
                 segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())
-                segment_gsnrs.append(segment_gsnr)
+                segment_gsnr_flat.append(segment_gsnr)
+                seg_rows.append(row)
+                seg_cols.append(col)
 
-            # Combine segments with soft boundary probabilities
-            boundary_probs = [regen_probs_physics[n] for n in demand_boundary_nodes[demand.id]]
-            path_gsnr = self.segment_combiner(segment_gsnrs, boundary_probs)
+            for col, node in enumerate(demand_boundary_nodes[demand.id]):
+                boundary_node_ids.append(node)
+                bnd_rows.append(row)
+                bnd_cols.append(col)
 
             path_noise_costs[demand.id] = demand_path_noise_costs[demand.id]
-            gsnr_preds[demand.id] = path_gsnr
             path_indicators[demand.id] = path_indicator
+
+        if demands:
+            num_demands = len(demands)
+            j_max = max(seg_counts)
+            long_ = dict(dtype=torch.long, device=device)
+
+            # index_put on a zeros tensor rather than in-place assignment:
+            # out-of-place keeps the autograd path to segment_gsnr_flat and
+            # to regen_probs_physics explicit, and the (row, col) pairs are
+            # unique so accumulate=False is right.
+            gsnr_matrix = torch.zeros(num_demands, j_max, device=device).index_put(
+                (torch.tensor(seg_rows, **long_), torch.tensor(seg_cols, **long_)),
+                torch.stack(segment_gsnr_flat),
+            )
+
+            prob_matrix = torch.zeros(num_demands, max(j_max - 1, 0), device=device)
+            if boundary_node_ids:
+                # ONE gather into regen_probs_physics, not one per boundary:
+                # the per-boundary list comprehension this replaces built
+                # sum_d (N_d - 1) separate 0-dim views every forward.
+                boundary_values = regen_probs_physics[
+                    torch.tensor(boundary_node_ids, **long_)
+                ]
+                prob_matrix = prob_matrix.index_put(
+                    (torch.tensor(bnd_rows, **long_), torch.tensor(bnd_cols, **long_)),
+                    boundary_values,
+                )
+
+            path_gsnrs = self.segment_combiner.forward_batched(
+                gsnr_matrix,
+                prob_matrix,
+                torch.tensor(seg_counts, **long_),
+            )
+            for row, demand in enumerate(demands):
+                gsnr_preds[demand.id] = path_gsnrs[row]
 
         return path_noise_costs, gsnr_preds, path_indicators, regen_probs
