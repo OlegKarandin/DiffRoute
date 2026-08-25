@@ -136,7 +136,7 @@ class AllocationHead(nn.Module):
         Always safely callable regardless of the flag — train.py's CSV-row
         code reads this every epoch unconditionally.
         """
-        return float(F.softplus(self.alpha_raw)) if self.greedy_residual else float("nan")
+        return float(F.softplus(self.alpha_raw).detach()) if self.greedy_residual else float("nan")
 
     def score(self, feats: torch.Tensor) -> torch.Tensor:
         """(..., ALLOC_FEATURE_DIM) -> (...). Positive means "cut here"."""
@@ -199,11 +199,14 @@ class AllocationHead(nn.Module):
             lambda_dev multiplies, a_physics is what the combiner folds and
             what resets the carry. waste is a scalar,
             sum_{d,k} a_priced[d,k] * relu(feature4[d,k]), masked by
-            cut_valid, gradient-detached from n_next/routing per this
-            module's carry-as-observation invariant (deviation 1 in the
-            task-6 brief: an undetached relu(feature4) would still carry
-            gradient into n_next even though the carry cd is already
-            detached, rewarding routing onto noisier next segments).
+            cut_valid. Only the relu(feature4) COEFFICIENT is
+            gradient-detached, per this module's carry-as-observation
+            invariant (deviation 1 in the task-6 brief: an undetached
+            relu(feature4) would still carry gradient into n_next even
+            though the carry cd is already detached, rewarding routing onto
+            noisier next segments) — the priced allocation a_k that
+            multiplies it is NOT detached, and legitimately carries gradient
+            into n_next/routing via its own dependence on score.
         """
         d, j = seg_noise.shape
         device = seg_noise.device

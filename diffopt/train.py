@@ -510,7 +510,7 @@ def main() -> None:
                 f"{alloc_dropout_p:.3f}",
                 lookahead,
                 route_context,
-                pl_cfg.get("greedy_residual", False),
+                greedy_residual,
                 f"{p_cfg.get('lambda_waste', 0.0):.4f}",
                 f"{waste_loss:.6f}",
                 f"{alpha_pre_step:.6f}",
