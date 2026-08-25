@@ -160,7 +160,11 @@ def build_context(
 
     pl_cfg = cfg.get("placement", {})
     c_cfg = cfg["constraint"]
-    allocation_head = AllocationHead(lookahead=pl_cfg.get("lookahead", True), route_context=pl_cfg.get("route_context", True)).to(device)
+    allocation_head = AllocationHead(
+        lookahead=pl_cfg.get("lookahead", True),
+        route_context=pl_cfg.get("route_context", True),
+        greedy_residual=pl_cfg.get("greedy_residual", False),
+    ).to(device)
 
     pipeline = DiffONetPipeline(
         topology=topology,

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 
@@ -293,7 +294,10 @@ def main() -> None:
     pl_cfg = cfg.get("placement", {})
     lookahead: bool = pl_cfg.get("lookahead", True)
     route_context: bool = pl_cfg.get("route_context", True)
-    allocation_head = AllocationHead(lookahead=lookahead, route_context=route_context).to(device)
+    greedy_residual: bool = pl_cfg.get("greedy_residual", False)
+    allocation_head = AllocationHead(
+        lookahead=lookahead, route_context=route_context, greedy_residual=greedy_residual
+    ).to(device)
 
     pipeline = DiffONetPipeline(
         topology=topology,
@@ -318,12 +322,11 @@ def main() -> None:
     t_cfg = cfg["training"]
     p_cfg = cfg["pipeline"]
 
-    # Guard against non-default greedy_residual/lambda_waste before they are
-    # implemented. greedy_residual half removed when arm 3/Step 5 lands;
-    # lambda_waste half removed when arm 4/Step 6 lands.
-    if pl_cfg.get("greedy_residual", False) or p_cfg.get("lambda_waste", 0.0) != 0.0:
+    # Guard against non-default lambda_waste before it is implemented.
+    # Removed when arm 4/Step 6 lands.
+    if p_cfg.get("lambda_waste", 0.0) != 0.0:
         raise ValueError(
-            "greedy_residual/lambda_waste are not implemented yet in this build"
+            "lambda_waste is not implemented yet in this build"
         )
 
     vlastelica_lambda: float = t_cfg["vlastelica_lambda"]
@@ -443,6 +446,16 @@ def main() -> None:
             alloc_head_state_pre_step = {
                 k: v.clone() for k, v in allocation_head.state_dict().items()
             }
+            # Read straight from the pre-step state dict, not the live
+            # module's `.alpha` accessor — by the time the CSV row is
+            # written, opt_alloc.step() has already mutated alpha_raw, and
+            # this row must describe the SAME parameters as the snapshot
+            # above (comment there explains why).
+            alpha_pre_step = (
+                float(F.softplus(alloc_head_state_pre_step["alpha_raw"]))
+                if greedy_residual
+                else float("nan")
+            )
 
             # Selection metrics, measured on the deployed allocation rather
             # than on the relaxation the gradient step is taken through.
@@ -504,7 +517,7 @@ def main() -> None:
                 pl_cfg.get("greedy_residual", False),
                 f"{p_cfg.get('lambda_waste', 0.0):.4f}",
                 f"{0.0:.6f}",
-                f"{float('nan'):.6f}",
+                f"{alpha_pre_step:.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",
             ])

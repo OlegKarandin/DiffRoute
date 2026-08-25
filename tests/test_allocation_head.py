@@ -17,6 +17,7 @@ from diffopt.placement.allocation import (
     site_view,
     total_device_cost,
 )
+from diffopt.placement.oracle import oracle_allocation
 from diffopt.qot.segment_combiner import GSNR_MAX, GSNR_MIN, db_to_linear_noise
 
 
@@ -280,3 +281,103 @@ def test_first_segment_has_no_device_gradient_because_the_carry_is_detached():
     # ...and the fix must not have killed route-differentiability outright:
     # the later columns still reach the score via g_next / g_after's n_next.
     assert seg_noise.grad[:, 1:].abs().sum().item() > 0
+
+
+def test_greedy_residual_init_reproduces_the_oracle():
+    """The arm-3 keystone (spec 5.2). Untrained, `AllocationHead(greedy_residual=True)`
+    has MLP == 0 exactly, so score = alpha * (bar_d - g_after) = -alpha *
+    feature4 with alpha > 0 — i.e. score > 0 <=> feature4 < 0, which is
+    exactly the oracle's own greedy cut rule
+    (test_oracle.py::test_greedy_weights_reproduce_the_oracle hand-sets the
+    same rule with a hand-built weight matrix). A hard=True rollout at init
+    must therefore reproduce oracle_allocation bit for bit, with no training
+    step in between.
+
+    Built per plan-docs/.../task-5-brief.md "deviation 3": the spec's own
+    text asks for an absolute tie guard, but the head/oracle disagreement
+    was measured to begin at a RELATIVE gap of ~1e-7 — 1e-6 absolute is safe
+    at bar 12.5 dB but inside the failure band at bar -4 dB. So the batch is
+    reject-sampled against a relative gap guard (1e-5) walked along the
+    oracle's own float64 accumulation, and seg_db is clamped to
+    [GSNR_MIN, GSNR_MAX] before conversion to noise — a bare `rollout()`
+    call, unlike the pipeline, does not clamp for you, and skipping that
+    step here would measure a clamp-band artifact rather than head/oracle
+    agreement.
+    """
+
+    def relative_tie_free(seg_db_clamped, bar_db, num_segments):
+        """Replicates oracle_allocation's own float64 accumulation
+        boundary-by-boundary and reports False the first time a boundary's
+        gap to the bar, relative to the bar, is not clearly resolved."""
+        d, j = seg_db_clamped.shape
+        n = db_to_linear_noise(seg_db_clamped.double())
+        bar_noise = db_to_linear_noise(bar_db.double())
+        c = torch.zeros(d, dtype=torch.float64)
+        for k in range(j):
+            valid = k < num_segments
+            n_k = n[:, k]
+            if k == 0:
+                c = torch.where(valid, n_k, c)
+                continue
+            candidate = c + n_k
+            rel_gap = (candidate - bar_noise).abs() / bar_noise
+            if bool((valid & (rel_gap <= 1e-5)).any()):
+                return False
+            over = valid & (candidate > bar_noise)
+            c = torch.where(valid, torch.where(over, n_k, candidate), c)
+        return True
+
+    def draw(seed):
+        g = torch.Generator().manual_seed(seed)
+        # Spans the clamp band on both ends ([-10, 40] against
+        # GSNR_MIN/MAX == -5/35), ragged num_segments (including K_d == 0,
+        # zero boundaries), and an extreme-ish bar range -- the hostile
+        # properties verified by hand during design.
+        seg_db = torch.rand(D, J, generator=g) * 50.0 - 10.0
+        bar_db = torch.rand(D, generator=g) * 20.0 - 4.0
+        num_segments = torch.randint(1, J + 1, (D,), generator=g)
+        seg_km = torch.rand(D, J, generator=g) * 400.0 + 1.0
+        return seg_db, bar_db, num_segments, seg_km
+
+    D, J = 40, 9
+    seed = 20260825
+    for attempt in range(200):
+        seg_db, bar_db, num_segments, seg_km = draw(seed)
+        seg_db_clamped = seg_db.clamp(GSNR_MIN, GSNR_MAX)
+        if relative_tie_free(seg_db_clamped, bar_db, num_segments):
+            break
+        seed += 1
+    else:
+        raise AssertionError(
+            "could not find a tie-free batch in 200 attempts -- widen the "
+            "draw or check relative_tie_free for a bug"
+        )
+
+    head = AllocationHead(greedy_residual=True)
+    seg_noise = db_to_linear_noise(seg_db_clamped)
+    a_head, _ = head.rollout(seg_noise, seg_km, bar_db, num_segments, hard=True)
+    expected = oracle_allocation(seg_db_clamped, bar_db, num_segments)
+
+    assert torch.equal(a_head, expected.a)
+    # A second, coarser assertion so a failure names the delta directly
+    # rather than just "tensors not equal".
+    assert int(a_head.sum().item()) == int(expected.count.sum().item())
+
+
+def test_greedy_residual_rejects_lookahead_false():
+    """greedy_residual reads feature 4, which lookahead=False masks to zero
+    -- the combination is nonsensical, not merely unhelpful, so it raises
+    rather than silently degrading to alpha * 0."""
+    with pytest.raises(ValueError):
+        AllocationHead(greedy_residual=True, lookahead=False)
+
+
+def test_alpha_stays_positive():
+    """Spec 5.2: alpha = softplus(alpha_raw) keeps alpha > 0 for any
+    alpha_raw, so the sign test `score > 0 <=> feature4 < 0` never inverts
+    no matter how training moves alpha_raw."""
+    head = AllocationHead(greedy_residual=True)
+    for v in (-50.0, 0.0, 50.0):
+        with torch.no_grad():
+            head.alpha_raw.fill_(v)
+        assert head.alpha > 0
