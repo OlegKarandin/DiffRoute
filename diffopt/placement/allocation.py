@@ -47,6 +47,7 @@ from diffopt.qot.segment_combiner import GSNR_MAX, GSNR_MIN, db_to_linear_noise
 #   7  (K_d - k) / K_SCALE
 ALLOC_FEATURE_DIM = 8
 LOOKAHEAD_COLS = (3, 4)
+ROUTE_CONTEXT_COLS = (5, 6, 7)
 
 # Feature 4 is what makes the greedy-optimal policy exactly representable:
 # cut at k iff feature 4 < 0. tests/test_oracle.py's representability test
@@ -65,10 +66,12 @@ class AllocationHead(nn.Module):
         hidden: int = 32,
         *,
         lookahead: bool = True,
+        route_context: bool = True,
         init_bias: float = -3.0,
     ) -> None:
         super().__init__()
         self.lookahead = lookahead
+        self.route_context = route_context
         self.net = nn.Sequential(
             nn.Linear(ALLOC_FEATURE_DIM, hidden),
             nn.ReLU(),
@@ -93,12 +96,15 @@ class AllocationHead(nn.Module):
 
     def score(self, feats: torch.Tensor) -> torch.Tensor:
         """(..., ALLOC_FEATURE_DIM) -> (...). Positive means "cut here"."""
-        if not self.lookahead:
+        if not self.lookahead or not self.route_context:
             # Mask rather than shrink the input layer: the arm sweep flips
             # this per run, and a shape change would make the two arms'
             # checkpoints structurally incompatible for no benefit.
             mask = torch.ones(ALLOC_FEATURE_DIM, device=feats.device, dtype=feats.dtype)
-            mask[list(LOOKAHEAD_COLS)] = 0.0
+            if not self.lookahead:
+                mask[list(LOOKAHEAD_COLS)] = 0.0
+            if not self.route_context:
+                mask[list(ROUTE_CONTEXT_COLS)] = 0.0
             feats = feats * mask
         return self.net(feats).squeeze(-1)
 

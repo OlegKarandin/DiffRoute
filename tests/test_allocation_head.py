@@ -11,6 +11,8 @@ import torch
 
 from diffopt.placement.allocation import (
     ALLOC_FEATURE_DIM,
+    LOOKAHEAD_COLS,
+    ROUTE_CONTEXT_COLS,
     AllocationHead,
     site_view,
     total_device_cost,
@@ -119,6 +121,36 @@ def test_lookahead_off_zeroes_only_the_two_lookahead_columns():
     feats = torch.randn(16, ALLOC_FEATURE_DIM)
     masked = feats.clone()
     masked[:, [3, 4]] = 0.0
+    assert torch.allclose(off.score(feats), on.score(masked), atol=1e-6)
+    assert not torch.allclose(off.score(feats), on.score(feats), atol=1e-4)
+
+
+def test_route_context_mask_zeroes_features_5_6_7():
+    on = AllocationHead(route_context=True)
+    off = AllocationHead(route_context=False)
+    off.load_state_dict(on.state_dict())
+    with torch.no_grad():                        # break the zero-init degeneracy
+        on.net[-1].weight.normal_()
+        off.net[-1].weight.copy_(on.net[-1].weight)
+
+    feats = torch.randn(16, ALLOC_FEATURE_DIM)
+    masked = feats.clone()
+    masked[:, list(ROUTE_CONTEXT_COLS)] = 0.0
+    assert torch.allclose(off.score(feats), on.score(masked), atol=1e-6)
+    assert not torch.allclose(off.score(feats), on.score(feats), atol=1e-4)
+
+
+def test_lookahead_and_route_context_off_together_zero_all_five_columns():
+    on = AllocationHead(lookahead=True, route_context=True)
+    off = AllocationHead(lookahead=False, route_context=False)
+    off.load_state_dict(on.state_dict())
+    with torch.no_grad():                        # break the zero-init degeneracy
+        on.net[-1].weight.normal_()
+        off.net[-1].weight.copy_(on.net[-1].weight)
+
+    feats = torch.randn(16, ALLOC_FEATURE_DIM)
+    masked = feats.clone()
+    masked[:, list(LOOKAHEAD_COLS) + list(ROUTE_CONTEXT_COLS)] = 0.0
     assert torch.allclose(off.score(feats), on.score(masked), atol=1e-6)
     assert not torch.allclose(off.score(feats), on.score(feats), atol=1e-4)
 

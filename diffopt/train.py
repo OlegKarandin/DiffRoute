@@ -292,7 +292,8 @@ def main() -> None:
 
     pl_cfg = cfg.get("placement", {})
     lookahead: bool = pl_cfg.get("lookahead", True)
-    allocation_head = AllocationHead(lookahead=lookahead).to(device)
+    route_context: bool = pl_cfg.get("route_context", True)
+    allocation_head = AllocationHead(lookahead=lookahead, route_context=route_context).to(device)
 
     pipeline = DiffONetPipeline(
         topology=topology,
