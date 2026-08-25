@@ -319,7 +319,8 @@ def main() -> None:
     p_cfg = cfg["pipeline"]
 
     # Guard against non-default greedy_residual/lambda_waste before they are
-    # implemented (Steps 5 and 6 will remove these checks as each becomes real).
+    # implemented. greedy_residual half removed when arm 3/Step 5 lands;
+    # lambda_waste half removed when arm 4/Step 6 lands.
     if pl_cfg.get("greedy_residual", False) or p_cfg.get("lambda_waste", 0.0) != 0.0:
         raise ValueError(
             "greedy_residual/lambda_waste are not implemented yet in this build"
@@ -502,7 +503,7 @@ def main() -> None:
                 route_context,
                 pl_cfg.get("greedy_residual", False),
                 f"{p_cfg.get('lambda_waste', 0.0):.4f}",
-                "0.000000",
+                f"{0.0:.6f}",
                 f"{float('nan'):.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",
