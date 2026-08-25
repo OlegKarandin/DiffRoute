@@ -72,12 +72,17 @@ ARMS = [
     {"name": "alloc_dropout_0.1", "overrides": {"placement": {"alloc_dropout_p": 0.1}}},
     {"name": "alloc_dropout_0.3", "overrides": {"placement": {"alloc_dropout_p": 0.3}}},
     {"name": "no_lookahead", "overrides": {"placement": {"lookahead": False}}},
+    {"name": "no_route_context",      "overrides": {"placement": {"route_context": False}}},
+    {"name": "greedy_residual",       "overrides": {"placement": {"greedy_residual": True}}},
+    {"name": "greedy_residual_waste", "overrides": {"placement": {"greedy_residual": True},
+                                                    "pipeline":  {"lambda_waste": 0.1}}},
 ]
 
 ARMS_BY_NAME: Dict[str, dict] = {arm["name"]: arm for arm in ARMS}
 
 CSV_FIELDNAMES = [
     "arm", "seed", "lambda_dev", "alloc_dropout_p", "lookahead",
+    "route_context", "greedy_residual", "lambda_waste",
     "hard_num_violated", "hard_num_devices", "hard_num_sites",
     "oracle_devices", "oracle_gap", "oracle_infeasible",
     "hard_worst_margin_db", "device_peak", "device_final", "device_plateaued",
@@ -249,6 +254,9 @@ def score(config_path: Path) -> dict:
         "lambda_dev": cfg["pipeline"]["lambda_dev"],
         "alloc_dropout_p": pl_cfg.get("alloc_dropout_p", 0.0),
         "lookahead": pl_cfg.get("lookahead", True),
+        "route_context": pl_cfg.get("route_context", True),
+        "greedy_residual": pl_cfg.get("greedy_residual", False),
+        "lambda_waste": cfg["pipeline"].get("lambda_waste", 0.0),
         "hard_num_violated": hard["hard_num_violated"],
         "hard_num_devices": hard["hard_num_devices"],
         "hard_num_sites": hard["hard_num_sites"],
