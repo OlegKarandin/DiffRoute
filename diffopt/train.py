@@ -317,6 +317,14 @@ def main() -> None:
 
     t_cfg = cfg["training"]
     p_cfg = cfg["pipeline"]
+
+    # Guard against non-default greedy_residual/lambda_waste before they are
+    # implemented (Steps 5 and 6 will remove these checks as each becomes real).
+    if pl_cfg.get("greedy_residual", False) or p_cfg.get("lambda_waste", 0.0) != 0.0:
+        raise ValueError(
+            "greedy_residual/lambda_waste are not implemented yet in this build"
+        )
+
     vlastelica_lambda: float = t_cfg["vlastelica_lambda"]
     lambda_min: float = t_cfg["vlastelica_lambda_min"]
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
@@ -382,6 +390,7 @@ def main() -> None:
             "tau", "vlastelica_lambda",
             "alloc_score_mean", "alloc_score_min", "alloc_score_max",
             "alloc_dropout_p", "lookahead",
+            "route_context", "greedy_residual", "lambda_waste", "waste_loss", "alloc_alpha",
             "ste_clamped_segments", "proxy_qot_rank_corr",
         ])
 
@@ -490,6 +499,11 @@ def main() -> None:
                 f"{score_max:.6f}",
                 f"{alloc_dropout_p:.3f}",
                 lookahead,
+                route_context,
+                pl_cfg.get("greedy_residual", False),
+                f"{p_cfg.get('lambda_waste', 0.0):.4f}",
+                "0.000000",
+                f"{float('nan'):.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",
             ])
