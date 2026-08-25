@@ -244,6 +244,7 @@ class _DummyAlloc:
         self.alloc_by_node = torch.zeros(1, n)
         self.alloc_by_node[0, 3] = a_value
         self.device_count = self.a.sum()
+        self.waste_cost = torch.zeros(())
         self.site_view = self.alloc_by_node.max(dim=0).values
         self.seg_gsnr_db = torch.full((1, 2), 30.0)
         self.seg_noise = torch.full((1, 2), 1.0e-3)
@@ -404,6 +405,7 @@ def _run_training(tmp_path, *, epochs: int = 1, scripted=None, monkeypatch=None,
             "num_violated": num_violated,
             "worst_margin_db": 0.0,
             "shortfalls": torch.zeros(1),
+            "waste_cost": 0.0,
         }
         return loss, metrics
 

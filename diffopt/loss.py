@@ -21,12 +21,15 @@ def compute_loss(
     margin_db: float = 0.5,
     lambda_dev: float = 1.0,
     lambda_cost: float = 0.01,
+    waste_cost: Optional[torch.Tensor] = None,
+    lambda_waste: float = 0.0,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the constrained training loss.
 
         L = sum_d lambda_d * relu(thr_d + delta - gsnr_d)
-          + lambda_dev  * sum_n sum_d a[d,n]
-          + lambda_cost * path_noise
+          + lambda_dev   * sum_n sum_d a[d,n]
+          + lambda_waste * waste_cost
+          + lambda_cost  * path_noise
 
     This replaces a weighted sum of three soft penalties in which feasibility
     competed with regenerator count on a fixed exchange rate. `lambda_dev`
@@ -83,6 +86,16 @@ def compute_loss(
                       scripts/calibrate_lambda_dev.py; do not hand-tune.
         lambda_cost:  Weight on the ASE-denominated path-noise regulariser. Not the
                       primary routing signal -- the STE in pipeline.forward supplies that.
+        waste_cost:   Scalar `AllocationOutputs.waste_cost` —
+                      sum_{d,k} a_priced[d,k] * relu(feature4[d,k]), live in
+                      the autograd graph but gradient-detached from
+                      n_next/routing per `AllocationHead.rollout`'s own
+                      docstring (only the priced allocation's own dependence
+                      on the score carries gradient). None (the default) is
+                      the "arm doesn't use this term" case; required
+                      whenever `lambda_waste != 0.0`.
+        lambda_waste: Weight on `waste_cost`. Default 0.0 is a true no-op —
+                      see `test_lambda_waste_defaults_to_no_op`.
 
     Returns:
         (total_loss, metrics_dict). `metrics["shortfalls"]` is a detached
@@ -133,9 +146,16 @@ def compute_loss(
     # (bare sum() returns int 0, and .item() below would then raise).
     path_noise_loss = sum(path_noise_costs.values(), torch.zeros((), device=device))
 
+    if lambda_waste != 0.0 and waste_cost is None:
+        raise ValueError(
+            "lambda_waste is non-zero but waste_cost was not provided"
+        )
+    waste_term = waste_cost if waste_cost is not None else torch.zeros((), device=device)
+
     total = (
         weighted_feasibility
         + lambda_dev * device_count
+        + lambda_waste * waste_term
         + lambda_cost * path_noise_loss
     )
 
@@ -143,6 +163,7 @@ def compute_loss(
         "feasibility_loss": feasibility_loss.item(),
         "weighted_feasibility_loss": weighted_feasibility.item(),
         "path_noise_loss": path_noise_loss.item(),
+        "waste_cost": float(waste_term.item()),
         # The soft (mean-field) device count. NOT tau-invariant the way the
         # old num_regen_soft was — sigmoid(score/tau) moves with tau even on
         # frozen scores — so this is a within-epoch diagnostic only. The

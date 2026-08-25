@@ -322,13 +322,6 @@ def main() -> None:
     t_cfg = cfg["training"]
     p_cfg = cfg["pipeline"]
 
-    # Guard against non-default lambda_waste before it is implemented.
-    # Removed when arm 4/Step 6 lands.
-    if p_cfg.get("lambda_waste", 0.0) != 0.0:
-        raise ValueError(
-            "lambda_waste is not implemented yet in this build"
-        )
-
     vlastelica_lambda: float = t_cfg["vlastelica_lambda"]
     lambda_min: float = t_cfg["vlastelica_lambda_min"]
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
@@ -424,12 +417,15 @@ def main() -> None:
                 margin_db=c_cfg["margin_db"],
                 lambda_dev=p_cfg["lambda_dev"],
                 lambda_cost=p_cfg["lambda_cost"],
+                waste_cost=alloc.waste_cost,
+                lambda_waste=p_cfg.get("lambda_waste", 0.0),
             )
 
             # Pre-step, like the state snapshots below — same row, same
             # parameters, not next epoch's already-updated ones.
             score_mean, score_min, score_max = alloc_score_stats(alloc, tau)
             device_loss = p_cfg["lambda_dev"] * metrics["device_count"]
+            waste_loss = p_cfg.get("lambda_waste", 0.0) * metrics["waste_cost"]
 
             # Snapshot the state the forward pass above (and therefore
             # `metrics` -- num_violated, device_count, worst_margin_db,
@@ -516,7 +512,7 @@ def main() -> None:
                 route_context,
                 pl_cfg.get("greedy_residual", False),
                 f"{p_cfg.get('lambda_waste', 0.0):.4f}",
-                f"{0.0:.6f}",
+                f"{waste_loss:.6f}",
                 f"{alpha_pre_step:.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",

@@ -172,7 +172,7 @@ class AllocationHead(nn.Module):
         tau: float = 1.0,
         hard: bool = False,
         dropout_p: float = 0.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Walk every demand's boundaries, vectorized across demands.
 
         Roughly J_max Python iterations per call (about 12 on
@@ -194,9 +194,16 @@ class AllocationHead(nn.Module):
                           decision. Ignored under .eval() and when hard.
 
         Returns:
-            (a_priced, a_physics), both (D, J-1). They differ only under
-            dropout: a_priced is what lambda_dev multiplies, a_physics is
-            what the combiner folds and what resets the carry.
+            (a_priced, a_physics, waste). a_priced/a_physics are both
+            (D, J-1) and differ only under dropout: a_priced is what
+            lambda_dev multiplies, a_physics is what the combiner folds and
+            what resets the carry. waste is a scalar,
+            sum_{d,k} a_priced[d,k] * relu(feature4[d,k]), masked by
+            cut_valid, gradient-detached from n_next/routing per this
+            module's carry-as-observation invariant (deviation 1 in the
+            task-6 brief: an undetached relu(feature4) would still carry
+            gradient into n_next even though the carry cd is already
+            detached, rewarding routing onto noisier next segments).
         """
         d, j = seg_noise.shape
         device = seg_noise.device
@@ -217,6 +224,7 @@ class AllocationHead(nn.Module):
         km_since = torch.zeros(d, dtype=dtype, device=device)
         km_done = torch.zeros(d, dtype=dtype, device=device)
         max_chunk = torch.zeros(d, dtype=dtype, device=device)
+        waste = torch.zeros((), dtype=dtype, device=device)
 
         priced_cols = []
         physics_cols = []
@@ -266,6 +274,8 @@ class AllocationHead(nn.Module):
                 a_k = torch.sigmoid(s / tau)
             a_k = a_k * cut_valid[:, k]
 
+            waste = waste + (a_k * F.relu(g_after - bar_db).detach()).sum()
+
             a_phys = a_k
             if use_dropout:
                 keep = (torch.rand_like(a_k) >= dropout_p).to(dtype)
@@ -288,9 +298,9 @@ class AllocationHead(nn.Module):
         self.last_max_chunk_noise = max_chunk.detach()
 
         if priced_cols:
-            return torch.stack(priced_cols, dim=1), torch.stack(physics_cols, dim=1)
+            return torch.stack(priced_cols, dim=1), torch.stack(physics_cols, dim=1), waste
         empty = torch.zeros(d, 0, dtype=dtype, device=device)
-        return empty, empty
+        return empty, empty, torch.zeros((), dtype=dtype, device=device)
 
 
 def total_device_cost(alloc_by_node: torch.Tensor) -> torch.Tensor:

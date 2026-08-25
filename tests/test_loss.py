@@ -70,6 +70,7 @@ def test_metrics_dict_has_the_keys_train_py_logs(simple_loss_inputs):
         "num_violated",
         "worst_margin_db",
         "shortfalls",
+        "waste_cost",
     ):
         assert key in metrics, f"missing metrics key: {key}"
 
@@ -290,3 +291,50 @@ def test_no_regen_probs_parameter_survives(simple_loss_inputs):
     assert "regen_probs" not in params
     assert "lambda_regen" not in params
     assert "regen_count_penalty" not in params
+
+
+# ---------------------------------------------------------------------------
+# Waste surcharge (arm 4, spec 5.3) — see task-6-brief.md section 9 test 8
+# ---------------------------------------------------------------------------
+
+def test_lambda_waste_defaults_to_no_op(simple_loss_inputs):
+    """With lambda_waste = 0.0 (the default) the returned total must be
+    BIT-IDENTICAL to the pre-change formula, regardless of what waste_cost
+    is — 0.0 * anything_finite is exactly +0.0 by IEEE-754, so the no-op case
+    must not depend on a branch that happens to skip the term."""
+    no_waste_args, _ = compute_loss(**simple_loss_inputs)
+
+    nonzero_waste_zero_weight, _ = compute_loss(
+        **simple_loss_inputs,
+        waste_cost=torch.tensor(123.456),
+        lambda_waste=0.0,
+    )
+
+    explicit_defaults, _ = compute_loss(
+        **simple_loss_inputs,
+        waste_cost=None,
+        lambda_waste=0.0,
+    )
+
+    assert torch.equal(no_waste_args, nonzero_waste_zero_weight)
+    assert torch.equal(no_waste_args, explicit_defaults)
+
+
+def test_lambda_waste_nonzero_without_waste_cost_raises(simple_loss_inputs):
+    """The only silent path is lambda_waste == 0.0 — a non-zero weight with
+    no waste_cost supplied must raise, not silently treat it as 0."""
+    inputs = dict(simple_loss_inputs)
+    inputs["lambda_waste"] = 1.0
+    with pytest.raises(ValueError):
+        compute_loss(**inputs)
+
+
+def test_lambda_waste_scales_the_waste_term(simple_loss_inputs):
+    inputs = dict(simple_loss_inputs)
+    inputs["lambda_waste"] = 2.0
+    inputs["waste_cost"] = torch.tensor(5.0)
+    with_waste, m = compute_loss(**inputs)
+    inputs["waste_cost"] = torch.tensor(0.0)
+    without_waste, _ = compute_loss(**inputs)
+    assert (with_waste - without_waste).item() == pytest.approx(10.0, rel=1e-6)
+    assert m["waste_cost"] == pytest.approx(5.0)
