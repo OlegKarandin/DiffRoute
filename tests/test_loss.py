@@ -338,3 +338,210 @@ def test_lambda_waste_scales_the_waste_term(simple_loss_inputs):
     without_waste, _ = compute_loss(**inputs)
     assert (with_waste - without_waste).item() == pytest.approx(10.0, rel=1e-6)
     assert m["waste_cost"] == pytest.approx(5.0)
+
+
+# ---------------------------------------------------------------------------
+# Augmented Lagrangian (spec 2026-08-31 sections 2.1 and 2.4)
+#
+# make_mod_config is a single 400 G format at a 20.0 dB threshold, so with
+# margin_db = 0.5 the bar is 20.5 dB and g = 20.5 - gsnr throughout.
+# ---------------------------------------------------------------------------
+
+def _one_demand_loss(gsnr_value, *, dual, penalty, rho=None, margin_db=0.5):
+    """compute_loss over a single demand, with every term but feasibility
+    switched off, returning (total, metrics, the gsnr leaf)."""
+    mod_cfg = make_mod_config()
+    gsnr = torch.tensor(gsnr_value, requires_grad=True)
+    total, metrics = compute_loss(
+        gsnr_preds={0: gsnr},
+        path_noise_costs={0: torch.tensor(0.0)},
+        demands=[Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)],
+        device_count=torch.zeros(()),
+        modulation_config=mod_cfg,
+        duals=torch.tensor([dual]),
+        margin_db=margin_db,
+        lambda_dev=0.0,
+        lambda_cost=0.0,
+        penalty=penalty,
+        rho=rho,
+    )
+    return total, metrics, gsnr
+
+
+def test_augmented_is_active_inside_the_feasible_region():
+    """The reason this change exists (spec 1.1).
+
+    A demand 0.2 dB INSIDE its bar contributes exactly zero force under the
+    hinge, no matter how large its dual — relu'(g) = 0 for g < 0 — so at an
+    optimum where every demand is feasible the only surviving force is
+    -lambda_dev, and no non-negative (lambda_dev, lambda_waste) makes that
+    optimum a stationary point. Under the augmented penalty the same demand
+    at lambda = 10, rho = 20 feels max(0, 10 + 20*(-0.2)) = 6.
+    """
+    hinge_total, _, hinge_gsnr = _one_demand_loss(20.7, dual=10.0, penalty="hinge")
+    hinge_total.backward()
+    assert hinge_gsnr.grad.item() == 0.0, "the defect: a satisfied demand pushes nothing"
+
+    aug_total, _, aug_gsnr = _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=20.0)
+    aug_total.backward()
+    assert aug_gsnr.grad.item() == pytest.approx(-6.0)
+
+
+def test_augmented_collapses_to_zero_past_the_band():
+    """What stops 346 slack demands summing into an over-buy bias, and what
+    disqualifies the softplus variant (spec 7): past g < -lambda/rho the
+    force is EXACTLY zero, not merely small."""
+    # lambda/rho = 10/20 = 0.5 dB, so g = -0.6 is outside the band.
+    total, _, gsnr = _one_demand_loss(21.1, dual=10.0, penalty="augmented", rho=20.0)
+    total.backward()
+    assert gsnr.grad.item() == 0.0
+
+
+def test_augmented_force_is_max_zero_lambda_plus_rho_g():
+    """The derivative in spec 2.1, by direct autograd, on the violated side."""
+    total, _, gsnr = _one_demand_loss(20.2, dual=10.0, penalty="augmented", rho=20.0)
+    total.backward()
+    # g = +0.3 -> lambda + rho*g = 16.0, and raising gsnr lowers the loss.
+    assert gsnr.grad.item() == pytest.approx(-16.0)
+
+
+def test_augmented_matches_the_hinge_force_on_the_bar():
+    """Continuity with today at g = 0: the augmented force is exactly lambda,
+    the value the hinge takes on its violated side."""
+    aug_total, _, aug_gsnr = _one_demand_loss(20.5, dual=10.0, penalty="augmented", rho=20.0)
+    aug_total.backward()
+    assert aug_gsnr.grad.item() == pytest.approx(-10.0)
+
+    hinge_total, _, hinge_gsnr = _one_demand_loss(20.4, dual=10.0, penalty="hinge")
+    hinge_total.backward()
+    assert hinge_gsnr.grad.item() == pytest.approx(-10.0)
+
+
+def test_augmented_term_value_matches_the_closed_form():
+    """(relu(lambda + rho*g)^2 - lambda^2) / (2*rho), including the negative
+    constant a comfortably-slack demand contributes — that constant is what
+    makes the term continuous at the kink."""
+    inside, m_inside, _ = _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=20.0)
+    # z = relu(10 + 20*(-0.2)) = 6 -> (36 - 100) / 40 = -1.6
+    assert inside.item() == pytest.approx(-1.6)
+    assert m_inside["weighted_feasibility_loss"] == pytest.approx(-1.6)
+
+    outside, _, _ = _one_demand_loss(21.1, dual=10.0, penalty="augmented", rho=20.0)
+    # z = relu(10 - 12) = 0 -> (0 - 100) / 40 = -2.5
+    assert outside.item() == pytest.approx(-2.5)
+
+
+def test_feasibility_loss_is_sum_relu_g_in_both_modes():
+    """Spec 2.4: the LOGGED diagnostic must stay comparable across arms, so
+    only the weighted term changes shape."""
+    mod_cfg = make_mod_config()
+    demands = [
+        Demand(id=0, src=0, dst=1, bitrate_gbps=400.0),
+        Demand(id=1, src=1, dst=2, bitrate_gbps=400.0),
+    ]
+    common = dict(
+        gsnr_preds={0: torch.tensor(18.0), 1: torch.tensor(25.0)},
+        path_noise_costs={0: torch.tensor(0.0), 1: torch.tensor(0.0)},
+        demands=demands,
+        device_count=torch.zeros(()),
+        modulation_config=mod_cfg,
+        duals=torch.tensor([10.0, 10.0]),
+        margin_db=0.5,
+        lambda_dev=0.0,
+        lambda_cost=0.0,
+    )
+    _, hinge_m = compute_loss(penalty="hinge", **common)
+    _, aug_m = compute_loss(penalty="augmented", rho=20.0, **common)
+    # bar = 20.5: relu(2.5) + relu(-4.5) = 2.5 in both modes.
+    assert hinge_m["feasibility_loss"] == pytest.approx(2.5)
+    assert aug_m["feasibility_loss"] == pytest.approx(2.5)
+
+
+def test_constraint_g_is_signed_and_detached():
+    """update_duals' augmented input. A slack demand's entry must be
+    NEGATIVE — that is the whole difference from `shortfalls`, and it is what
+    lets the dual fall on slack instead of ratcheting."""
+    mod_cfg = make_mod_config()
+    demands = [
+        Demand(id=0, src=0, dst=1, bitrate_gbps=400.0),
+        Demand(id=1, src=1, dst=2, bitrate_gbps=400.0),
+    ]
+    _, metrics = compute_loss(
+        gsnr_preds={0: torch.tensor(18.0), 1: torch.tensor(25.0)},
+        path_noise_costs={0: torch.tensor(0.0), 1: torch.tensor(0.0)},
+        demands=demands,
+        device_count=torch.zeros(()),
+        modulation_config=mod_cfg,
+        duals=torch.tensor([10.0, 10.0]),
+        margin_db=0.5,
+        lambda_dev=0.0,
+        lambda_cost=0.0,
+        penalty="augmented",
+        rho=20.0,
+    )
+    g = metrics["constraint_g"]
+    assert g.shape == (2,)
+    assert not g.requires_grad, "dual updates must not build a graph"
+    assert g[0].item() == pytest.approx(2.5)
+    assert g[1].item() == pytest.approx(-4.5)
+    # `shortfalls` stays one-sided, for hinge mode and the violated count.
+    assert metrics["shortfalls"][1].item() == pytest.approx(0.0)
+
+
+def test_constraint_g_is_returned_in_hinge_mode_too():
+    """It costs one subtraction and keeps the metrics dict one shape, so a
+    diagnostic reading it does not have to know which mode produced it."""
+    _, metrics, _ = _one_demand_loss(20.7, dual=10.0, penalty="hinge")
+    assert metrics["constraint_g"][0].item() == pytest.approx(-0.2)
+
+
+def test_augmented_without_rho_raises():
+    """Spec 3: never a silent fallback. Mirrors lambda_waste/waste_cost."""
+    with pytest.raises(ValueError, match="rho"):
+        _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=None)
+
+
+def test_non_positive_rho_raises():
+    with pytest.raises(ValueError, match="rho"):
+        _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=0.0)
+
+
+def test_unknown_penalty_raises():
+    with pytest.raises(ValueError, match="penalty"):
+        _one_demand_loss(20.7, dual=10.0, penalty="softplus")
+
+
+def test_hinge_mode_is_bit_identical_to_the_default(simple_loss_inputs):
+    """Regression guard. `penalty` defaults to hinge, and naming it
+    explicitly must change nothing — not the total, not a metric."""
+    default_total, default_m = compute_loss(**simple_loss_inputs)
+    explicit_total, explicit_m = compute_loss(penalty="hinge", **simple_loss_inputs)
+    assert torch.equal(default_total, explicit_total)
+    assert default_m["weighted_feasibility_loss"] == explicit_m["weighted_feasibility_loss"]
+    assert torch.equal(default_m["shortfalls"], explicit_m["shortfalls"])
+
+
+def test_augmented_dual_falls_on_slack_under_the_signed_update():
+    """Spec 2.2, on the UNCHANGED update_duals: signed g at step rho gives
+    lambda <- clamp(lambda + rho*g, 0, dual_max), which decreases on slack by
+    construction — the reason dual_decay becomes structurally unnecessary."""
+    updated = update_duals(torch.tensor([10.0]), torch.tensor([-0.2]),
+                           eta=20.0, dual_max=1000.0)
+    assert updated[0].item() == pytest.approx(6.0)
+
+
+def test_augmented_dual_rises_on_violation_and_respects_the_cap():
+    rising = update_duals(torch.tensor([10.0]), torch.tensor([0.5]),
+                          eta=20.0, dual_max=1000.0)
+    assert rising[0].item() == pytest.approx(20.0)
+    capped = update_duals(torch.tensor([990.0]), torch.tensor([5.0]),
+                          eta=20.0, dual_max=1000.0)
+    assert capped[0].item() == pytest.approx(1000.0)
+
+
+def test_augmented_dual_floors_at_zero_on_deep_slack():
+    """Complementary slackness: a demand that does not need the cut has its
+    price decay to 0, its force vanishes, and the cut sheds."""
+    updated = update_duals(torch.tensor([1.0]), torch.tensor([-10.0]),
+                           eta=20.0, dual_max=1000.0)
+    assert updated[0].item() == pytest.approx(0.0)

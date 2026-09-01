@@ -23,6 +23,8 @@ def compute_loss(
     lambda_cost: float = 0.01,
     waste_cost: Optional[torch.Tensor] = None,
     lambda_waste: float = 0.0,
+    penalty: str = "hinge",
+    rho: Optional[float] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the constrained training loss.
 
@@ -96,13 +98,69 @@ def compute_loss(
                       whenever `lambda_waste != 0.0`.
         lambda_waste: Weight on `waste_cost`. Default 0.0 is a true no-op —
                       see `test_lambda_waste_defaults_to_no_op`.
+        penalty:      "hinge" (the default and the shipped behaviour) or
+                      "augmented". The hinge prices feasibility with
+                      `dual_d * relu(g_d)`, whose derivative is
+                      `dual_d * 1{g_d > 0}` — exactly zero for a satisfied
+                      demand, no matter how large its dual. At an optimum
+                      every demand is satisfied AND the marginal cut is
+                      load-bearing, so the only surviving force on an
+                      allocation variable is `-lambda_dev`, and stationarity
+                      would require `lambda_dev = 0`. No non-negative
+                      (lambda_dev, lambda_waste) makes that optimum a
+                      stationary point; `lambda_waste` cancels out of the
+                      condition entirely. "augmented" is the canonical
+                      method of multipliers (Hestenes / Powell /
+                      Rockafellar): the term becomes
+                      `(relu(lambda_d + rho*g_d)^2 - lambda_d^2) / (2*rho)`
+                      on the SIGNED `g_d = bar_d - gsnr_d`, so the force is
+                      `max(0, lambda_d + rho*g_d)` — nonzero for a band of
+                      width `lambda_d/rho` dB INSIDE the feasible region,
+                      wider for demands whose duals grew, and EXACTLY zero
+                      past it. That last exactness is the point: a merely
+                      small force on 346 slack demands sums into systematic
+                      over-buy, which is why a softplus hinge was rejected.
+        rho:          Augmented-Lagrangian penalty coefficient, and ALSO the
+                      dual step: `update_duals` is called with `eta=rho` in
+                      that mode, which is gradient ascent on the dual
+                      function with a step the penalty's own curvature makes
+                      well-scaled. Required whenever `penalty="augmented"`
+                      and ignored otherwise; there is no default, because a
+                      guessed rho sets the band width. MEASURE it with
+                      `python -m scripts.calibrate_rho`; do not hand-tune.
 
     Returns:
         (total_loss, metrics_dict). `metrics["shortfalls"]` is a detached
         (num_demands,) tensor indexed by `Demand.id`, to be fed straight into
-        `update_duals` after the optimizer step.
+        `update_duals` after the optimizer step in HINGE mode.
+        `metrics["constraint_g"]` is the same tensor unclipped — the SIGNED
+        `bar_d - gsnr_d`, negative when the demand has headroom — and is what
+        `update_duals` consumes in AUGMENTED mode. Both are returned in both
+        modes, so the dict has one shape regardless of penalty.
     """
     device = duals.device
+
+    # Named errors, never a silent fallback — the same rule the
+    # lambda_waste/waste_cost pair below follows. A mistyped penalty that
+    # quietly ran the hinge would produce a plausible number measured
+    # against the wrong objective, and an unset rho would silently pick a
+    # band width nobody measured.
+    if penalty not in ("hinge", "augmented"):
+        raise ValueError(
+            f"unknown penalty {penalty!r}; expected 'hinge' or 'augmented'"
+        )
+    if penalty == "augmented":
+        if rho is None:
+            raise ValueError(
+                "penalty='augmented' requires rho — the penalty coefficient, "
+                "which is also the dual step. There is no default: measure it "
+                "with `python -m scripts.calibrate_rho`."
+            )
+        if rho <= 0.0:
+            raise ValueError(
+                f"rho must be > 0 under penalty='augmented' (it divides the "
+                f"penalty term and scales the dual step), got {rho}"
+            )
 
     # Start as zero tensors (not float 0) so the graph is valid even when
     # all demands are feasible and no shortfall terms are added.
@@ -110,6 +168,10 @@ def compute_loss(
     feasibility_loss = torch.zeros((), device=device)
     # Detached record for the dual update — deliberately not part of the graph.
     shortfalls = torch.zeros(duals.shape[0], device=device)
+    # The same quantity UNCLIPPED. `update_duals` needs the one-sided version
+    # under the hinge (a slack demand's violation is 0, not -3) and the signed
+    # one under the augmented penalty (where falling on slack is the point).
+    constraint_g = torch.zeros(duals.shape[0], device=device)
 
     num_infeasible = 0
     num_violated = 0
@@ -119,9 +181,23 @@ def compute_loss(
         threshold = modulation_config.required_snr_threshold(demand.bitrate_gbps)
         # The bar the constraint enforces is threshold + margin.
         bar_t = torch.tensor(threshold + margin_db, device=device, dtype=torch.float32)
-        shortfall = F.relu(bar_t - gsnr_preds[demand.id])
 
-        weighted_feasibility = weighted_feasibility + duals[demand.id] * shortfall
+        # SIGNED and live in the graph. The relu is taken separately below
+        # for the two consumers that genuinely want a one-sided quantity —
+        # the logged `feasibility_loss` and the hinge-mode dual record —
+        # because the augmented term needs `g` itself: carrying force while
+        # g < 0 is its entire purpose.
+        g = bar_t - gsnr_preds[demand.id]
+        shortfall = F.relu(g)
+
+        if penalty == "augmented":
+            z = F.relu(duals[demand.id] + rho * g)
+            weighted_feasibility = weighted_feasibility + (
+                (z * z - duals[demand.id] ** 2) / (2.0 * rho)
+            )
+        else:
+            weighted_feasibility = weighted_feasibility + duals[demand.id] * shortfall
+
         # Unweighted sum kept so the logged feasibility_loss column stays
         # comparable across epochs while the duals are deliberately
         # non-stationary.
@@ -129,6 +205,7 @@ def compute_loss(
 
         shortfall_value = shortfall.item()
         shortfalls[demand.id] = shortfall_value
+        constraint_g[demand.id] = g.item()
         if shortfall_value > 0:
             num_violated += 1
 
@@ -174,6 +251,7 @@ def compute_loss(
         "num_violated": num_violated,
         "worst_margin_db": worst_margin_db if demands else math.nan,
         "shortfalls": shortfalls,
+        "constraint_g": constraint_g,
     }
     return total, metrics
 
