@@ -545,3 +545,32 @@ def test_augmented_dual_floors_at_zero_on_deep_slack():
     updated = update_duals(torch.tensor([1.0]), torch.tensor([-10.0]),
                            eta=20.0, dual_max=1000.0)
     assert updated[0].item() == pytest.approx(0.0)
+
+
+def test_augmented_composed_seam_dual_dynamics_across_epochs():
+    """The seam no per-task review could see: real compute_loss feeding real
+    update_duals across epochs, at rho, the way train.py's loop actually
+    does it — each function above is only tested in isolation."""
+    mod_cfg = make_mod_config()
+    demands = [
+        Demand(id=0, src=0, dst=1, bitrate_gbps=400.0),  # violated: g = +1.0
+        Demand(id=1, src=1, dst=2, bitrate_gbps=400.0),  # deep slack: g = -4.5
+    ]
+    gsnr_preds = {0: torch.tensor(19.5), 1: torch.tensor(25.0)}
+    path_noise_costs = {0: torch.tensor(0.0), 1: torch.tensor(0.0)}
+    rho = 1.0
+    duals = torch.tensor([0.0, 0.0])
+    for epoch in range(3):
+        _, metrics = compute_loss(
+            gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs,
+            demands=demands, device_count=torch.zeros(()),
+            modulation_config=mod_cfg, duals=duals, margin_db=0.5,
+            lambda_dev=0.0, lambda_cost=0.0, penalty="augmented", rho=rho,
+        )
+        g = metrics["constraint_g"]
+        # force = max(0, lambda + rho*g); the slack demand's lambda is 0
+        # every epoch, so its force is exactly 0, not merely small.
+        assert max(0.0, duals[1].item() + rho * g[1].item()) == 0.0
+        duals = update_duals(duals, g, eta=rho, dual_max=1000.0)
+        assert duals[0].item() == pytest.approx(epoch + 1.0)  # ascends by rho*g=1.0/epoch
+        assert duals[1].item() == 0.0  # floored, never ratchets on slack

@@ -33,6 +33,10 @@ def compute_loss(
           + lambda_waste * waste_cost
           + lambda_cost  * path_noise
 
+    That feasibility term is the `penalty="hinge"` form only. Under
+    `penalty="augmented"` the first line is replaced by the squared term
+    described in the `penalty` arg's own docstring entry below.
+
     This replaces a weighted sum of three soft penalties in which feasibility
     competed with regenerator count on a fixed exchange rate. `lambda_dev`
     stays fixed; the duals rise until feasibility is bought, so regenerator
@@ -274,6 +278,23 @@ def update_duals(
     placement the router never reaches. Demands pinned at the cap are reported
     at the end of the run by `diffopt/train.py`, so a non-converging constraint
     surfaces as a named list rather than as silent oscillation.
+
+    This docstring describes the HINGE caller's contract: `diffopt/train.py`
+    calls this function with `shortfalls=metrics["shortfalls"]` (one-sided,
+    never negative) at `eta=c_cfg["dual_lr"]` when `penalty="hinge"`. Under
+    `penalty="augmented"`, the SAME call site instead passes
+    `shortfalls=metrics["constraint_g"]` — the SIGNED `bar_d - gsnr_d`,
+    negative on a slack demand — at `eta=rho`, the augmented penalty's own
+    coefficient (see `compute_loss`'s `rho` arg). The `shortfalls` parameter
+    name and the `torch.where(shortfalls > 0, ...)` condition below are
+    unchanged for both callers; under the augmented call, that condition
+    routes every non-violated entry — including `g == 0`, the fixed point of
+    spec §2.3 in
+    `docs/superpowers/specs/2026-08-31-augmented-lagrangian-design.md` — onto
+    the decay branch below, not just genuinely slack ones. That branch is a
+    no-op whenever `decay=0.0`, which is the shipped default (`dual_decay` is
+    not set in `constrained_stress.yaml`), so `g == 0` and `g < 0` both leave
+    the dual unchanged in that case; ascent still only happens on `g > 0`.
 
     `decay` (default 0.0, i.e. no decay — pure ratchet, the original
     behaviour) multiplicatively relaxes a dual by `(1 - decay)` on any epoch
