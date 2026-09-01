@@ -48,6 +48,26 @@ _BASE_CFG_FOR_CAL = yaml.safe_load(
 )
 _CAL = _BASE_CFG_FOR_CAL["pipeline"]["lambda_dev"]
 
+# Augmented-Lagrangian penalty coefficient, MEASURED on 2026-09-01 by
+#   python -m scripts.calibrate_rho --config configs/experiment/constrained_stress.yaml
+# device push 7.9842e+01, unit (linear, un-relu'd) feasibility push 7.3507e+02
+#   -> lambda* = lambda_dev / s = 0.108618
+#   -> rho = lambda* / 0.35 dB   = 0.310338      (ceiling 10*lambda* = 1.086182, not binding)
+# check 2 (20 epochs, hinge vs augmented):
+#   hinge     violated max=17 final=1 | last-10 violated max=2 zero_in=6/10 |
+#             gap min=0 final=0 | devices final=30 oracle=31 | lambda_max=10.214
+#   augmented rho=0.3103 violated max=31 final=0 | last-10 violated max=0
+#             zero_in=10/10 | gap min=0 final=0 | devices final=31 oracle=31 |
+#             lambda_max=0.019
+#
+# NOT swept and NOT inherited. Both companion calibrations denominate their
+# band in the hinge's gradient, which is exactly zero at the state this arm
+# is aimed at; this one measures the LINEAR signed constraint instead, whose
+# denominator sums over all 346 demands rather than the handful in the
+# relu's active set. Re-run the script if the physics, the topology,
+# lambda_dev or margin_db changes.
+RHO = 0.310338
+
 # Old arms tested `placement.gate` and `gate_dropout_p`, both deleted. The
 # three axes that matter now:
 #
@@ -106,6 +126,34 @@ ARMS = [
     {"name": "alloc_ste_tau30", "overrides": {
         "placement": {"alloc_ste": True},
         "training":  {"alloc_tau_start": 30.0, "alloc_tau_end": 30.0}}},
+    # Augmented Lagrangian (design spec 2026-08-31). The hinge's derivative
+    # is dual_d * 1{g_d > 0}, so a satisfied demand contributes EXACTLY zero
+    # upward force however large its dual. At an optimum every demand is
+    # satisfied and the marginal cut is load-bearing, leaving -lambda_dev as
+    # the only force: stationarity would require lambda_dev = 0, and
+    # lambda_waste cancels out of the condition entirely. That is why
+    # calibrate_lambda_waste.py — run correctly, finding the shipped 0.1 was
+    # 3.5x under-weight — improved sustained over-buy 75.3 -> 62.8 devices
+    # and still could not converge.
+    #
+    # max(0, lambda + rho*g) is nonzero over a lambda/rho-wide band INSIDE
+    # the feasible region and exactly zero past it, which gives the objective
+    # the fixed point (g* = 0, lambda* = lambda_dev / s) it currently lacks.
+    #
+    # dual_init drops to 0.0: at a nonzero starting lambda every slack demand
+    # would push up before any of them had ever been violated. The cold start
+    # is the intended dynamics — epoch 1 has the head at the oracle with
+    # nothing pushing up, lambda_dev sheds, one demand breaks, and that
+    # demand's lambda starts rising.
+    {"name": "al_ste_greedy", "overrides": {
+        "constraint": {"penalty": "augmented", "rho": RHO, "dual_init": 0.0},
+        "placement":  {"alloc_ste": True, "greedy_residual": True},
+        "training":   {"alloc_tau_end": 1.0}}},
+    # No-regression control for spec section 6: the same penalty change with
+    # nothing else moved, so a regression against `baseline` attributes to
+    # the penalty rather than to the STE or the residual.
+    {"name": "al_baseline", "overrides": {
+        "constraint": {"penalty": "augmented", "rho": RHO, "dual_init": 0.0}}},
 ]
 
 ARMS_BY_NAME: Dict[str, dict] = {arm["name"]: arm for arm in ARMS}
