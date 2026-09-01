@@ -536,3 +536,150 @@ def test_waste_gradient_pushes_a_wasteful_cut_down():
     waste_justified.backward()
     assert justified_head.net[-1].bias.grad is not None
     assert justified_head.net[-1].bias.grad.item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# alloc_ste: straight-through allocation decisions
+#
+# The arm exists because the mean-field relaxation and the deployed rollout
+# disagree about physics (spec 2.5), and that disagreement manufactures
+# VIOLATIONS the deployed network does not have. Measured on constrained_stress
+# at the oracle allocation (oracle_gap == 0, hard_num_violated == 0): the soft
+# pass reported 10 of 346 demands violated, all 10 feasible in the hard
+# rollout, and 100% of the feasibility force at that state came from them.
+# Under the STE the forward pass IS the deployed decision, so the two cannot
+# disagree; tau then only sets the slope of the backward surrogate.
+# ---------------------------------------------------------------------------
+
+def _four_segment_demand():
+    seg_db = torch.tensor([[12.0, 9.0, 20.0, 11.0]])
+    return (
+        db_to_linear_noise(seg_db),
+        torch.tensor([[300.0, 400.0, 500.0, 350.0]]),
+        torch.tensor([9.5]),
+        torch.tensor([4]),
+    )
+
+
+def test_alloc_ste_forward_equals_the_hard_decision():
+    """The whole contract: with the arm on, the differentiable pass takes the
+    SAME decisions the deployed rollout takes, so the carry it folds is the
+    exact chunk noise rather than a partition-weighted expectation."""
+    torch.manual_seed(0)
+    head = AllocationHead(alloc_ste=True)
+    with torch.no_grad():
+        head.net[-1].weight.normal_(std=2.0)   # make scores vary in sign
+        head.net[-1].bias.zero_()
+    seg_noise, seg_km, bar, nseg = _four_segment_demand()
+
+    a_ste, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, tau=1.0)
+    a_hard, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+
+    assert set(a_ste.detach().unique().tolist()) <= {0.0, 1.0}
+    assert torch.equal(a_ste.detach(), a_hard)
+    # ... and unlike the hard branch it is still attached to the graph.
+    assert a_ste.requires_grad
+    assert not a_hard.requires_grad
+
+
+def test_alloc_ste_backward_slope_is_the_sigmoid_surrogate():
+    """Forward is a step function, whose true derivative is 0 everywhere. If
+    the detach is written wrong the arm silently becomes a hard decision with
+    NO gradient, the head stops learning, and every downstream number still
+    looks plausible. Pin the surrogate: d a / d score == sigmoid'(s/tau)/tau.
+
+    At init the final layer is zero-weight with bias -3, so score == -3 on
+    every boundary regardless of features and d(score)/d(bias) == 1 exactly.
+    """
+    tau = 0.7
+    head = AllocationHead(alloc_ste=True)
+    seg_noise = db_to_linear_noise(torch.tensor([[12.0, 9.0, 20.0]]))
+    a, _, _ = head.rollout(
+        seg_noise, torch.tensor([[300.0, 400.0, 500.0]]),
+        torch.tensor([9.5]), torch.tensor([3]), tau=tau,
+    )
+    assert torch.equal(a.detach(), torch.zeros(1, 2))     # sign of -3
+
+    a.sum().backward()
+    sig = 1.0 / (1.0 + math.exp(3.0 / tau))
+    expected = 2 * sig * (1.0 - sig) / tau                # two valid boundaries
+    assert head.net[-1].bias.grad.item() == pytest.approx(expected, rel=1e-5)
+    assert expected > 0.0
+
+
+def test_alloc_ste_defaults_off_and_is_a_true_no_op():
+    """Master's numbers must stay reproducible: the default path is the
+    mean-field sigmoid, unchanged."""
+    head = AllocationHead()
+    assert head.alloc_ste is False
+    seg_noise = db_to_linear_noise(torch.tensor([[12.0, 9.0, 20.0]]))
+    a, _, _ = head.rollout(
+        seg_noise, torch.tensor([[300.0, 400.0, 500.0]]),
+        torch.tensor([9.5]), torch.tensor([3]), tau=0.8,
+    )
+    expected = 1.0 / (1.0 + math.exp(3.0 / 0.8))
+    assert torch.allclose(a, torch.full_like(a, expected), atol=1e-6)
+
+
+def test_alloc_ste_does_not_touch_the_hard_branch():
+    """hard_rollout is the DEPLOYED measurement and the selection key. It must
+    not move because an optimisation-side flag was flipped, or arms stop being
+    comparable to each other."""
+    torch.manual_seed(0)
+    plain = AllocationHead()
+    with torch.no_grad():
+        plain.net[-1].weight.normal_(std=2.0)
+        plain.net[-1].bias.zero_()
+    ste = AllocationHead(alloc_ste=True)
+    ste.load_state_dict(plain.state_dict())
+    seg_noise, seg_km, bar, nseg = _four_segment_demand()
+
+    a_plain, phys_plain, w_plain = plain.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    a_ste, phys_ste, w_ste = ste.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+
+    assert torch.equal(a_plain, a_ste)
+    assert torch.equal(phys_plain, phys_ste)
+    assert torch.equal(w_plain, w_ste)
+
+
+def test_alloc_ste_dropout_keeps_both_decisions_binary():
+    """Physics dropout zeroes a_physics, never the priced a. With the STE both
+    must stay in {0,1}: a fractional a_physics would put a partial carry reset
+    back into the fold, which is the exact defect this arm removes."""
+    torch.manual_seed(0)
+    head = AllocationHead(alloc_ste=True)
+    with torch.no_grad():
+        head.net[-1].weight.normal_(std=2.0)
+        head.net[-1].bias.fill_(1.0)          # push a healthy share positive
+    head.train()
+    seg_db = torch.rand(16, 6) * 30.0 - 5.0
+    a, a_phys, _ = head.rollout(
+        db_to_linear_noise(seg_db),
+        torch.rand(16, 6) * 400.0 + 1.0,
+        torch.full((16,), 9.5),
+        torch.full((16,), 6, dtype=torch.long),
+        tau=1.0, dropout_p=0.5,
+    )
+    assert set(a.detach().unique().tolist()) <= {0.0, 1.0}
+    assert set(a_phys.detach().unique().tolist()) <= {0.0, 1.0}
+    assert a_phys.sum() < a.sum()             # dropout actually dropped something
+
+
+def test_alloc_ste_composes_with_greedy_residual():
+    """The arm the sweep actually runs is alloc_ste + greedy_residual. Its
+    soft pass must equal its own hard rollout; combined with
+    test_greedy_residual_init_reproduces_the_oracle (which pins the hard
+    rollout to oracle_allocation bit for bit), that makes the DIFFERENTIABLE
+    pass reproduce the oracle at init -- the state the convergence
+    investigation cares about."""
+    torch.manual_seed(0)
+    head = AllocationHead(greedy_residual=True, alloc_ste=True)
+    seg_db = torch.rand(32, 6) * 30.0 - 5.0
+    seg_noise = db_to_linear_noise(seg_db)
+    seg_km = torch.rand(32, 6) * 400.0 + 1.0
+    bar = torch.rand(32) * 10.0 + 5.0
+    nseg = torch.randint(1, 7, (32,))
+
+    a_ste, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, tau=1.0)
+    a_hard, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    assert torch.equal(a_ste.detach(), a_hard)

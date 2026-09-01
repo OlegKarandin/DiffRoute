@@ -76,13 +76,43 @@ ARMS = [
     {"name": "greedy_residual",       "overrides": {"placement": {"greedy_residual": True}}},
     {"name": "greedy_residual_waste", "overrides": {"placement": {"greedy_residual": True},
                                                     "pipeline":  {"lambda_waste": 0.1}}},
+    # alloc_ste: the training forward pass takes the DEPLOYED decision, so the
+    # relaxation and hard_rollout cannot disagree about who is feasible.
+    # Measured at an allocation with oracle_gap == 0, the un-STE'd soft pass
+    # called 10 of 346 demands violated -- all 10 feasible when deployed -- and
+    # those phantoms carried 100% of the feasibility force, 9.7x the combined
+    # lambda_dev + lambda_waste shed. alloc_tau_end is pinned to
+    # alloc_tau_start because under the STE tau only scales the backward
+    # surrogate; train.py warns if an alloc_ste config leaves it annealing.
+    {"name": "alloc_ste", "overrides": {"placement": {"alloc_ste": True},
+                                        "training":  {"alloc_tau_end": 1.0}}},
+    {"name": "alloc_ste_greedy", "overrides": {"placement": {"alloc_ste": True,
+                                                             "greedy_residual": True},
+                                               "training":  {"alloc_tau_end": 1.0}}},
+    # Plain alloc_ste at tau=1.0 collapsed: TRUE scores ran to +110 (measured by
+    # intercepting head.score, NOT by alloc_score_stats -- that diagnostic
+    # inverts a = sigmoid(s/tau) and is invalid when a is 0/1), the surrogate
+    # slope hit exactly 0 on all 4844 boundaries, and the head sat at 1564
+    # devices vs an oracle of 33 with no gradient left to shed.
+    #
+    # Under the STE tau sets the WIDTH OF THE LIVE GRADIENT WINDOW in score
+    # units, nothing else -- the forward decision is a sign test. So it wants
+    # to be LARGE enough to span the score range the head traverses, the
+    # opposite of the anneal's original job. tau=30 puts s=+110 at s/tau=3.7,
+    # where sigmoid' is still ~0.024. tau=10 brackets it from below.
+    {"name": "alloc_ste_tau10", "overrides": {
+        "placement": {"alloc_ste": True},
+        "training":  {"alloc_tau_start": 10.0, "alloc_tau_end": 10.0}}},
+    {"name": "alloc_ste_tau30", "overrides": {
+        "placement": {"alloc_ste": True},
+        "training":  {"alloc_tau_start": 30.0, "alloc_tau_end": 30.0}}},
 ]
 
 ARMS_BY_NAME: Dict[str, dict] = {arm["name"]: arm for arm in ARMS}
 
 CSV_FIELDNAMES = [
     "arm", "seed", "lambda_dev", "alloc_dropout_p", "lookahead",
-    "route_context", "greedy_residual", "lambda_waste",
+    "route_context", "greedy_residual", "lambda_waste", "alloc_ste",
     "hard_num_violated", "hard_num_devices", "hard_num_sites",
     "oracle_devices", "oracle_gap", "oracle_infeasible",
     "hard_worst_margin_db", "device_peak", "device_final", "device_plateaued",
@@ -257,6 +287,7 @@ def score(config_path: Path) -> dict:
         "route_context": pl_cfg.get("route_context", True),
         "greedy_residual": pl_cfg.get("greedy_residual", False),
         "lambda_waste": cfg["pipeline"].get("lambda_waste", 0.0),
+        "alloc_ste": pl_cfg.get("alloc_ste", False),
         "hard_num_violated": hard["hard_num_violated"],
         "hard_num_devices": hard["hard_num_devices"],
         "hard_num_sites": hard["hard_num_sites"],

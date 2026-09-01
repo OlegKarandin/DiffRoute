@@ -295,8 +295,31 @@ def main() -> None:
     lookahead: bool = pl_cfg.get("lookahead", True)
     route_context: bool = pl_cfg.get("route_context", True)
     greedy_residual: bool = pl_cfg.get("greedy_residual", False)
+    alloc_ste: bool = pl_cfg.get("alloc_ste", False)
+    # Under the STE, tau has no forward job left — the forward decision is the
+    # deployed one — so the anneal only sharpens the backward surrogate, and
+    # sharpening it starves every boundary whose score is not already near 0.
+    # The arm therefore pins alloc_tau_end to alloc_tau_start. Warn rather than
+    # override: a config is the record of what a run actually did, and silently
+    # rewriting one is how an arm stops meaning what its name says.
+    # cfg["training"] rather than t_cfg: that alias is not bound until later
+    # in this function, and binding it early here would leave two names for
+    # one dict in the same scope.
+    _tau_start = cfg["training"]["alloc_tau_start"]
+    _tau_end = cfg["training"]["alloc_tau_end"]
+    if alloc_ste and _tau_end != _tau_start:
+        print(
+            f"WARNING: placement.alloc_ste is on but alloc_tau_start "
+            f"({_tau_start}) != alloc_tau_end ({_tau_end}). "
+            f"Under the STE tau only scales the "
+            f"backward surrogate sigmoid'(s/tau)/tau, so annealing it "
+            f"concentrates gradient onto near-zero scores and starves the "
+            f"rest of the head. Pin alloc_tau_end to alloc_tau_start unless "
+            f"you are deliberately measuring that."
+        )
     allocation_head = AllocationHead(
-        lookahead=lookahead, route_context=route_context, greedy_residual=greedy_residual
+        lookahead=lookahead, route_context=route_context,
+        greedy_residual=greedy_residual, alloc_ste=alloc_ste,
     ).to(device)
 
     pipeline = DiffONetPipeline(

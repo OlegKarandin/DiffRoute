@@ -87,12 +87,14 @@ class AllocationHead(nn.Module):
         lookahead: bool = True,
         route_context: bool = True,
         greedy_residual: bool = False,
+        alloc_ste: bool = False,
         init_bias: float = -3.0,
     ) -> None:
         super().__init__()
         self.lookahead = lookahead
         self.route_context = route_context
         self.greedy_residual = greedy_residual
+        self.alloc_ste = alloc_ste
         if greedy_residual and not lookahead:
             raise ValueError(
                 "greedy_residual needs feature 4, which lookahead=False masks"
@@ -186,6 +188,9 @@ class AllocationHead(nn.Module):
             num_segments: (D,) long, each in [1, J].
             tau:          sharpness of sigmoid(score / tau). Passed per call,
                           never stored — same rule as pipeline.forward's.
+                          Under `alloc_ste` it no longer affects the forward
+                          value at all, only the slope of the backward
+                          surrogate.
             hard:         deterministic decisions a_k = 1 if score_k > 0.
                           NOT a threshold on the soft pass: under hard
                           decisions the carry c is the EXACT chunk noise, so
@@ -273,6 +278,29 @@ class AllocationHead(nn.Module):
 
             if hard:
                 a_k = (s > 0).to(dtype)
+            elif self.alloc_ste:
+                # Straight-through. The FORWARD value is the deployed decision,
+                # so this pass folds the exact chunk noise instead of a
+                # partition-weighted expectation; the BACKWARD pass keeps
+                # sigmoid'(s/tau)/tau, so the head still learns.
+                #
+                # Without it the relaxation and hard_rollout disagree about
+                # which demands are feasible, and the duals price violations
+                # the deployed network does not have. Measured on
+                # constrained_stress at an allocation with oracle_gap == 0 and
+                # hard_num_violated == 0: 10 of 346 demands read as violated in
+                # the soft pass, every one feasible in the hard rollout, and
+                # those 10 carried 100% of the feasibility force -- 9.7x the
+                # combined lambda_dev + lambda_waste shed. Annealing tau made
+                # it worse (13 phantoms at tau=0.3), because a cut that is
+                # barely needed has score ~ 0 and sigmoid(0/tau) == 0.5 at
+                # EVERY temperature.
+                #
+                # tau keeps only its backward role here, so the anneal has no
+                # forward job left; the arm pins alloc_tau_end to
+                # alloc_tau_start and train.py warns when it is not pinned.
+                a_soft = torch.sigmoid(s / tau)
+                a_k = a_soft + ((s > 0).to(dtype) - a_soft).detach()
             else:
                 a_k = torch.sigmoid(s / tau)
             a_k = a_k * cut_valid[:, k]

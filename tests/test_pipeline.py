@@ -102,12 +102,12 @@ def make_hub_topology() -> Topology:
 # Pipeline factory
 # ---------------------------------------------------------------------------
 
-def make_pipeline(topology: Topology) -> DiffONetPipeline:
+def make_pipeline(topology: Topology, *, alloc_ste: bool = False) -> DiffONetPipeline:
     qot_model = SpanAttentionQoT(max_spans=60)
     segment_combiner = SegmentCombiner()  # stateless and parameter-free
     # The head is amortized over route-local features, so it takes no
     # topology argument — unlike the (num_nodes,) logit vector it replaces.
-    allocation_head = AllocationHead()
+    allocation_head = AllocationHead(alloc_ste=alloc_ste)
     return DiffONetPipeline(
         topology=topology,
         qot_model=qot_model,
@@ -1327,3 +1327,106 @@ def test_spearman_returns_nan_on_constant_input():
     b = torch.tensor([1.0, 2.0, 3.0, 4.0])
     assert math.isnan(_spearman(a, b))
     assert math.isnan(_spearman(b, a))
+
+
+# ---------------------------------------------------------------------------
+# alloc_ste at the pipeline level
+# ---------------------------------------------------------------------------
+
+def test_alloc_ste_training_pass_matches_the_hard_rollout():
+    """The load-bearing property of the arm.
+
+    Without the STE the training relaxation and the deployed rollout disagree
+    about physics by construction -- that is what
+    test_hard_alloc_is_not_a_threshold_on_the_soft_pass asserts, and it is
+    correct for the mean-field pass. The consequence, measured on
+    constrained_stress at an allocation with oracle_gap == 0 and
+    hard_num_violated == 0, is that the soft pass reported 10 of 346 demands
+    VIOLATED -- every one of them feasible in the deployed network -- and the
+    duals priced all 10. With the STE the forward decision IS the deployed
+    decision, so per-demand GSNR must agree exactly and no such phantom can
+    exist.
+    """
+    torch.manual_seed(0)
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology, alloc_ste=True)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].weight.normal_(std=2.0)
+        pipeline.allocation_head.net[-1].bias.zero_()
+    demands = make_demands()
+
+    _, gsnr_soft, _, soft = pipeline(demands, tau=1.0)
+    with torch.no_grad():
+        _, gsnr_hard, _, hard = pipeline(demands, hard_alloc=True)
+
+    assert torch.equal(soft.a.detach(), hard.a)
+    assert soft.device_count.item() == pytest.approx(hard.device_count.item())
+    for did in hard.demand_ids:
+        assert gsnr_soft[did].item() == pytest.approx(gsnr_hard[did].item(), abs=1e-5)
+
+
+def test_alloc_ste_training_pass_still_carries_gradient():
+    """A straight-through estimator that loses its gradient is indistinguishable
+    from a working one at the forward values, and every downstream metric stays
+    plausible while the head stops learning. Pin it at the pipeline level, not
+    only at the rollout.
+
+    std=0.2 on the final layer, NOT the std=2.0 the forward-value tests use:
+    unnormalised features times std=2.0 put scores at |s| ~ 25, where
+    sigmoid'(s) underflows to exactly 0.0 in float32 and this test fails for a
+    reason that has nothing to do with the STE wiring. The real head's scores
+    span [-8.7, +2.9] (see constrained_stress.yaml's alloc_tau_end comment), so
+    std=0.2 measures the regime the arm actually runs in. The saturation limit
+    itself is pinned separately, below.
+    """
+    torch.manual_seed(0)
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology, alloc_ste=True)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].weight.normal_(std=0.2)
+        pipeline.allocation_head.net[-1].bias.zero_()
+
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0)
+    assert alloc.device_count.requires_grad
+    alloc.device_count.backward()
+
+    total = sum(
+        p.grad.abs().sum().item()
+        for p in pipeline.allocation_head.parameters()
+        if p.grad is not None
+    )
+    assert total > 0.0
+
+
+def test_alloc_ste_surrogate_vanishes_on_a_saturated_score():
+    """A KNOWN limit of the arm, pinned so it is a documented property rather
+    than a surprise mid-sweep.
+
+    The surrogate is sigmoid'(s/tau)/tau, which underflows to exactly 0 in
+    float32 past |s/tau| ~ 20. The forward decision stays correct, so nothing
+    downstream looks wrong -- the head just silently stops learning at that
+    boundary. This is the same failure the head already hit once from the other
+    direction (alloc_tau_end 0.1 drove |s/tau| past saturation and caused an
+    irreversible training collapse, recorded in constrained_stress.yaml).
+
+    train.py logs alloc_score_min/max every epoch; that is the column to watch
+    on any alloc_ste run. If this test ever starts FAILING, the surrogate was
+    changed to a clipped straight-through -- update the comment, do not just
+    delete the test.
+    """
+    torch.manual_seed(0)
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology, alloc_ste=True)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].weight.normal_(std=2.0)   # |s| ~ 25
+        pipeline.allocation_head.net[-1].bias.zero_()
+
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0)
+    assert set(alloc.a.detach().unique().tolist()) <= {0.0, 1.0}    # forward fine
+    alloc.device_count.backward()
+    total = sum(
+        p.grad.abs().sum().item()
+        for p in pipeline.allocation_head.parameters()
+        if p.grad is not None
+    )
+    assert total == 0.0                                             # backward gone

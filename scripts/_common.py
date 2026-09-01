@@ -164,6 +164,10 @@ def build_context(
         lookahead=pl_cfg.get("lookahead", True),
         route_context=pl_cfg.get("route_context", True),
         greedy_residual=pl_cfg.get("greedy_residual", False),
+        # Read from config here, not passed per call, precisely so a
+        # diagnostic cannot measure a different relaxation than the run it is
+        # describing — the drift class this whole module exists to prevent.
+        alloc_ste=pl_cfg.get("alloc_ste", False),
     ).to(device)
 
     pipeline = DiffONetPipeline(
