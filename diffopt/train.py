@@ -317,6 +317,31 @@ def main() -> None:
             f"rest of the head. Pin alloc_tau_end to alloc_tau_start unless "
             f"you are deliberately measuring that."
         )
+
+    # Constraint penalty mode. "hinge" (the default) is the shipped
+    # one-sided term; "augmented" is the method of multipliers, whose primal
+    # derivative max(0, lambda + rho*g) stays nonzero for a band of width
+    # lambda/rho INSIDE the feasible region — the only reason a satisfied
+    # demand can defend the cut that satisfies it. Validation of the
+    # (penalty, rho) pair lives in compute_loss, next to the
+    # lambda_waste/waste_cost check it mirrors, so a diagnostic script
+    # calling compute_loss directly gets the same named errors main() does.
+    penalty: str = c_cfg.get("penalty", "hinge")
+    rho = c_cfg.get("rho")
+    dual_decay: float = c_cfg.get("dual_decay", 0.0)
+    # Warn rather than override, same rule as the alloc_ste warning above.
+    if penalty == "augmented" and dual_decay != 0.0:
+        print(
+            f"WARNING: constraint.dual_decay ({dual_decay}) is set together "
+            f"with constraint.penalty=augmented. The augmented dual step "
+            f"lambda <- clamp(lambda + rho*g, 0, dual_max) already decreases "
+            f"on slack by construction, so a multiplicative relaxation on top "
+            f"of it is a second, unmodelled one. dual_decay was bolted on for "
+            f"open_followups.md item #3 to unstick a pure ratchet the "
+            f"augmented dual does not have. Set it to 0.0 unless you are "
+            f"deliberately measuring that."
+        )
+
     allocation_head = AllocationHead(
         lookahead=lookahead, route_context=route_context,
         greedy_residual=greedy_residual, alloc_ste=alloc_ste,
@@ -442,6 +467,8 @@ def main() -> None:
                 lambda_cost=p_cfg["lambda_cost"],
                 waste_cost=alloc.waste_cost,
                 lambda_waste=p_cfg.get("lambda_waste", 0.0),
+                penalty=penalty,
+                rho=rho,
             )
 
             # Pre-step, like the state snapshots below — same row, same
@@ -490,15 +517,30 @@ def main() -> None:
             opt_edge.step()
             opt_alloc.step()
 
-            # Dual ascent, using the same shortfalls the loss consumed this
-            # epoch. Runs AFTER the primal step so the duals price the
+            # Dual ascent, using the same constraint values the loss consumed
+            # this epoch. Runs AFTER the primal step so the duals price the
             # constraint violation the step was actually taken against.
+            #
+            # The two modes feed it different vectors on purpose. The hinge's
+            # dual must NOT fall on a slack demand — that demand's violation
+            # is 0, not a negative number — so it ascends on relu(g) at
+            # `dual_lr`. One-sidedness is correct there, and fatal only in the
+            # force the same relu carries to the head. The augmented dual is
+            # gradient ascent on the dual function, so it takes the SIGNED g
+            # at the SAME rho the penalty uses: that shared coefficient is
+            # what makes the step well-scaled against the penalty's own
+            # curvature, and what makes the pair's fixed point g* = 0,
+            # lambda* = lambda_dev / s.
+            if penalty == "augmented":
+                dual_signal, dual_eta = metrics["constraint_g"], rho
+            else:
+                dual_signal, dual_eta = metrics["shortfalls"], c_cfg["dual_lr"]
             duals = update_duals(
                 duals,
-                metrics["shortfalls"],
-                eta=c_cfg["dual_lr"],
+                dual_signal,
+                eta=dual_eta,
                 dual_max=c_cfg["dual_max"],
-                decay=c_cfg.get("dual_decay", 0.0),
+                decay=dual_decay,
             )
             lambda_max_observed = duals.max().item()
             num_at_cap = int((duals >= c_cfg["dual_max"]).sum().item())

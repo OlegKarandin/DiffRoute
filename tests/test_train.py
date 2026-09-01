@@ -295,6 +295,7 @@ def _write_config(
     epochs: int,
     lookahead: bool = True,
     alloc_dropout_p: float = 0.0,
+    constraint_overrides: dict | None = None,
 ) -> Path:
     config = {
         "topology": "unused",
@@ -340,13 +341,17 @@ def _write_config(
         "log_dir": str(tmp_path / "logs"),
         "checkpoint_dir": str(tmp_path / "checkpoints"),
     }
+    # Merged rather than replaced so a test naming only `penalty`/`rho` still
+    # gets the margin_db/dual_max the rest of main() reads.
+    if constraint_overrides:
+        config["constraint"].update(constraint_overrides)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.dump(config))
     return config_path
 
 
 def _run_training(tmp_path, *, epochs: int = 1, scripted=None, monkeypatch=None,
-                  **config_kwargs):
+                  loss_calls=None, **config_kwargs):
     """Drive the real diffopt.train.main() epoch loop.
 
     Only the numerically expensive / physics-derived pieces irrelevant to
@@ -357,6 +362,10 @@ def _run_training(tmp_path, *, epochs: int = 1, scripted=None, monkeypatch=None,
     allocation — so the default path still exercises the oracle. A test that
     needs a specific deployed allocation monkeypatches `train_mod.hard_rollout`
     itself, before calling this.
+
+    `loss_calls`, when given a list, receives the kwargs of every stubbed
+    compute_loss call — the only way to assert on what main() PASSED, as
+    opposed to what it did with the result.
 
     `scripted` is a per-epoch (total_loss, num_violated, device_count)
     sequence for the stubbed compute_loss.
@@ -392,6 +401,8 @@ def _run_training(tmp_path, *, epochs: int = 1, scripted=None, monkeypatch=None,
         return list(demands), []
 
     def fake_compute_loss(**kwargs):
+        if loss_calls is not None:
+            loss_calls.append(kwargs)
         idx = call_count["n"]
         call_count["n"] += 1
         loss_value, num_violated, device_count = scripted[idx]
@@ -405,6 +416,11 @@ def _run_training(tmp_path, *, epochs: int = 1, scripted=None, monkeypatch=None,
             "num_violated": num_violated,
             "worst_margin_db": 0.0,
             "shortfalls": torch.zeros(1),
+            # Sentinel, deliberately distinguishable from `shortfalls`: a
+            # test asserting WHICH vector reached update_duals has to be able
+            # to tell the two apart, and both are all-zeros in the real
+            # feasible case.
+            "constraint_g": torch.full((1,), -3.0),
             "waste_cost": 0.0,
         }
         return loss, metrics
@@ -737,3 +753,80 @@ def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch)
 
     with pytest.raises(ValueError, match="Preflight excluded every demand"):
         train_mod.main()
+
+
+# ---------------------------------------------------------------------------
+# Augmented-Lagrangian wiring (spec 2026-08-31 sections 2.2 and 3)
+# ---------------------------------------------------------------------------
+
+_AUGMENTED = {"penalty": "augmented", "rho": 20.0, "dual_init": 0.0}
+
+
+def _spy_on_update_duals(monkeypatch, seen: dict):
+    def spy(duals, signal, *, eta, dual_max, decay=0.0):
+        seen["signal"] = signal.clone()
+        seen["eta"] = eta
+        seen["decay"] = decay
+        return duals
+    monkeypatch.setattr(train_mod, "update_duals", spy)
+
+
+def test_hinge_is_the_default_when_the_config_names_no_penalty(tmp_path):
+    """constrained_stress.yaml and every other shipped config name no
+    penalty, and must keep running the hinge."""
+    calls = []
+    _run_training(tmp_path, loss_calls=calls)
+    assert calls[0]["penalty"] == "hinge"
+    assert calls[0]["rho"] is None
+
+
+def test_augmented_penalty_and_rho_reach_compute_loss(tmp_path):
+    calls = []
+    _run_training(tmp_path, loss_calls=calls, constraint_overrides=_AUGMENTED)
+    assert calls[0]["penalty"] == "augmented"
+    assert calls[0]["rho"] == pytest.approx(20.0)
+
+
+def test_augmented_dual_step_uses_signed_g_at_step_rho(tmp_path, monkeypatch):
+    """Spec 2.2. The augmented dual update is gradient ascent on the dual
+    function with step rho, so it takes the SIGNED constraint value and the
+    SAME rho the penalty uses — that shared coefficient is what makes the
+    step well-scaled against the penalty's curvature."""
+    seen = {}
+    _spy_on_update_duals(monkeypatch, seen)
+    _run_training(tmp_path, monkeypatch=monkeypatch, constraint_overrides=_AUGMENTED)
+    assert seen["eta"] == pytest.approx(20.0)
+    assert torch.equal(seen["signal"], torch.full((1,), -3.0))
+
+
+def test_hinge_dual_step_still_uses_shortfalls_at_dual_lr(tmp_path, monkeypatch):
+    """Regression guard: adding the augmented branch must not move the
+    default path off `shortfalls` / `dual_lr`. One-sidedness is CORRECT for
+    the hinge's dual — a slack demand's violation is 0, not a negative
+    number — and only wrong for the force the same relu carries to the
+    head."""
+    seen = {}
+    _spy_on_update_duals(monkeypatch, seen)
+    _run_training(tmp_path, monkeypatch=monkeypatch)
+    assert seen["eta"] == pytest.approx(1.0)          # constraint.dual_lr
+    assert torch.equal(seen["signal"], torch.zeros(1))
+
+
+def test_dual_decay_under_augmented_warns_rather_than_overriding(tmp_path, capsys):
+    """Mirrors the alloc_ste/alloc_tau_end warning: a config is the record of
+    what a run actually did, so main() says the setting is redundant instead
+    of silently rewriting it."""
+    _run_training(tmp_path, constraint_overrides={**_AUGMENTED, "dual_decay": 0.1})
+    out = capsys.readouterr().out
+    assert "dual_decay" in out
+    assert "augmented" in out
+
+
+def test_dual_decay_still_reaches_update_duals_under_augmented(tmp_path, monkeypatch):
+    """The warning is a warning. main() must not quietly zero the value it
+    warned about — that would make the printed config a lie."""
+    seen = {}
+    _spy_on_update_duals(monkeypatch, seen)
+    _run_training(tmp_path, monkeypatch=monkeypatch,
+                  constraint_overrides={**_AUGMENTED, "dual_decay": 0.1})
+    assert seen["decay"] == pytest.approx(0.1)
