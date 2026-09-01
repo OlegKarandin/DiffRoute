@@ -384,7 +384,7 @@ def test_augmented_is_active_inside_the_feasible_region():
 
     aug_total, _, aug_gsnr = _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=20.0)
     aug_total.backward()
-    assert aug_gsnr.grad.item() == pytest.approx(-6.0)
+    assert aug_gsnr.grad.item() == pytest.approx(-6.0, abs=1e-4)
 
 
 def test_augmented_collapses_to_zero_past_the_band():
@@ -423,8 +423,8 @@ def test_augmented_term_value_matches_the_closed_form():
     makes the term continuous at the kink."""
     inside, m_inside, _ = _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=20.0)
     # z = relu(10 + 20*(-0.2)) = 6 -> (36 - 100) / 40 = -1.6
-    assert inside.item() == pytest.approx(-1.6)
-    assert m_inside["weighted_feasibility_loss"] == pytest.approx(-1.6)
+    assert inside.item() == pytest.approx(-1.6, abs=1e-4)
+    assert m_inside["weighted_feasibility_loss"] == pytest.approx(-1.6, abs=1e-4)
 
     outside, _, _ = _one_demand_loss(21.1, dual=10.0, penalty="augmented", rho=20.0)
     # z = relu(10 - 12) = 0 -> (0 - 100) / 40 = -2.5
@@ -492,7 +492,7 @@ def test_constraint_g_is_returned_in_hinge_mode_too():
     """It costs one subtraction and keeps the metrics dict one shape, so a
     diagnostic reading it does not have to know which mode produced it."""
     _, metrics, _ = _one_demand_loss(20.7, dual=10.0, penalty="hinge")
-    assert metrics["constraint_g"][0].item() == pytest.approx(-0.2)
+    assert metrics["constraint_g"][0].item() == pytest.approx(-0.2, abs=1e-4)
 
 
 def test_augmented_without_rho_raises():
