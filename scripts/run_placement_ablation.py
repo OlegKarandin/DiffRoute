@@ -68,19 +68,15 @@ _CAL = _BASE_CFG_FOR_CAL["pipeline"]["lambda_dev"]
 # lambda_dev or margin_db changes.
 RHO = 0.310338
 
-# Old arms tested `placement.gate` and `gate_dropout_p`, both deleted. The
-# three axes that matter now:
+# Old arms tested `placement.gate` and `gate_dropout_p`, both deleted; a
+# later per-demand `alloc_dropout_p` arm was measured actively harmful under
+# this head (open_followups.md item #8) and removed too. The two axes that
+# matter now:
 #
 #   lambda_dev   the calibration is a measurement with a band, not a point.
 #                +/-3x brackets it, so the sweep answers "is the device count
 #                a property of need or of price?" — the question no
 #                lambda_regen value ever answered under L1-on-sites.
-#   alloc_dropout
-#                gate dropout existed to manufacture node-discriminating
-#                gradient a per-node mask could not otherwise get. A
-#                per-demand variable already has a demand-specific signal,
-#                so this arm tests whether the mechanism is still EARNING
-#                its variance rather than assuming it is.
 #   lookahead    feature 4 is what makes the greedy-optimal rule exactly
 #                representable. Turning it off should raise oracle_gap; if
 #                it does not, the head is not using the representability
@@ -89,19 +85,16 @@ ARMS = [
     {"name": "baseline", "overrides": {}},
     {"name": "lambda_dev_0.3x", "overrides": {"pipeline": {"lambda_dev": _CAL * 0.3}}},
     {"name": "lambda_dev_3x",   "overrides": {"pipeline": {"lambda_dev": _CAL * 3.0}}},
-    {"name": "alloc_dropout_0.1", "overrides": {"placement": {"alloc_dropout_p": 0.1}}},
-    {"name": "alloc_dropout_0.3", "overrides": {"placement": {"alloc_dropout_p": 0.3}}},
     {"name": "no_lookahead", "overrides": {"placement": {"lookahead": False}}},
     {"name": "no_route_context",      "overrides": {"placement": {"route_context": False}}},
     {"name": "greedy_residual",       "overrides": {"placement": {"greedy_residual": True}}},
-    {"name": "greedy_residual_waste", "overrides": {"placement": {"greedy_residual": True},
-                                                    "pipeline":  {"lambda_waste": 0.1}}},
     # alloc_ste: the training forward pass takes the DEPLOYED decision, so the
     # relaxation and hard_rollout cannot disagree about who is feasible.
     # Measured at an allocation with oracle_gap == 0, the un-STE'd soft pass
     # called 10 of 346 demands violated -- all 10 feasible when deployed -- and
     # those phantoms carried 100% of the feasibility force, 9.7x the combined
-    # lambda_dev + lambda_waste shed. alloc_tau_end is pinned to
+    # lambda_dev + lambda_waste shed (lambda_waste has since been removed —
+    # see open_followups.md item #8). alloc_tau_end is pinned to
     # alloc_tau_start because under the STE tau only scales the backward
     # surrogate; train.py warns if an alloc_ste config leaves it annealing.
     {"name": "alloc_ste", "overrides": {"placement": {"alloc_ste": True},
@@ -109,32 +102,14 @@ ARMS = [
     {"name": "alloc_ste_greedy", "overrides": {"placement": {"alloc_ste": True,
                                                              "greedy_residual": True},
                                                "training":  {"alloc_tau_end": 1.0}}},
-    # Plain alloc_ste at tau=1.0 collapsed: TRUE scores ran to +110 (measured by
-    # intercepting head.score, NOT by alloc_score_stats -- that diagnostic
-    # inverts a = sigmoid(s/tau) and is invalid when a is 0/1), the surrogate
-    # slope hit exactly 0 on all 4844 boundaries, and the head sat at 1564
-    # devices vs an oracle of 33 with no gradient left to shed.
-    #
-    # Under the STE tau sets the WIDTH OF THE LIVE GRADIENT WINDOW in score
-    # units, nothing else -- the forward decision is a sign test. So it wants
-    # to be LARGE enough to span the score range the head traverses, the
-    # opposite of the anneal's original job. tau=30 puts s=+110 at s/tau=3.7,
-    # where sigmoid' is still ~0.024. tau=10 brackets it from below.
-    {"name": "alloc_ste_tau10", "overrides": {
-        "placement": {"alloc_ste": True},
-        "training":  {"alloc_tau_start": 10.0, "alloc_tau_end": 10.0}}},
-    {"name": "alloc_ste_tau30", "overrides": {
-        "placement": {"alloc_ste": True},
-        "training":  {"alloc_tau_start": 30.0, "alloc_tau_end": 30.0}}},
     # Augmented Lagrangian (design spec 2026-08-31). The hinge's derivative
     # is dual_d * 1{g_d > 0}, so a satisfied demand contributes EXACTLY zero
     # upward force however large its dual. At an optimum every demand is
     # satisfied and the marginal cut is load-bearing, leaving -lambda_dev as
-    # the only force: stationarity would require lambda_dev = 0, and
-    # lambda_waste cancels out of the condition entirely. That is why
-    # calibrate_lambda_waste.py — run correctly, finding the shipped 0.1 was
-    # 3.5x under-weight — improved sustained over-buy 75.3 -> 62.8 devices
-    # and still could not converge.
+    # the only force: stationarity would require lambda_dev = 0. A correctly
+    # re-weighted lambda_waste improved sustained over-buy 75.3 -> 62.8
+    # devices and still could not converge — see open_followups.md item #8
+    # for why lambda_waste itself was later removed.
     #
     # max(0, lambda + rho*g) is nonzero over a lambda/rho-wide band INSIDE
     # the feasible region and exactly zero past it, which gives the objective
@@ -159,8 +134,8 @@ ARMS = [
 ARMS_BY_NAME: Dict[str, dict] = {arm["name"]: arm for arm in ARMS}
 
 CSV_FIELDNAMES = [
-    "arm", "seed", "lambda_dev", "alloc_dropout_p", "lookahead",
-    "route_context", "greedy_residual", "lambda_waste", "alloc_ste",
+    "arm", "seed", "lambda_dev", "lookahead",
+    "route_context", "greedy_residual", "alloc_ste",
     "hard_num_violated", "hard_num_devices", "hard_num_sites",
     "oracle_devices", "oracle_gap", "oracle_infeasible",
     "hard_worst_margin_db", "device_peak", "device_final", "device_plateaued",
@@ -330,11 +305,9 @@ def score(config_path: Path) -> dict:
 
     return {
         "lambda_dev": cfg["pipeline"]["lambda_dev"],
-        "alloc_dropout_p": pl_cfg.get("alloc_dropout_p", 0.0),
         "lookahead": pl_cfg.get("lookahead", True),
         "route_context": pl_cfg.get("route_context", True),
         "greedy_residual": pl_cfg.get("greedy_residual", False),
-        "lambda_waste": cfg["pipeline"].get("lambda_waste", 0.0),
         "alloc_ste": pl_cfg.get("alloc_ste", False),
         "hard_num_violated": hard["hard_num_violated"],
         "hard_num_devices": hard["hard_num_devices"],

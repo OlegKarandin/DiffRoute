@@ -22,7 +22,6 @@ def compute_loss(
     lambda_dev: float = 1.0,
     lambda_cost: float = 0.01,
     waste_cost: Optional[torch.Tensor] = None,
-    lambda_waste: float = 0.0,
     penalty: str = "hinge",
     rho: Optional[float] = None,
 ) -> Tuple[torch.Tensor, dict]:
@@ -30,7 +29,6 @@ def compute_loss(
 
         L = sum_d lambda_d * relu(thr_d + delta - gsnr_d)
           + lambda_dev   * sum_n sum_d a[d,n]
-          + lambda_waste * waste_cost
           + lambda_cost  * path_noise
 
     That feasibility term is the `penalty="hinge"` form only. Under
@@ -97,11 +95,9 @@ def compute_loss(
                       the autograd graph but gradient-detached from
                       n_next/routing per `AllocationHead.rollout`'s own
                       docstring (only the priced allocation's own dependence
-                      on the score carries gradient). None (the default) is
-                      the "arm doesn't use this term" case; required
-                      whenever `lambda_waste != 0.0`.
-        lambda_waste: Weight on `waste_cost`. Default 0.0 is a true no-op —
-                      see `test_lambda_waste_defaults_to_no_op`.
+                      on the score carries gradient). Logged as a diagnostic
+                      only — it carries no weight in the total loss. None
+                      (the default) logs 0.0.
         penalty:      "hinge" (the default and the shipped behaviour) or
                       "augmented". The hinge prices feasibility with
                       `dual_d * relu(g_d)`, whose derivative is
@@ -110,10 +106,7 @@ def compute_loss(
                       every demand is satisfied AND the marginal cut is
                       load-bearing, so the only surviving force on an
                       allocation variable is `-lambda_dev`, and stationarity
-                      would require `lambda_dev = 0`. No non-negative
-                      (lambda_dev, lambda_waste) makes that optimum a
-                      stationary point; `lambda_waste` cancels out of the
-                      condition entirely. "augmented" is the canonical
+                      would require `lambda_dev = 0`. "augmented" is the canonical
                       method of multipliers (Hestenes / Powell /
                       Rockafellar): the term becomes
                       `(relu(lambda_d + rho*g_d)^2 - lambda_d^2) / (2*rho)`
@@ -144,8 +137,7 @@ def compute_loss(
     """
     device = duals.device
 
-    # Named errors, never a silent fallback — the same rule the
-    # lambda_waste/waste_cost pair below follows. A mistyped penalty that
+    # Named errors, never a silent fallback. A mistyped penalty that
     # quietly ran the hinge would produce a plausible number measured
     # against the wrong objective, and an unset rho would silently pick a
     # band width nobody measured.
@@ -227,16 +219,11 @@ def compute_loss(
     # (bare sum() returns int 0, and .item() below would then raise).
     path_noise_loss = sum(path_noise_costs.values(), torch.zeros((), device=device))
 
-    if lambda_waste != 0.0 and waste_cost is None:
-        raise ValueError(
-            "lambda_waste is non-zero but waste_cost was not provided"
-        )
     waste_term = waste_cost if waste_cost is not None else torch.zeros((), device=device)
 
     total = (
         weighted_feasibility
         + lambda_dev * device_count
-        + lambda_waste * waste_term
         + lambda_cost * path_noise_loss
     )
 

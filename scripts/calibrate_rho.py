@@ -1,11 +1,11 @@
 """Calibrate `rho` by MEASURING the fixed point, not by sweeping.
 
-Third of the calibration scripts, and the one whose measurement the other two
-cannot make. `calibrate_lambda_dev.py` and `calibrate_lambda_waste.py` both
-denominate their band in the HINGE's gradient — and the hinge's gradient is
-exactly zero at the state this design is aimed at, an allocation where every
-demand is already feasible. A quantity that is identically zero where it
-matters cannot calibrate anything.
+The calibration script whose measurement `calibrate_lambda_dev.py` cannot
+make. `calibrate_lambda_dev.py` denominates its band in the HINGE's
+gradient — and the hinge's gradient is exactly zero at the state this design
+is aimed at, an allocation where every demand is already feasible. A
+quantity that is identically zero where it matters cannot calibrate
+anything.
 
 The augmented Lagrangian's fixed point (design spec section 2.3) supplies an
 anchor the hinge has no analogue for. At rest, on the marginal cut:
@@ -146,12 +146,11 @@ def _trial_run(
 ) -> List[Dict[str, float]]:
     """`diffopt.train.main`'s per-epoch step in miniature, at a trial mode.
 
-    Same construction and the same deliberate omissions as
-    calibrate_lambda_waste.py's `_trial_run` — both optimizers, zero_grad
-    before the forward, the tau/vlastelica schedules, hard_rollout PRE-step,
-    then backward/step, then the dual update on what the loss consumed.
-    Drops the CSV, the trajectory file, the checkpoint and its selection key.
-    Writes nothing.
+    Same construction and the same deliberate omissions as `diffopt.train`'s
+    own loop — both optimizers, zero_grad before the forward, the
+    tau/vlastelica schedules, hard_rollout PRE-step, then backward/step, then
+    the dual update on what the loss consumed. Drops the CSV, the trajectory
+    file, the checkpoint and its selection key. Writes nothing.
 
     The one addition that matters here: the dual update branches exactly the
     way train.py's does — `metrics["constraint_g"]` at step `rho` under
@@ -166,8 +165,6 @@ def _trial_run(
     MUTATES `ctx.pipeline` — rebuild the context before a second call.
     """
     c_cfg, p_cfg, t_cfg = cfg["constraint"], cfg["pipeline"], cfg["training"]
-    pl_cfg = cfg.get("placement", {})
-    alloc_dropout_p: float = pl_cfg.get("alloc_dropout_p", 0.0)
 
     ctx.pipeline.train()
     duals = torch.full((len(demands),), float(dual_init), device=ctx.device)
@@ -185,7 +182,6 @@ def _trial_run(
 
         path_noise_costs, gsnr_preds, _, alloc = ctx.pipeline(
             demands, tau=tau, lambda_=vlastelica_lambda,
-            alloc_dropout_p=alloc_dropout_p,
         )
         loss, metrics = compute_loss(
             gsnr_preds=gsnr_preds,
@@ -198,7 +194,6 @@ def _trial_run(
             lambda_dev=p_cfg["lambda_dev"],
             lambda_cost=p_cfg["lambda_cost"],
             waste_cost=alloc.waste_cost,
-            lambda_waste=p_cfg.get("lambda_waste", 0.0),
             penalty=penalty,
             rho=rho,
         )

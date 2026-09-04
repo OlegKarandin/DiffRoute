@@ -156,34 +156,6 @@ def test_lookahead_and_route_context_off_together_zero_all_five_columns():
     assert not torch.allclose(off.score(feats), on.score(feats), atol=1e-4)
 
 
-def test_dropout_splits_priced_from_physics():
-    """alloc_dropout zeroes the PHYSICS decision (manufacturing a violation
-    so the hinge reopens) while the PRICED decision stays undropped — else
-    the price per device fluctuates with the mask."""
-    head = AllocationHead()
-    head.train()
-    with torch.no_grad():
-        head.net[-1].bias.fill_(50.0)
-    a, a_phys, _ = head.rollout(
-        torch.rand(32, 5) + 0.01, torch.rand(32, 5) * 100,
-        torch.full((32,), 9.5), torch.full((32,), 5, dtype=torch.long),
-        dropout_p=1.0,
-    )
-    assert torch.equal(a_phys, torch.zeros(32, 4))
-    assert (a > 0.99).all()
-
-
-def test_dropout_is_inactive_in_eval_mode():
-    head = AllocationHead()
-    head.eval()
-    a, a_phys, _ = head.rollout(
-        torch.rand(8, 4) + 0.01, torch.rand(8, 4) * 100,
-        torch.full((8,), 9.5), torch.full((8,), 4, dtype=torch.long),
-        dropout_p=1.0,
-    )
-    assert torch.equal(a, a_phys)
-
-
 def test_total_device_cost_is_sum_over_nodes_then_demands():
     """Spec section 6 hook 2: cost aggregation lives in ONE named function,
     written sum_n sum_d, so Stage IV can slot max_s between the two sums."""
@@ -640,29 +612,6 @@ def test_alloc_ste_does_not_touch_the_hard_branch():
     assert torch.equal(a_plain, a_ste)
     assert torch.equal(phys_plain, phys_ste)
     assert torch.equal(w_plain, w_ste)
-
-
-def test_alloc_ste_dropout_keeps_both_decisions_binary():
-    """Physics dropout zeroes a_physics, never the priced a. With the STE both
-    must stay in {0,1}: a fractional a_physics would put a partial carry reset
-    back into the fold, which is the exact defect this arm removes."""
-    torch.manual_seed(0)
-    head = AllocationHead(alloc_ste=True)
-    with torch.no_grad():
-        head.net[-1].weight.normal_(std=2.0)
-        head.net[-1].bias.fill_(1.0)          # push a healthy share positive
-    head.train()
-    seg_db = torch.rand(16, 6) * 30.0 - 5.0
-    a, a_phys, _ = head.rollout(
-        db_to_linear_noise(seg_db),
-        torch.rand(16, 6) * 400.0 + 1.0,
-        torch.full((16,), 9.5),
-        torch.full((16,), 6, dtype=torch.long),
-        tau=1.0, dropout_p=0.5,
-    )
-    assert set(a.detach().unique().tolist()) <= {0.0, 1.0}
-    assert set(a_phys.detach().unique().tolist()) <= {0.0, 1.0}
-    assert a_phys.sum() < a.sum()             # dropout actually dropped something
 
 
 def test_alloc_ste_composes_with_greedy_residual():

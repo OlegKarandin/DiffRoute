@@ -74,13 +74,6 @@ pipeline:
   channel_loading_fraction: 0.5
 
 placement:
-  alloc_dropout_p: 0.0     # OFF by default. The old gate_dropout existed to
-                           # manufacture node-discriminating gradient that a
-                           # per-node mask could not otherwise get. A
-                           # per-demand variable already has a sharp,
-                           # demand-specific signal, so re-measure whether
-                           # this is still needed (Task 11's arm) rather
-                           # than assuming it.
   lookahead: true
 
 # Fixed traffic matrix. Regenerates deterministically from

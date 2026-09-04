@@ -154,50 +154,6 @@ def alloc_dead_fraction(alloc, tau: float, threshold: float = ALLOC_DEAD_SLOPE) 
     return float((slope < threshold).to(dtype=torch.float64).mean().item())
 
 
-def alloc_live_fraction_per_demand(
-    alloc, tau: float, *, num_duals: int, threshold: float = ALLOC_DEAD_SLOPE
-) -> torch.Tensor:
-    """(num_duals,) in [0, 1]: per demand, the fraction of its REAL boundaries
-    whose backward surrogate slope still exceeds `threshold`.
-
-    This is the anti-windup gate. `update_duals` integrates a demand's
-    violation whether or not the head can act on it, so during a saturated
-    stretch the dual accumulates pressure that has nowhere to go — measured at
-    19 to 50 while the head sat frozen (the `dual_max` cap of 1000 is nowhere
-    near binding, so the cap does not catch this). When the head becomes
-    responsive again the stored pressure discharges into a head that can
-    finally move, and drives it from "everything off" straight through zero to
-    "everything on" in 4-8 epochs, where it re-saturates on the far side.
-    Scaling the dual step by this fraction is conditional integration: the
-    integrator holds while the actuator is saturated.
-
-    PER-DEMAND rather than one global scalar, because the two differ exactly
-    where it matters: a demand whose own boundaries are dead must hold while a
-    demand with live boundaries keeps ascending. In the fully-frozen states
-    that motivated this they coincide, so the global version would look
-    correct on the measured runs and be wrong in between.
-
-    A demand with NO real boundary gets 1.0, not 0.0. The head has no lever on
-    such a demand at all, so there is no head saturation to protect against;
-    its dual's only useful audience is the ROUTER, which is not what
-    saturated. Gating it would suppress the one signal that can still fix it.
-    Same rule for a routing that produced no boundary anywhere.
-    """
-    gate = torch.ones(num_duals, dtype=torch.float32)
-    if alloc.score.numel() == 0:
-        return gate
-    gate = gate.to(alloc.score.device)
-    valid = alloc.boundary_node_ids >= 0
-    a = torch.sigmoid(alloc.score.to(dtype=torch.float64) / tau)
-    live = ((a * (1.0 - a) / tau >= threshold) & valid).sum(dim=1).to(torch.float64)
-    total = valid.sum(dim=1).to(torch.float64)
-    # clamp only guards the division; the where() picks 1.0 on those rows.
-    frac = torch.where(total > 0, live / total.clamp(min=1.0), torch.ones_like(total))
-    for row, demand_id in enumerate(alloc.demand_ids):
-        gate[demand_id] = frac[row].to(gate.dtype)
-    return gate
-
-
 def hard_rollout(
     pipeline,
     demands: List[Demand],
@@ -415,8 +371,7 @@ def main() -> None:
     # derivative max(0, lambda + rho*g) stays nonzero for a band of width
     # lambda/rho INSIDE the feasible region — the only reason a satisfied
     # demand can defend the cut that satisfies it. Validation of the
-    # (penalty, rho) pair lives in compute_loss, next to the
-    # lambda_waste/waste_cost check it mirrors, so a diagnostic script
+    # (penalty, rho) pair lives in compute_loss, so a diagnostic script
     # calling compute_loss directly gets the same named errors main() does.
     penalty: str = c_cfg.get("penalty", "hinge")
     rho = c_cfg.get("rho")
@@ -485,7 +440,6 @@ def main() -> None:
     # to prevent (AllocationHead's docstring, spec 2.2). `alpha_raw` under
     # greedy_residual is a scalar and is excluded on the same rule: it sets
     # WHERE the closed point sits, not how far the score can swing.
-    anti_windup: bool = bool(cfg["training"].get("alloc_anti_windup", False))
     alloc_weight_decay: float = float(cfg["training"].get("alloc_weight_decay", 0.0))
 
     # Optimizer for the allocation head. "adam" is the default and reproduces
@@ -574,13 +528,6 @@ def main() -> None:
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
     epochs: int = t_cfg["epochs_e2e"]
 
-    # Training-only masking of the PHYSICS allocation decisions. See
-    # DiffONetPipeline.forward's alloc_dropout_p docstring. OFF by default:
-    # the old gate_dropout manufactured node-discriminating gradient that a
-    # per-node mask could not otherwise get, and a per-demand variable
-    # already has a sharp, demand-specific signal.
-    alloc_dropout_p: float = pl_cfg.get("alloc_dropout_p", 0.0)
-
     log_dir = Path(cfg.get("log_dir", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = Path(cfg.get("checkpoint_dir", "checkpoints"))
@@ -633,8 +580,8 @@ def main() -> None:
             "lambda_max_observed", "num_at_cap",
             "tau", "vlastelica_lambda",
             "alloc_score_mean", "alloc_score_min", "alloc_score_max",
-            "alloc_dropout_p", "lookahead",
-            "route_context", "greedy_residual", "lambda_waste", "waste_loss", "alloc_alpha",
+            "lookahead",
+            "route_context", "greedy_residual", "waste_cost", "alloc_alpha",
             "ste_clamped_segments", "proxy_qot_rank_corr",
             "alloc_dead_frac", "alloc_grad_norm",
         ])
@@ -653,7 +600,6 @@ def main() -> None:
 
             path_noise_costs, gsnr_preds, _, alloc = pipeline(
                 demands, tau=tau, lambda_=vlastelica_lambda,
-                alloc_dropout_p=alloc_dropout_p,
             )
             loss, metrics = compute_loss(
                 gsnr_preds=gsnr_preds,
@@ -666,7 +612,6 @@ def main() -> None:
                 lambda_dev=p_cfg["lambda_dev"],
                 lambda_cost=p_cfg["lambda_cost"],
                 waste_cost=alloc.waste_cost,
-                lambda_waste=p_cfg.get("lambda_waste", 0.0),
                 penalty=penalty,
                 rho=rho,
             )
@@ -676,7 +621,6 @@ def main() -> None:
             score_mean, score_min, score_max = alloc_score_stats(alloc)
             dead_frac = alloc_dead_fraction(alloc, tau)
             device_loss = p_cfg["lambda_dev"] * metrics["device_count"]
-            waste_loss = p_cfg.get("lambda_waste", 0.0) * metrics["waste_cost"]
 
             # Snapshot the state the forward pass above (and therefore
             # `metrics` -- num_violated, device_count, worst_margin_db,
@@ -746,21 +690,10 @@ def main() -> None:
                 dual_signal, dual_eta = metrics["constraint_g"], rho
             else:
                 dual_signal, dual_eta = metrics["shortfalls"], c_cfg["dual_lr"]
-            # Anti-windup: hold each demand's integrator in proportion to how
-            # much of ITS head is still able to respond. Off by default — this
-            # changes the dual trajectory of every run that enables it.
-            # Scales the whole step, ascent and decay alike: conditional
-            # integration holds the integrator's VALUE while the actuator is
-            # saturated, rather than freezing one direction and not the other.
-            step_eta = dual_eta
-            if anti_windup:
-                step_eta = dual_eta * alloc_live_fraction_per_demand(
-                    alloc, tau, num_duals=duals.shape[0]
-                )
             duals = update_duals(
                 duals,
                 dual_signal,
-                eta=step_eta,
+                eta=dual_eta,
                 dual_max=c_cfg["dual_max"],
                 decay=dual_decay,
             )
@@ -794,12 +727,10 @@ def main() -> None:
                 f"{score_mean:.6f}",
                 f"{score_min:.6f}",
                 f"{score_max:.6f}",
-                f"{alloc_dropout_p:.3f}",
                 lookahead,
                 route_context,
                 greedy_residual,
-                f"{p_cfg.get('lambda_waste', 0.0):.4f}",
-                f"{waste_loss:.6f}",
+                f"{metrics['waste_cost']:.6f}",
                 f"{alpha_pre_step:.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",

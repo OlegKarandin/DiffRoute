@@ -192,7 +192,6 @@ class AllocationHead(nn.Module):
         *,
         tau: float = 1.0,
         hard: bool = False,
-        dropout_p: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Walk every demand's boundaries, vectorized across demands.
 
@@ -214,14 +213,11 @@ class AllocationHead(nn.Module):
                           NOT a threshold on the soft pass: under hard
                           decisions the carry c is the EXACT chunk noise, so
                           the rollout is self-consistent physics. Spec 2.5.
-            dropout_p:    training-only probability of zeroing a PHYSICS
-                          decision. Ignored under .eval() and when hard.
 
         Returns:
             (a_priced, a_physics, waste). a_priced/a_physics are both
-            (D, J-1) and differ only under dropout: a_priced is what
-            lambda_dev multiplies, a_physics is what the combiner folds and
-            what resets the carry. waste is a scalar,
+            (D, J-1): a_priced is what lambda_dev multiplies, a_physics is
+            what the combiner folds and what resets the carry. waste is a scalar,
             sum_{d,k} a_priced[d,k] * relu(feature4[d,k]), masked by
             cut_valid. Only the relu(feature4) COEFFICIENT is
             gradient-detached, per this module's carry-as-observation
@@ -256,7 +252,6 @@ class AllocationHead(nn.Module):
         priced_cols = []
         physics_cols = []
         score_cols = []
-        use_dropout = self.training and dropout_p > 0.0 and not hard
 
         for k in range(j - 1):
             c = c + n[:, k]
@@ -327,22 +322,14 @@ class AllocationHead(nn.Module):
 
             waste = waste + (a_k * F.relu(g_after - bar_db).detach()).sum()
 
-            a_phys = a_k
-            if use_dropout:
-                keep = (torch.rand_like(a_k) >= dropout_p).to(dtype)
-                a_phys = a_k * keep
-
             priced_cols.append(a_k)
-            physics_cols.append(a_phys)
+            physics_cols.append(a_k)
             score_cols.append(s.detach())
-            # The PHYSICS decision resets the carry: under dropout the demand
-            # really does lose that regenerator, which is the point — it puts
-            # the demand back in the hinge's active region, the only region
-            # that produces discriminating gradient. Feature 5 (km_since_cut)
+            # The PHYSICS decision resets the carry. Feature 5 (km_since_cut)
             # resets the same way: it is the distance since the PREVIOUS cut,
             # not since the start of the route, or it duplicates feature 6.
-            c = c * (1.0 - a_phys)
-            km_since = km_since * (1.0 - a_phys)
+            c = c * (1.0 - a_k)
+            km_since = km_since * (1.0 - a_k)
 
         if j >= 1:
             c = c + n[:, j - 1] if j > 1 else n[:, 0]

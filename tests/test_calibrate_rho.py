@@ -1,8 +1,8 @@
 """The rho calibration arithmetic, unit-tested away from a real run.
 
-Mirrors tests/test_calibrate_lambda_dev.py and
-tests/test_calibrate_lambda_waste.py, but the anchor is a different KIND of
-quantity. Those two set a force RATIO band; this one sets a DISTANCE. The
+Mirrors tests/test_calibrate_lambda_dev.py, but the anchor is a different
+KIND of quantity. That one sets a force RATIO band; this one sets a
+DISTANCE. The
 augmented Lagrangian has a fixed point the hinge does not — at rest a
 constrained demand sits exactly on its bar with price
 lambda* = lambda_dev / s — and rho converts that price into the width of the

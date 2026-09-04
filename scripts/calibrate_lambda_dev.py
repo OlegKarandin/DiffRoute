@@ -92,7 +92,7 @@ def _first_recruitment_epoch(
       * `zero_grad()` on both BEFORE the forward pass;
       * `tau` and `vlastelica_lambda` from the epoch's schedule
         (`schedule_at` replays `main()`'s anneal and decay exactly);
-      * the soft forward pass with `alloc_dropout_p` from `placement`;
+      * the soft forward pass;
       * `compute_loss` with the trial `lambda_dev` and the live duals;
       * `hard_rollout` PRE-STEP — before `backward()`/`step()`, exactly where
         `main()` measures it, so the reported epoch describes the parameters
@@ -110,15 +110,12 @@ def _first_recruitment_epoch(
     context.
     """
     c_cfg, p_cfg, t_cfg = cfg["constraint"], cfg["pipeline"], cfg["training"]
-    pl_cfg = cfg.get("placement", {})
-    alloc_dropout_p: float = pl_cfg.get("alloc_dropout_p", 0.0)
 
-    # build_context defaults to eval_mode=True; train.py never calls .eval(),
-    # and pipeline.forward ignores alloc_dropout_p under .eval(). Nothing in
-    # this pipeline is actually mode-dependent today (SpanAttentionQoT
-    # hardcodes dropout=0.0 and the head has no stochastic layer), but the
-    # trial run should be in the mode training runs in, not one step removed
-    # from it.
+    # build_context defaults to eval_mode=True; train.py never calls .eval().
+    # Nothing in this pipeline is actually mode-dependent today
+    # (SpanAttentionQoT hardcodes dropout=0.0 and the head has no stochastic
+    # layer), but the trial run should be in the mode training runs in, not
+    # one step removed from it.
     ctx.pipeline.train()
 
     # One dual per demand, persisted across epochs, uniform at lambda_0 —
@@ -142,7 +139,6 @@ def _first_recruitment_epoch(
 
         path_noise_costs, gsnr_preds, _, alloc = ctx.pipeline(
             demands, tau=tau, lambda_=vlastelica_lambda,
-            alloc_dropout_p=alloc_dropout_p,
         )
         loss, metrics = compute_loss(
             gsnr_preds=gsnr_preds,

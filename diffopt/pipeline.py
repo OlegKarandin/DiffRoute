@@ -438,7 +438,6 @@ class DiffONetPipeline(nn.Module):
         lambda_: float = 10.0,
         *,
         hard_alloc: bool = False,
-        alloc_dropout_p: float = 0.0,
     ) -> Tuple[
         Dict[int, torch.Tensor],   # path_noise_costs
         Dict[int, torch.Tensor],   # gsnr_preds
@@ -458,12 +457,6 @@ class DiffONetPipeline(nn.Module):
                       decisions the head's carry is the EXACT chunk noise, so
                       the rollout is self-consistent physics, and the two
                       passes are allowed to disagree. Spec 2.5.
-            alloc_dropout_p: Training-only probability of zeroing a PHYSICS
-                      allocation. `AllocationOutputs.a` (what lambda_dev
-                      prices) is always undropped; only `a_physics` (what the
-                      fold sees and what resets the carry) is masked, so the
-                      price per device does not fluctuate with the mask.
-                      Ignored under .eval() and whenever hard_alloc is set.
 
         Returns:
             path_noise_costs: demand_id → scalar accumulated-ASE-noise tensor, live in autograd graph.
@@ -780,7 +773,6 @@ class DiffONetPipeline(nn.Module):
                     num_segments,
                     tau=tau,
                     hard=hard_alloc,
-                    dropout_p=alloc_dropout_p,
                 )
 
             # Scatter a onto (D, N) so the cost is written sum_n sum_d and

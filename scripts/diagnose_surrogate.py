@@ -90,9 +90,9 @@ def main() -> None:
     original_forward = pipeline.forward
 
     def instrumented_forward(demands, *fwd_args, **fwd_kwargs):
-        # *args/**kwargs, not a copied signature: pipeline.forward grew
-        # hard_alloc/alloc_dropout_p, and a shim that pins the old parameter
-        # list would silently drop any kwarg added after it.
+        # *args/**kwargs, not a copied signature: pipeline.forward has grown
+        # keyword-only args before (e.g. hard_alloc), and a shim that pins
+        # the old parameter list would silently drop any kwarg added after it.
         path_noise_costs_out, gsnr_preds_out, path_inds_out, alloc_out = \
             original_forward(demands, *fwd_args, **fwd_kwargs)
 

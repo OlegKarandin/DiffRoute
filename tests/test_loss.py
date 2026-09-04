@@ -294,50 +294,24 @@ def test_no_regen_probs_parameter_survives(simple_loss_inputs):
 
 
 # ---------------------------------------------------------------------------
-# Waste surcharge (arm 4, spec 5.3) — see task-6-brief.md section 9 test 8
+# waste_cost — logged diagnostic only (open_followups.md item #8: the
+# lambda_waste weight was removed, since it improves the mean over-buy and
+# still loses on the metric that matters, the best feasible epoch).
 # ---------------------------------------------------------------------------
 
-def test_lambda_waste_defaults_to_no_op(simple_loss_inputs):
-    """With lambda_waste = 0.0 (the default) the returned total must be
-    BIT-IDENTICAL to the pre-change formula, regardless of what waste_cost
-    is — 0.0 * anything_finite is exactly +0.0 by IEEE-754, so the no-op case
-    must not depend on a branch that happens to skip the term."""
-    no_waste_args, _ = compute_loss(**simple_loss_inputs)
+def test_waste_cost_is_diagnostic_only_and_never_changes_the_total(simple_loss_inputs):
+    """waste_cost must be logged in metrics but must never move total,
+    whatever value it carries — it has no weight to multiply by anymore."""
+    no_waste_args, no_waste_metrics = compute_loss(**simple_loss_inputs)
 
-    nonzero_waste_zero_weight, _ = compute_loss(
+    with_waste, with_waste_metrics = compute_loss(
         **simple_loss_inputs,
         waste_cost=torch.tensor(123.456),
-        lambda_waste=0.0,
     )
 
-    explicit_defaults, _ = compute_loss(
-        **simple_loss_inputs,
-        waste_cost=None,
-        lambda_waste=0.0,
-    )
-
-    assert torch.equal(no_waste_args, nonzero_waste_zero_weight)
-    assert torch.equal(no_waste_args, explicit_defaults)
-
-
-def test_lambda_waste_nonzero_without_waste_cost_raises(simple_loss_inputs):
-    """The only silent path is lambda_waste == 0.0 — a non-zero weight with
-    no waste_cost supplied must raise, not silently treat it as 0."""
-    inputs = dict(simple_loss_inputs)
-    inputs["lambda_waste"] = 1.0
-    with pytest.raises(ValueError):
-        compute_loss(**inputs)
-
-
-def test_lambda_waste_scales_the_waste_term(simple_loss_inputs):
-    inputs = dict(simple_loss_inputs)
-    inputs["lambda_waste"] = 2.0
-    inputs["waste_cost"] = torch.tensor(5.0)
-    with_waste, m = compute_loss(**inputs)
-    inputs["waste_cost"] = torch.tensor(0.0)
-    without_waste, _ = compute_loss(**inputs)
-    assert (with_waste - without_waste).item() == pytest.approx(10.0, rel=1e-6)
-    assert m["waste_cost"] == pytest.approx(5.0)
+    assert torch.equal(no_waste_args, with_waste)
+    assert no_waste_metrics["waste_cost"] == pytest.approx(0.0)
+    assert with_waste_metrics["waste_cost"] == pytest.approx(123.456)
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +348,8 @@ def test_augmented_is_active_inside_the_feasible_region():
     A demand 0.2 dB INSIDE its bar contributes exactly zero force under the
     hinge, no matter how large its dual — relu'(g) = 0 for g < 0 — so at an
     optimum where every demand is feasible the only surviving force is
-    -lambda_dev, and no non-negative (lambda_dev, lambda_waste) makes that
-    optimum a stationary point. Under the augmented penalty the same demand
+    -lambda_dev, and stationarity would require lambda_dev = 0. Under the
+    augmented penalty the same demand
     at lambda = 10, rho = 20 feels max(0, 10 + 20*(-0.2)) = 6.
     """
     hinge_total, _, hinge_gsnr = _one_demand_loss(20.7, dual=10.0, penalty="hinge")
@@ -496,7 +470,7 @@ def test_constraint_g_is_returned_in_hinge_mode_too():
 
 
 def test_augmented_without_rho_raises():
-    """Spec 3: never a silent fallback. Mirrors lambda_waste/waste_cost."""
+    """Spec 3: never a silent fallback."""
     with pytest.raises(ValueError, match="rho"):
         _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=None)
 

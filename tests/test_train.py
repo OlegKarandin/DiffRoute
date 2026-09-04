@@ -263,7 +263,7 @@ class _DummyPipeline:
     """Stand-in for DiffONetPipeline. Its physics forward pass is irrelevant
     to checkpoint selection, so it is replaced with a cheap deterministic
     no-op satisfying main()'s call shape:
-    `pipeline(demands, tau=..., lambda_=..., alloc_dropout_p=...)` ->
+    `pipeline(demands, tau=..., lambda_=...)` ->
     (path_noise_costs, gsnr_preds, path_indicators, AllocationOutputs), plus
     the `hard_alloc=True` variant hard_rollout uses.
 
@@ -285,8 +285,7 @@ class _DummyPipeline:
     def to(self, device):
         return self
 
-    def __call__(self, demands, tau=1.0, lambda_=10.0, *, hard_alloc=False,
-                 alloc_dropout_p=0.0):
+    def __call__(self, demands, tau=1.0, lambda_=10.0, *, hard_alloc=False):
         alloc = _DummyAlloc(hard=hard_alloc)
         gsnr = {d.id: torch.tensor(_DummyPipeline.gsnr_value) for d in demands}
         noise = {d.id: torch.zeros(()) for d in demands}
@@ -298,7 +297,6 @@ def _write_config(
     *,
     epochs: int,
     lookahead: bool = True,
-    alloc_dropout_p: float = 0.0,
     constraint_overrides: dict | None = None,
     training_overrides: dict | None = None,
 ) -> Path:
@@ -328,7 +326,6 @@ def _write_config(
             "channel_loading_fraction": 0.5,
         },
         "placement": {
-            "alloc_dropout_p": alloc_dropout_p,
             "lookahead": lookahead,
         },
         "training": {
@@ -652,8 +649,8 @@ def test_log_csv_header_is_device_priced(tmp_path):
         "lambda_max_observed", "num_at_cap",
         "tau", "vlastelica_lambda",
         "alloc_score_mean", "alloc_score_min", "alloc_score_max",
-        "alloc_dropout_p", "lookahead",
-        "route_context", "greedy_residual", "lambda_waste", "waste_loss", "alloc_alpha",
+        "lookahead",
+        "route_context", "greedy_residual", "waste_cost", "alloc_alpha",
         "ste_clamped_segments", "proxy_qot_rank_corr",
         "alloc_dead_frac", "alloc_grad_norm",
     ]
@@ -1119,89 +1116,3 @@ def test_alloc_grad_clip_reaches_clip_grad_norm(tmp_path, monkeypatch):
 def test_negative_grad_clip_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="alloc_grad_clip"):
         _run_training(tmp_path, training_overrides={"alloc_grad_clip": -1.0})
-
-
-# ---------------------------------------------------------------------------
-# Anti-windup on the dual
-# ---------------------------------------------------------------------------
-#
-# While the head is saturated it cannot act, but `update_duals` keeps
-# integrating the violation regardless. Measured with weight decay on: the
-# dual climbs to 19-50 during a frozen stretch (the cap is 1000, nowhere near
-# binding), and when the spring restores responsiveness that stored pressure
-# discharges into a head that can suddenly move — driving it from "everything
-# off" through zero to "everything on" in 4-8 epochs, where it re-saturates:
-#
-#   s13 wd=0.1  dual 19.4  score_min -8.9 -> +2.1 -> +11.4 -> +19.6, 1566 devices
-#   s13 wd=1.0  dual 27.4  score_min -2.4 -> +0.3 ->  +7.1 -> +12.5, 1416 devices
-#   s42 wd=1.0  dual 10.9  (milder wind-up, milder overshoot: 0 -> 223 devices)
-#
-# Peak dual tracks overshoot severity, which is what integrator wind-up
-# predicts. The standard remedy is conditional integration: hold the
-# integrator while the actuator is saturated. `alloc_dead_fraction` is that
-# saturation signal.
-#
-# PER-DEMAND, not global: a demand whose own boundaries are all dead should
-# hold, while a demand with live boundaries keeps ascending. A demand with NO
-# real boundary is deliberately NOT held — the head has no lever there at all,
-# so the dual's only useful audience is the router, which is not saturated.
-# See docs/investigations/augmented_lagrangian_gate.md.
-
-
-def test_live_fraction_is_zero_for_a_demand_whose_boundaries_are_all_dead():
-    pipeline = _pinned_score_pipeline(-40.0, alloc_ste=True)
-    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
-
-    gate = train_mod.alloc_live_fraction_per_demand(alloc, 1.0, num_duals=3)
-
-    # Demands 0 (0->4) and 2 (1->4) each cross node 3 and have one boundary.
-    assert gate[0].item() == pytest.approx(0.0)
-    assert gate[2].item() == pytest.approx(0.0)
-
-
-def test_live_fraction_is_one_at_the_decision_boundary():
-    pipeline = _pinned_score_pipeline(0.0, alloc_ste=True)
-    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
-
-    gate = train_mod.alloc_live_fraction_per_demand(alloc, 1.0, num_duals=3)
-
-    assert gate.min().item() == pytest.approx(1.0)
-
-
-def test_a_demand_with_no_boundary_is_never_held():
-    """Demand 1 (0->3) terminates at the sole regen candidate, so it has no
-    boundary at all. The head cannot help it however unsaturated it is; only
-    the router can, and the router is not what saturated. Holding its dual
-    would suppress the one signal that can still fix it."""
-    pipeline = _pinned_score_pipeline(-40.0, alloc_ste=True)
-    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
-    assert not bool((alloc.boundary_node_ids[1] >= 0).any())   # really has none
-
-    gate = train_mod.alloc_live_fraction_per_demand(alloc, 1.0, num_duals=3)
-
-    assert gate[1].item() == pytest.approx(1.0)
-
-
-def test_anti_windup_is_off_by_default_and_eta_stays_a_plain_scalar(tmp_path, monkeypatch):
-    seen = {}
-    _spy_on_update_duals(monkeypatch, seen)
-    _run_training(tmp_path, monkeypatch=monkeypatch)
-
-    assert seen["eta"] == pytest.approx(1.0)          # constraint.dual_lr
-    assert not torch.is_tensor(seen["eta"])
-
-
-def test_anti_windup_scales_the_dual_step_by_the_live_fraction(tmp_path, monkeypatch):
-    """The stub pipeline's head sits at its init bias of -3.0, where
-    sigmoid'(-3)/1 = 0.045 — comfortably live — so a correctly wired gate
-    passes the step through at full strength rather than zeroing it. A gate
-    that always returned 0 would pass the 'off by default' test above and
-    silently disable the duals entirely."""
-    seen = {}
-    _spy_on_update_duals(monkeypatch, seen)
-    _run_training(tmp_path, monkeypatch=monkeypatch,
-                  training_overrides={"alloc_anti_windup": True})
-
-    assert torch.is_tensor(seen["eta"])
-    assert seen["eta"].shape == (1,)                  # one dual per demand
-    assert seen["eta"].item() == pytest.approx(1.0)   # live head -> full step
