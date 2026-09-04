@@ -83,6 +83,17 @@ pipeline:
 
 placement:
   lookahead: true
+  # STE: the training forward pass takes the DEPLOYED decision, so the
+  # relaxation and hard_rollout cannot disagree about who is feasible.
+  # Without it, measured at an allocation with oracle_gap == 0, the soft
+  # pass called 10 of 346 demands violated that were feasible when
+  # deployed, and those phantoms carried 100% of the feasibility force —
+  # score_runaway_and_dual_windup.md's saturated-open runaway (score to
+  # +229, dead_frac 1.0000) starts from exactly that phantom pressure.
+  # Required for the `4 vs 24 over-buy` result below to reproduce; without
+  # it this config saturates open (measured 2026-09-04: ~1560 devices vs
+  # an oracle of ~33). See training.alloc_tau_end for its other half.
+  alloc_ste: true
 
 # Fixed traffic matrix. Regenerates deterministically from
 # (topology, seed, scale, alpha) — nothing is committed; the checksum is
@@ -124,26 +135,43 @@ constraint:
 
 training:
   lr_edge_net: 1.0e-3
-  # The old lr_regen reasoning — "Adam moves a logit at most lr per epoch, so
-  # the total excursion is lr * epochs_e2e" — was about a single free logit
-  # per node. The allocation head is an MLP over route-local features, so no
-  # such excursion budget applies; this value is inherited, not re-derived.
-  lr_alloc: 2.0e-2         # was lr_regen
-  epochs_e2e: 60
+  # MEASURED, not the old lr_regen value: three SGD seeds (42/7/13) were
+  # swept post-optimizer-swap and 0.0005 was the arm that actually reached
+  # the documented over-buy figures (open_followups.md item #7/#8,
+  # optimizer_normalization_and_the_score_runaway.md). The shipped value
+  # here sat at 2.0e-2 for a long time — 40x too high — which was calibrated
+  # against Adam's normalised step, not SGD's proportional one; under SGD it
+  # produces either a frozen-closed or saturated-open run. See
+  # scripts/calibrate_lambda_dev.py if this needs re-deriving from scratch.
+  lr_alloc: 0.0005
+  # Grad-norm cap on the allocation head, matching the arm the numbers below
+  # were measured on (runs/sgd/long300_dmin0_s42). With a proportional (SGD)
+  # step, one transient gradient early in training can force the effective
+  # step down for the rest of the run; clipping caps that transient so a
+  # healthy lr survives the whole budget.
+  alloc_grad_clip: 100.0
+  # 300, not 60: Finding 7 measured the augmented penalty overtaking the
+  # (now-removed) hinge only past ~150 epochs — at 60 epochs hinge/Adam was
+  # still ahead. This was already the number open_followups.md called "the
+  # shipped budget", but no config actually carried it until now.
+  epochs_e2e: 300
   vlastelica_lambda: 10.0
   vlastelica_lambda_min: 1.0
   vlastelica_lambda_decay: 0.995
   alloc_tau_start: 1.0
-  # tau_end was 0.1 and the anneal ended at epoch 40. At tau = 0.1 the usable
-  # score band is |s| < 0.5 while the head's scores span [-8.7, +2.9], so a
-  # wrong-way excursion pushes the sigmoid past float32 saturation with zero
-  # gradient left to recover with — measured 2026-08-24 as an irreversible
-  # training collapse on this config. Nothing downstream needs a small tau:
-  # selection, oracle_gap and deployment all read hard_rollout, a sign test on
-  # the score. See .superpowers/.../task12-investigation.md (fix B).
-  alloc_tau_end: 0.3
+  # Pinned to alloc_tau_start, not annealed: under alloc_ste tau has no
+  # forward job left (the forward decision is the deployed one), so
+  # annealing it only sharpens the backward surrogate and starves every
+  # boundary whose score isn't already near 0 — train.py warns if an
+  # alloc_ste config leaves these two different. The original tau_end=0.1
+  # (pre-STE) reasoning — a small tau's usable score band, |s| < 0.5,
+  # sitting far inside the head's actual score range — is why annealing
+  # was dangerous in the first place; pinning at 1.0 sidesteps the anneal
+  # entirely rather than picking a safer endpoint.
+  alloc_tau_end: 1.0
   alloc_tau_anneal_start_epoch: 10
-  alloc_tau_anneal_end_epoch: 55   # companion to tau_end, same reasoning
+  alloc_tau_anneal_end_epoch: 55   # inert while tau_start == tau_end; kept
+                                    # so a future un-pin has a starting point
 
 # Checkpoint selection always reads the DEPLOYED allocation (train.py's
 # hard_rollout), never the relaxation the gradient flows through. There is
