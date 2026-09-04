@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -264,11 +264,17 @@ def update_duals(
     duals: torch.Tensor,
     shortfalls: torch.Tensor,
     *,
-    eta: float,
+    eta: Union[float, torch.Tensor],
     dual_max: float,
     decay: float = 0.0,
 ) -> torch.Tensor:
     """Dual ascent step: `lambda_d <- clamp(lambda_d + eta * shortfall_d, 0, lambda_max)`.
+
+    `eta` may be a scalar (every demand steps at the same rate — the shipped
+    behaviour) or a per-demand tensor broadcast elementwise over `shortfalls`.
+    The tensor form is what `diffopt.train`'s anti-windup gate passes: a
+    demand whose head is saturated steps at ~0 so its dual cannot accumulate
+    pressure nothing can act on. See `alloc_live_fraction_per_demand`.
 
     Returns a NEW tensor; `duals` is not mutated, so a caller can keep a
     previous epoch's vector for diagnostics.

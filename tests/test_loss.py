@@ -5,7 +5,7 @@ import torch
 import pytest
 
 from diffopt.demands import Demand
-from diffopt.loss import compute_loss
+from diffopt.loss import compute_loss, update_duals
 
 from tests.test_pipeline import make_mod_config
 

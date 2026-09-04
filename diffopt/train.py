@@ -70,40 +70,132 @@ def linear_anneal(
     return start + frac * (end - start)
 
 
-def alloc_score_stats(alloc, tau: float) -> Tuple[float, float, float]:
+def alloc_score_stats(alloc) -> Tuple[float, float, float]:
     """(mean, min, max) of the head's raw scores on REAL boundaries.
 
-    The scores themselves are not returned by the forward pass, but they are
-    exactly recoverable from the priced allocations that are: on a valid
-    boundary `a = sigmoid(score / tau)`, so `score = tau * logit(a)`. Padded
-    columns (`boundary_node_ids < 0`) hold exactly 0 and are excluded — a
-    padded cut is no cut, not a score of -inf.
+    Read straight off `alloc.score`, which the head publishes from the walk.
+    Padded columns (`boundary_node_ids < 0`) are excluded — a padded cut is
+    no cut, not a score of -inf.
 
-    `a` is clamped to float32's own representable range before the logit
-    (~[-87.3, +15.9] * tau in score units, asymmetric because a sigmoid
-    approaches 1 far sooner than it underflows to 0). The clamp is therefore
-    the point where the information is genuinely gone from `a`, not an
-    arbitrary readout window: a column pinned at either cap IS saturation,
-    which is what this diagnostic exists to make visible. Read a
-    score_min == score_max at a cap as "every boundary saturated", not as
-    "the head stopped discriminating between boundaries".
+    This used to invert the forward value instead: on a valid boundary
+    `a = sigmoid(score / tau)`, so `score = tau * logit(a)`, with `a` clamped
+    to float32's representable range first. That is exact while the head is
+    unsaturated, and reports nothing at all once it is not — which inverts
+    the diagnostic's whole purpose. Under `alloc_ste` the forward value is
+    EXACTLY 0 or 1, so every boundary pinned to a clamp on every epoch:
+    the augmented-Lagrangian gate's three `al_ste_greedy` seeds each logged
+    score_min == -87.336545 and score_max == +15.942385 for 60/60 epochs
+    while their true scores ran to -47, and score_mean was an exact affine
+    restatement of device_count. Worse, because the readout was `tau *`
+    clamp, a pinned column TRACKED THE TAU ANNEAL: `al_baseline`'s logged
+    "recovery" from -60.165 to -26.201 over epochs 30-55 is
+    `-87.336545 * tau` at tau = 0.6889 and 0.3000, not the head moving.
+    See docs/investigations/augmented_lagrangian_gate.md.
+
+    Takes no `tau`: a raw score does not depend on one.
 
     Returns (nan, nan, nan) when the routing produced no boundary at all.
     """
-    a = alloc.a.detach()
-    if a.numel() == 0:
+    scores = alloc.score
+    if scores.numel() == 0:
         return math.nan, math.nan, math.nan
     valid = alloc.boundary_node_ids >= 0
     if not bool(valid.any()):
         return math.nan, math.nan, math.nan
-    finfo = torch.finfo(torch.float32)
-    p = a[valid].to(dtype=torch.float64).clamp(finfo.tiny, 1.0 - finfo.eps)
-    scores = tau * (torch.log(p) - torch.log1p(-p))
+    scores = scores[valid].to(dtype=torch.float64)
     return (
         float(scores.mean().item()),
         float(scores.min().item()),
         float(scores.max().item()),
     )
+
+
+# Below this, sigmoid'(s/tau)/tau contributes nothing a shared parameter can
+# feel. At tau=1 it is |s| > ~14.5; the head's gradient is a SUM over
+# boundaries, and the live ones sit at up to 0.25, so a 1e-6 boundary is
+# eight orders of magnitude down on its own neighbours. Not a cliff — the
+# underflow is gradual — but a readable line on one side of which a boundary
+# has stopped participating.
+ALLOC_DEAD_SLOPE = 1e-6
+
+
+def alloc_dead_fraction(alloc, tau: float, threshold: float = ALLOC_DEAD_SLOPE) -> float:
+    """Fraction of REAL boundaries whose backward surrogate slope has vanished.
+
+    The slope is `sigmoid'(s/tau)/tau`, which is what the STE propagates and
+    also what the plain relaxation's chain rule carries. A boundary below
+    `threshold` cannot move the head's parameters however wrong its decision
+    is, and no dual-side quantity — not `lambda`, not `rho`, not a dual
+    floor — reaches it, because the gradient has already underflowed by the
+    time the price arrives.
+
+    This is the column `alloc_score_*` cannot be: saturation is not the same
+    as failure, and the two are not even correlated in the direction one
+    would guess. On the augmented-Lagrangian gate the seed with the CLEANEST
+    tail (al_ste_greedy 42, ten violation-free epochs) was the most saturated
+    run measured, at 71% of boundaries dead and true scores reaching -47,
+    while `al_baseline` at its selected epoch had 0% dead. What separates
+    them is where the s=0 crossing sits relative to the dead mass, which is
+    what `greedy_residual` pins and what a run without it has to find on its
+    own. See docs/investigations/augmented_lagrangian_gate.md.
+
+    Returns nan when the routing produced no boundary at all, matching
+    `alloc_score_stats`.
+    """
+    scores = alloc.score
+    if scores.numel() == 0:
+        return math.nan
+    valid = alloc.boundary_node_ids >= 0
+    if not bool(valid.any()):
+        return math.nan
+    s = scores[valid].to(dtype=torch.float64)
+    a = torch.sigmoid(s / tau)
+    slope = a * (1.0 - a) / tau
+    return float((slope < threshold).to(dtype=torch.float64).mean().item())
+
+
+def alloc_live_fraction_per_demand(
+    alloc, tau: float, *, num_duals: int, threshold: float = ALLOC_DEAD_SLOPE
+) -> torch.Tensor:
+    """(num_duals,) in [0, 1]: per demand, the fraction of its REAL boundaries
+    whose backward surrogate slope still exceeds `threshold`.
+
+    This is the anti-windup gate. `update_duals` integrates a demand's
+    violation whether or not the head can act on it, so during a saturated
+    stretch the dual accumulates pressure that has nowhere to go — measured at
+    19 to 50 while the head sat frozen (the `dual_max` cap of 1000 is nowhere
+    near binding, so the cap does not catch this). When the head becomes
+    responsive again the stored pressure discharges into a head that can
+    finally move, and drives it from "everything off" straight through zero to
+    "everything on" in 4-8 epochs, where it re-saturates on the far side.
+    Scaling the dual step by this fraction is conditional integration: the
+    integrator holds while the actuator is saturated.
+
+    PER-DEMAND rather than one global scalar, because the two differ exactly
+    where it matters: a demand whose own boundaries are dead must hold while a
+    demand with live boundaries keeps ascending. In the fully-frozen states
+    that motivated this they coincide, so the global version would look
+    correct on the measured runs and be wrong in between.
+
+    A demand with NO real boundary gets 1.0, not 0.0. The head has no lever on
+    such a demand at all, so there is no head saturation to protect against;
+    its dual's only useful audience is the ROUTER, which is not what
+    saturated. Gating it would suppress the one signal that can still fix it.
+    Same rule for a routing that produced no boundary anywhere.
+    """
+    gate = torch.ones(num_duals, dtype=torch.float32)
+    if alloc.score.numel() == 0:
+        return gate
+    gate = gate.to(alloc.score.device)
+    valid = alloc.boundary_node_ids >= 0
+    a = torch.sigmoid(alloc.score.to(dtype=torch.float64) / tau)
+    live = ((a * (1.0 - a) / tau >= threshold) & valid).sum(dim=1).to(torch.float64)
+    total = valid.sum(dim=1).to(torch.float64)
+    # clamp only guards the division; the where() picks 1.0 on those rows.
+    frac = torch.where(total > 0, live / total.clamp(min=1.0), torch.ones_like(total))
+    for row, demand_id in enumerate(alloc.demand_ids):
+        gate[demand_id] = frac[row].to(gate.dtype)
+    return gate
 
 
 def hard_rollout(
@@ -362,10 +454,117 @@ def main() -> None:
         [pipeline.edge_log_weight],
         lr=cfg["training"]["lr_edge_net"],
     )
-    opt_alloc = optim.Adam(
-        allocation_head.parameters(),
-        lr=cfg["training"]["lr_alloc"],
-    )
+    # `lambda_dev * device_count` is the only loss term that touches every
+    # boundary unconditionally, and d/ds of it is `lambda_dev *
+    # sigmoid'(s/tau)/tau` — strictly positive, so it pushes every score down
+    # every step and never changes sign. The only opposing force is
+    # `weighted_feasibility`, which under the augmented penalty reaches into
+    # the feasible region across a band of width `lambda/rho` — ZERO once the
+    # dual decays to 0, which complementary slackness is designed to make
+    # happen. Constant force, no restoring force: the head drifts until
+    # saturation stops it. Measured on constrained_stress with
+    # greedy_residual off: scores reach -329 (frozen closed, 0 devices) or
+    # +229 (frozen open, 1415 devices vs an oracle of 22), with
+    # alloc_dead_frac == 1.0000 for the last 50 of 150 epochs on all three
+    # seeds. Raising alloc_tau only moves the wall — the score range scales
+    # with tau, so |s|/tau lands at 71-110 whatever tau is.
+    # See docs/investigations/augmented_lagrangian_gate.md.
+    #
+    # DECOUPLED decay (AdamW), not Adam's coupled L2: the drift is sustained
+    # by Adam's own normalisation, which divides a consistently-signed
+    # gradient by its running magnitude and so delivers a full-size step
+    # however small that gradient has become. A coupled L2 term goes through
+    # that same division and is damped with everything else; a decoupled one
+    # is applied straight to the parameters.
+    #
+    # WEIGHTS ONLY. The score's reach lives in the weights — measured across
+    # checkpoints, `net.4.weight` grows from exactly 0 to 0.55-0.77 while
+    # `net.4.bias` stays at -2.87 from -3.0 — and decaying the bias toward 0
+    # would put every boundary at sigmoid(0) = 0.5, the "head opens
+    # everything at init" failure the zero-weight/negative-bias init exists
+    # to prevent (AllocationHead's docstring, spec 2.2). `alpha_raw` under
+    # greedy_residual is a scalar and is excluded on the same rule: it sets
+    # WHERE the closed point sits, not how far the score can swing.
+    anti_windup: bool = bool(cfg["training"].get("alloc_anti_windup", False))
+    alloc_weight_decay: float = float(cfg["training"].get("alloc_weight_decay", 0.0))
+
+    # Optimizer for the allocation head. "adam" is the default and reproduces
+    # every run recorded before this key existed.
+    #
+    # "sgd" exists because Adam's step is a RATIO, m/(sqrt(v)+eps). A
+    # consistently-signed gradient gives m ~ sqrt(v) and therefore a step of
+    # ~lr HOWEVER SMALL that gradient has become. Two measured consequences,
+    # both in docs/investigations/score_runaway_and_dual_windup.md:
+    #
+    #   1. It removes the brake the objective already has. The device force
+    #      per boundary is lambda_dev * sigmoid'(s/tau)/tau, which decays
+    #      5.0e-3 (s=-3) -> 5.0e-6 (s=-10) -> 3.0e-11 (s=-22). Under SGD the
+    #      step decays with it and the score asymptotes near the sigmoid's
+    #      own death; under Adam the drift runs at constant velocity to -131
+    #      (al_baseline) and -329 (alloc_ste at tau=3).
+    #   2. It strips the dual of authority over the head. A dual enters only
+    #      as a gradient SCALE, and Adam divides scale back out, so a dual
+    #      winding 0 -> 21.2 moves the head no faster than a dual of 0. That
+    #      is a rate-limited actuator driven by an integral controller, the
+    #      textbook wind-up setup this file's Finding 7 records.
+    #
+    # momentum stays 0: Adam's beta1 = 0.9 is a momentum term, and it is what
+    # makes the plant second-order. A second-order plant under the augmented
+    # dual's PI-shaped force is what oscillates in the first place.
+    alloc_optimizer: str = str(
+        cfg["training"].get("alloc_optimizer", "adam")
+    ).lower()
+    if alloc_optimizer not in ("adam", "sgd"):
+        raise ValueError(
+            f"unknown training.alloc_optimizer {alloc_optimizer!r}; "
+            f"expected 'adam' or 'sgd'"
+        )
+
+    # Max total grad-norm on the allocation head, 0.0 = off (the shipped
+    # default, and what every recorded run used). This exists for the same
+    # reason the SGD arm needs it: with a proportional step, one transient
+    # gradient at the epoch 7-9 whipsaw would force lr down far enough to
+    # make the remaining 50 epochs useless. Clipping caps the transient so a
+    # healthy lr survives the whole run. Under Adam it also stops that
+    # transient being burned into exp_avg_sq, which at beta2 = 0.999 over a
+    # 60-STEP run (one optimizer step per epoch) is never forgotten:
+    # measured sqrt(v_hat) = 52.1 against a live gradient of 0.15, an
+    # effective step of 4.1e-5.
+    alloc_grad_clip: float = float(cfg["training"].get("alloc_grad_clip", 0.0))
+    if alloc_grad_clip < 0.0:
+        raise ValueError(
+            f"training.alloc_grad_clip must be >= 0 (0.0 disables it), "
+            f"got {alloc_grad_clip}"
+        )
+
+    _alloc_params = list(allocation_head.parameters())
+    # WEIGHTS ONLY for decay under either optimizer, same rule and same
+    # reasoning as the AdamW branch documents below.
+    _decay_groups = [
+        {"params": [p for p in _alloc_params if p.ndim >= 2],
+         "weight_decay": alloc_weight_decay},
+        {"params": [p for p in _alloc_params if p.ndim < 2],
+         "weight_decay": 0.0},
+    ]
+    if alloc_optimizer == "sgd":
+        # Coupled weight_decay is correct here: SGD has no normalisation to
+        # decouple FROM, so torch's L2 term already lands straight on the
+        # parameter, which is exactly what AdamW's decoupling buys elsewhere.
+        opt_alloc = optim.SGD(
+            _decay_groups,
+            lr=cfg["training"]["lr_alloc"],
+            momentum=0.0,
+        )
+    elif alloc_weight_decay > 0.0:
+        opt_alloc = optim.AdamW(
+            _decay_groups,
+            lr=cfg["training"]["lr_alloc"],
+        )
+    else:
+        opt_alloc = optim.Adam(
+            allocation_head.parameters(),
+            lr=cfg["training"]["lr_alloc"],
+        )
 
     t_cfg = cfg["training"]
     p_cfg = cfg["pipeline"]
@@ -437,6 +636,7 @@ def main() -> None:
             "alloc_dropout_p", "lookahead",
             "route_context", "greedy_residual", "lambda_waste", "waste_loss", "alloc_alpha",
             "ste_clamped_segments", "proxy_qot_rank_corr",
+            "alloc_dead_frac", "alloc_grad_norm",
         ])
 
         for epoch in range(1, epochs + 1):
@@ -473,7 +673,8 @@ def main() -> None:
 
             # Pre-step, like the state snapshots below — same row, same
             # parameters, not next epoch's already-updated ones.
-            score_mean, score_min, score_max = alloc_score_stats(alloc, tau)
+            score_mean, score_min, score_max = alloc_score_stats(alloc)
+            dead_frac = alloc_dead_fraction(alloc, tau)
             device_loss = p_cfg["lambda_dev"] * metrics["device_count"]
             waste_loss = p_cfg.get("lambda_waste", 0.0) * metrics["waste_cost"]
 
@@ -514,6 +715,16 @@ def main() -> None:
             )
 
             loss.backward()
+            # Returned norm is measured BEFORE clipping, so the logged column
+            # reports what the loss actually produced rather than what
+            # survived the cap. max_norm=inf makes this a pure measurement
+            # when clipping is off, which is the default.
+            alloc_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    allocation_head.parameters(),
+                    alloc_grad_clip if alloc_grad_clip > 0.0 else float("inf"),
+                )
+            )
             opt_edge.step()
             opt_alloc.step()
 
@@ -535,10 +746,21 @@ def main() -> None:
                 dual_signal, dual_eta = metrics["constraint_g"], rho
             else:
                 dual_signal, dual_eta = metrics["shortfalls"], c_cfg["dual_lr"]
+            # Anti-windup: hold each demand's integrator in proportion to how
+            # much of ITS head is still able to respond. Off by default — this
+            # changes the dual trajectory of every run that enables it.
+            # Scales the whole step, ascent and decay alike: conditional
+            # integration holds the integrator's VALUE while the actuator is
+            # saturated, rather than freezing one direction and not the other.
+            step_eta = dual_eta
+            if anti_windup:
+                step_eta = dual_eta * alloc_live_fraction_per_demand(
+                    alloc, tau, num_duals=duals.shape[0]
+                )
             duals = update_duals(
                 duals,
                 dual_signal,
-                eta=dual_eta,
+                eta=step_eta,
                 dual_max=c_cfg["dual_max"],
                 decay=dual_decay,
             )
@@ -581,6 +803,8 @@ def main() -> None:
                 f"{alpha_pre_step:.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",
+                f"{dead_frac:.6f}",
+                f"{alloc_grad_norm:.6e}",
             ])
             f.flush()
 

@@ -71,8 +71,9 @@ def build_score_delta_grid(
     """~num_points evenly spaced deltas spanning [score_min, score_max], padded
     by margin_frac of the span on each side.
 
-    Degenerate case (span == 0, e.g. every boundary saturated the sigmoid, or
-    there were no boundaries at all so alloc_score_stats returned NaNs): falls
+    Degenerate case (span == 0, e.g. a head whose final layer is still
+    zero-weight so every boundary scores identically, or there were no
+    boundaries at all so alloc_score_stats returned NaNs): falls
     back to a fixed +-1.0 window around score_min (or around 0.0 if score_min
     itself is not finite) rather than returning a single-point or NaN grid,
     since a delta sweep with one point cannot locate a threshold crossing.
@@ -152,15 +153,20 @@ def main() -> None:
         delta_grid = parse_delta_grid(args.delta_grid)
     else:
         # A soft pass at the checkpoint's own tau, purely to recover the raw
-        # score range the deployed head produces on REAL boundaries — see
-        # alloc_score_stats's own docstring for why this is exactly
-        # recoverable from the priced allocations without the pipeline ever
-        # exposing scores directly.
+        # score range the deployed head produces on REAL boundaries.
+        #
+        # The grid this feeds is a sweep of the final-layer BIAS, so it has to
+        # span the true score range. alloc_score_stats used to invert
+        # a = sigmoid(s/tau) to get there, which is exact only while the head
+        # is unsaturated: on an alloc_ste checkpoint `a` is exactly 0/1 and
+        # every boundary read back as a float32 clamp, so the grid spanned
+        # +-87.3*tau regardless of where the head actually sat. It now reads
+        # alloc.score directly and the range is the real one.
         with torch.no_grad():
             _, _, _, soft_alloc = ctx.pipeline(
                 demands, tau=tau, lambda_=vlastelica_lambda, hard_alloc=False,
             )
-        _score_mean, score_min, score_max = alloc_score_stats(soft_alloc, tau)
+        _score_mean, score_min, score_max = alloc_score_stats(soft_alloc)
         delta_grid = build_score_delta_grid(
             score_min, score_max,
             num_points=args.grid_points, margin_frac=args.grid_margin_frac,

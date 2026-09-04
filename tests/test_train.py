@@ -241,6 +241,10 @@ class _DummyAlloc:
         a_value = 0.0 if hard else torch.sigmoid(torch.tensor(-3.0)).item()
         self.a = torch.full((1, 1), a_value)
         self.a_physics = self.a
+        # The raw score behind `a_value`, i.e. AllocationHead's own init
+        # bias. Carried explicitly for the same reason AllocationOutputs
+        # carries it: it is not recoverable from `a` once the head saturates.
+        self.score = torch.full((1, 1), -3.0)
         self.alloc_by_node = torch.zeros(1, n)
         self.alloc_by_node[0, 3] = a_value
         self.device_count = self.a.sum()
@@ -296,6 +300,7 @@ def _write_config(
     lookahead: bool = True,
     alloc_dropout_p: float = 0.0,
     constraint_overrides: dict | None = None,
+    training_overrides: dict | None = None,
 ) -> Path:
     config = {
         "topology": "unused",
@@ -345,6 +350,8 @@ def _write_config(
     # gets the margin_db/dual_max the rest of main() reads.
     if constraint_overrides:
         config["constraint"].update(constraint_overrides)
+    if training_overrides:
+        config["training"].update(training_overrides)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.dump(config))
     return config_path
@@ -648,6 +655,7 @@ def test_log_csv_header_is_device_priced(tmp_path):
         "alloc_dropout_p", "lookahead",
         "route_context", "greedy_residual", "lambda_waste", "waste_loss", "alloc_alpha",
         "ste_clamped_segments", "proxy_qot_rank_corr",
+        "alloc_dead_frac", "alloc_grad_norm",
     ]
 
 
@@ -830,3 +838,370 @@ def test_dual_decay_still_reaches_update_duals_under_augmented(tmp_path, monkeyp
     _run_training(tmp_path, monkeypatch=monkeypatch,
                   constraint_overrides={**_AUGMENTED, "dual_decay": 0.1})
     assert seen["decay"] == pytest.approx(0.1)
+
+
+# ---------------------------------------------------------------------------
+# alloc_score_stats — the head's raw scores
+# ---------------------------------------------------------------------------
+#
+# The column exists to make saturation visible (see its own docstring and the
+# CSV header comment in main()). Recovering the score by inverting the
+# sigmoid, `score = tau * logit(a)`, cannot do that under `alloc_ste`, where
+# the forward value `a` is EXACTLY 0 or 1 and the logit therefore pins to
+# float32's clamps on every boundary at every epoch. Measured on the shipped
+# augmented-Lagrangian gate runs (docs/investigations/augmented_lagrangian_gate.md):
+# all three `al_ste_greedy` seeds logged alloc_score_min == -87.336545 and
+# alloc_score_max == +15.942385 for 60/60 epochs, while the true scores ran to
+# -47 with 71% of boundaries below a 1e-6 backward slope. The score has to
+# come from the head, not from its own output.
+
+
+def _pinned_score_pipeline(score: float, *, alloc_ste: bool):
+    """A pipeline whose head returns `score` on every boundary.
+
+    Zero final-layer weights plus a constant bias make the score independent
+    of the features, so the expected value is exact rather than approximate.
+    """
+    pipeline = make_pipeline(make_hub_topology(), alloc_ste=alloc_ste)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].bias.fill_(score)
+    return pipeline
+
+
+def test_alloc_score_stats_reports_the_true_score_under_the_ste():
+    pipeline = _pinned_score_pipeline(-40.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+
+    mean, lo, hi = train_mod.alloc_score_stats(alloc)
+
+    assert mean == pytest.approx(-40.0, abs=1e-3)
+    assert lo == pytest.approx(-40.0, abs=1e-3)
+    assert hi == pytest.approx(-40.0, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# alloc_dead_fraction — how much of the head can still move
+# ---------------------------------------------------------------------------
+#
+# The score column says WHERE the head sits; this says whether it can still
+# get anywhere. Under the STE the backward pass keeps sigmoid'(s/tau)/tau,
+# and the head's parameters are SHARED across every boundary — so a boundary
+# whose slope has underflowed contributes nothing to the summed parameter
+# gradient no matter how badly it needs to move. That is the mechanism spec
+# section 8 names for the alloc_ste collapse ("the head opened everything
+# while lambda_dev could not reach it"), and no dual-side parameter reaches
+# it. Neither device_count nor the score range shows it directly: the gate's
+# CLEANEST seed (al_ste_greedy 42, a spotless 10-epoch tail) was also the
+# most saturated one measured, at 71% of boundaries below 1e-6.
+
+
+def test_dead_fraction_is_one_when_every_score_is_saturated():
+    pipeline = _pinned_score_pipeline(-40.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+
+    # sigmoid'(-40) ~ 4.2e-18, far under the 1e-6 threshold.
+    assert train_mod.alloc_dead_fraction(alloc, 1.0) == pytest.approx(1.0)
+
+
+def test_dead_fraction_is_zero_at_the_decision_boundary():
+    pipeline = _pinned_score_pipeline(0.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+
+    # sigmoid'(0) = 0.25, the largest slope the surrogate ever delivers.
+    assert train_mod.alloc_dead_fraction(alloc, 1.0) == pytest.approx(0.0)
+
+
+def test_dead_fraction_counts_only_real_boundaries():
+    """make_demands() is deliberately ragged — demand 1 (0->3) terminates at
+    the sole regen candidate and has NO boundary, so its padded column must
+    not be counted alive or dead. Half the (D, J-1) grid here is padding."""
+    pipeline = _pinned_score_pipeline(-40.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+
+    real = int((alloc.boundary_node_ids >= 0).sum())
+    assert real < alloc.score.numel()          # padding really is present
+    assert train_mod.alloc_dead_fraction(alloc, 1.0) == pytest.approx(1.0)
+
+
+def test_dead_fraction_sharpens_as_tau_anneals():
+    """tau scales the surrogate's slope, so annealing it kills boundaries the
+    head could still move at tau=1. This is the concrete cost behind main()'s
+    alloc_ste/alloc_tau_end warning, which today has no measured column."""
+    pipeline = _pinned_score_pipeline(-8.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+
+    assert train_mod.alloc_dead_fraction(alloc, 1.0) == pytest.approx(0.0)
+    assert train_mod.alloc_dead_fraction(alloc, 0.3) == pytest.approx(1.0)
+
+
+
+# ---------------------------------------------------------------------------
+# Weight decay on the allocation head
+# ---------------------------------------------------------------------------
+#
+# lambda_dev * device_count is the only loss term that touches every boundary
+# unconditionally, and its derivative lambda_dev * sigmoid'(s/tau)/tau is
+# strictly positive -- so it pushes every score down, every step, forever. The
+# only opposing force is weighted_feasibility, which under the augmented
+# penalty acts inside the feasible region across a band of width lambda/rho:
+# ZERO once the dual decays to 0, which is exactly what complementary
+# slackness is designed to make happen. Constant force, no restoring force ->
+# the head drifts until saturation stops it (measured: scores to -329 and
+# +229, dead_frac 1.0000 for 50/50 final epochs on all three seeds).
+#
+# Weight decay is the restoring force, applied where the drift lives: the
+# score's reach comes from the WEIGHTS (net.4.weight grows 0.0 -> 0.55-0.77
+# while net.4.bias stays at -2.87 from -3.0), so biases are excluded. Decaying
+# the bias would pull it toward 0, i.e. sigmoid(0) = 0.5 -- the "head opens
+# everything at init" failure AllocationHead's docstring warns against.
+
+
+def _spy_on_optimizers(monkeypatch):
+    """Record the (class, param_groups) of every optimizer main() builds."""
+    built = []
+    for name in ("Adam", "AdamW", "SGD"):
+        real = getattr(train_mod.optim, name)
+
+        def make(real=real, name=name):
+            def spy(params, **kwargs):
+                opt = real(params, **kwargs)
+                built.append((name, opt))
+                return opt
+            return spy
+
+        monkeypatch.setattr(train_mod.optim, name, make())
+    return built
+
+
+def test_head_optimizer_defaults_to_adam_without_weight_decay(tmp_path, monkeypatch):
+    """The shipped behaviour. A weight decay nobody asked for is a silent
+    change to every existing run's optimiser."""
+    built = _spy_on_optimizers(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch)
+
+    assert [name for name, _ in built] == ["Adam", "Adam"]
+    for _, opt in built:
+        assert all(g["weight_decay"] == 0.0 for g in opt.param_groups)
+
+
+def test_alloc_weight_decay_reaches_the_head_via_adamw(tmp_path, monkeypatch):
+    """Decoupled (AdamW), not Adam's coupled L2: the drift is sustained by
+    Adam's own normalisation, which divides a consistently-signed gradient by
+    its own running magnitude and so delivers a full-size step however small
+    that gradient is. A coupled L2 penalty goes through that same division;
+    a decoupled one does not."""
+    built = _spy_on_optimizers(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch,
+                  training_overrides={"alloc_weight_decay": 0.05})
+
+    kinds = [name for name, _ in built]
+    assert kinds == ["Adam", "AdamW"], f"edge net stays on Adam; head moves: {kinds}"
+    head = built[1][1]
+    assert max(g["weight_decay"] for g in head.param_groups) == pytest.approx(0.05)
+
+
+def test_weight_decay_never_touches_a_bias(tmp_path, monkeypatch):
+    """AllocationHead starts CLOSED at bias -3.0 so lambda_dev is live from
+    epoch 0 with no warm-up (spec 2.2). Decaying that bias toward 0 is
+    sigmoid(0) = 0.5 on every boundary -- the saturation-at-~2000-devices
+    failure the zero-weight/negative-bias init exists to prevent."""
+    built = _spy_on_optimizers(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch,
+                  training_overrides={"alloc_weight_decay": 0.05})
+
+    head = built[1][1]
+    decayed = [p for g in head.param_groups if g["weight_decay"] > 0 for p in g["params"]]
+    biases = [p for p in decayed if p.ndim < 2]
+    assert not biases, f"{len(biases)} bias/scalar tensors are being decayed"
+    assert decayed, "nothing is being decayed at all"
+
+
+# ---------------------------------------------------------------------------
+#
+# Optimizer choice for the allocation head, and gradient clipping.
+#
+# Adam's step is a RATIO, m/(sqrt(v)+eps), so a consistently-signed gradient
+# gives ~lr HOWEVER SMALL that gradient has become. Two measured consequences
+# on the runs in docs/investigations/score_runaway_and_dual_windup.md:
+#
+#   the objective's own brake is discarded -- lambda_dev * sigmoid'(s/tau)/tau
+#   falls 5.0e-3 (s=-3) -> 3.0e-11 (s=-22), and under SGD the step falls with
+#   it, but under Adam the drift runs at constant velocity to -131;
+#
+#   the dual loses authority -- a dual enters the head's loss only as a
+#   gradient SCALE, and Adam divides scale back out, so winding 0 -> 21.2
+#   moves the head no faster. A rate-limited actuator under an integral
+#   controller is the textbook wind-up setup.
+#
+# Neither is a reason to change the default. "adam" stays shipped; "sgd" is
+# the isolating arm.
+
+
+def test_alloc_optimizer_sgd_selects_sgd_with_no_momentum(tmp_path, monkeypatch):
+    """momentum stays 0 on purpose: Adam's beta1 = 0.9 IS a momentum term,
+    and it is what makes the plant second-order. A second-order plant under
+    the augmented dual's PI-shaped force is what oscillates."""
+    built = _spy_on_optimizers(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch,
+                  training_overrides={"alloc_optimizer": "sgd"})
+
+    kinds = [name for name, _ in built]
+    assert kinds == ["Adam", "SGD"], f"edge net stays on Adam; head moves: {kinds}"
+    head = built[1][1]
+    assert all(g["momentum"] == 0.0 for g in head.param_groups)
+
+
+def test_alloc_optimizer_defaults_to_adam_when_the_config_is_silent(tmp_path,
+                                                                    monkeypatch):
+    """The shipped behaviour. Every run recorded before this key existed used
+    Adam, and a silent optimizer swap would invalidate all of them."""
+    built = _spy_on_optimizers(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch)
+    assert [name for name, _ in built] == ["Adam", "Adam"]
+
+
+def test_unknown_alloc_optimizer_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="alloc_optimizer"):
+        _run_training(tmp_path, training_overrides={"alloc_optimizer": "adamw"})
+
+
+def test_sgd_excludes_biases_from_weight_decay_too(tmp_path, monkeypatch):
+    """Same rule as the AdamW branch: the score's reach lives in the weights,
+    and decaying net.4.bias toward 0 is sigmoid(0) = 0.5 on every boundary."""
+    built = _spy_on_optimizers(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch,
+                  training_overrides={"alloc_optimizer": "sgd",
+                                      "alloc_weight_decay": 0.05})
+
+    head = built[1][1]
+    decayed = [p for g in head.param_groups if g["weight_decay"] > 0 for p in g["params"]]
+    assert decayed, "nothing is being decayed at all"
+    assert not [p for p in decayed if p.ndim < 2], "a bias/scalar is being decayed"
+
+
+def _clip_spy(monkeypatch):
+    """Record the max_norm every clip_grad_norm_ call receives."""
+    calls = []
+    real = train_mod.torch.nn.utils.clip_grad_norm_
+
+    def spy(params, max_norm, *a, **kw):
+        calls.append(max_norm)
+        return real(params, max_norm, *a, **kw)
+
+    monkeypatch.setattr(train_mod.torch.nn.utils, "clip_grad_norm_", spy)
+    return calls
+
+
+def test_grad_clip_is_off_by_default_and_the_norm_is_still_logged(tmp_path,
+                                                                  monkeypatch):
+    """Off means max_norm=inf -- a pure measurement, not a cap. The column
+    has to be populated on the default path or it is useless as the
+    instrument that sizes an SGD learning rate."""
+    calls = _clip_spy(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch, epochs=2)
+
+    assert calls == [float("inf"), float("inf")]
+    rows = _read_csv(tmp_path / "logs" / "e2e_train_log.csv")
+    col = rows[0].index("alloc_grad_norm")
+    assert [float(r[col]) for r in rows[1:]] == [0.0, 0.0]
+
+
+def test_alloc_grad_clip_reaches_clip_grad_norm(tmp_path, monkeypatch):
+    """Clipping exists so one transient at the epoch 7-9 whipsaw cannot force
+    lr down for the remaining 50 epochs -- and, under Adam, cannot be burned
+    into exp_avg_sq, which at beta2=0.999 over a 60-STEP run never forgets."""
+    calls = _clip_spy(monkeypatch)
+    _run_training(tmp_path, monkeypatch=monkeypatch, epochs=2,
+                  training_overrides={"alloc_grad_clip": 1.5})
+    assert calls == [1.5, 1.5]
+
+
+def test_negative_grad_clip_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="alloc_grad_clip"):
+        _run_training(tmp_path, training_overrides={"alloc_grad_clip": -1.0})
+
+
+# ---------------------------------------------------------------------------
+# Anti-windup on the dual
+# ---------------------------------------------------------------------------
+#
+# While the head is saturated it cannot act, but `update_duals` keeps
+# integrating the violation regardless. Measured with weight decay on: the
+# dual climbs to 19-50 during a frozen stretch (the cap is 1000, nowhere near
+# binding), and when the spring restores responsiveness that stored pressure
+# discharges into a head that can suddenly move — driving it from "everything
+# off" through zero to "everything on" in 4-8 epochs, where it re-saturates:
+#
+#   s13 wd=0.1  dual 19.4  score_min -8.9 -> +2.1 -> +11.4 -> +19.6, 1566 devices
+#   s13 wd=1.0  dual 27.4  score_min -2.4 -> +0.3 ->  +7.1 -> +12.5, 1416 devices
+#   s42 wd=1.0  dual 10.9  (milder wind-up, milder overshoot: 0 -> 223 devices)
+#
+# Peak dual tracks overshoot severity, which is what integrator wind-up
+# predicts. The standard remedy is conditional integration: hold the
+# integrator while the actuator is saturated. `alloc_dead_fraction` is that
+# saturation signal.
+#
+# PER-DEMAND, not global: a demand whose own boundaries are all dead should
+# hold, while a demand with live boundaries keeps ascending. A demand with NO
+# real boundary is deliberately NOT held — the head has no lever there at all,
+# so the dual's only useful audience is the router, which is not saturated.
+# See docs/investigations/augmented_lagrangian_gate.md.
+
+
+def test_live_fraction_is_zero_for_a_demand_whose_boundaries_are_all_dead():
+    pipeline = _pinned_score_pipeline(-40.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+
+    gate = train_mod.alloc_live_fraction_per_demand(alloc, 1.0, num_duals=3)
+
+    # Demands 0 (0->4) and 2 (1->4) each cross node 3 and have one boundary.
+    assert gate[0].item() == pytest.approx(0.0)
+    assert gate[2].item() == pytest.approx(0.0)
+
+
+def test_live_fraction_is_one_at_the_decision_boundary():
+    pipeline = _pinned_score_pipeline(0.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+
+    gate = train_mod.alloc_live_fraction_per_demand(alloc, 1.0, num_duals=3)
+
+    assert gate.min().item() == pytest.approx(1.0)
+
+
+def test_a_demand_with_no_boundary_is_never_held():
+    """Demand 1 (0->3) terminates at the sole regen candidate, so it has no
+    boundary at all. The head cannot help it however unsaturated it is; only
+    the router can, and the router is not what saturated. Holding its dual
+    would suppress the one signal that can still fix it."""
+    pipeline = _pinned_score_pipeline(-40.0, alloc_ste=True)
+    _, _, _, alloc = pipeline(make_demands(), tau=1.0, lambda_=10.0)
+    assert not bool((alloc.boundary_node_ids[1] >= 0).any())   # really has none
+
+    gate = train_mod.alloc_live_fraction_per_demand(alloc, 1.0, num_duals=3)
+
+    assert gate[1].item() == pytest.approx(1.0)
+
+
+def test_anti_windup_is_off_by_default_and_eta_stays_a_plain_scalar(tmp_path, monkeypatch):
+    seen = {}
+    _spy_on_update_duals(monkeypatch, seen)
+    _run_training(tmp_path, monkeypatch=monkeypatch)
+
+    assert seen["eta"] == pytest.approx(1.0)          # constraint.dual_lr
+    assert not torch.is_tensor(seen["eta"])
+
+
+def test_anti_windup_scales_the_dual_step_by_the_live_fraction(tmp_path, monkeypatch):
+    """The stub pipeline's head sits at its init bias of -3.0, where
+    sigmoid'(-3)/1 = 0.045 — comfortably live — so a correctly wired gate
+    passes the step through at full strength rather than zeroing it. A gate
+    that always returned 0 would pass the 'off by default' test above and
+    silently disable the duals entirely."""
+    seen = {}
+    _spy_on_update_duals(monkeypatch, seen)
+    _run_training(tmp_path, monkeypatch=monkeypatch,
+                  training_overrides={"alloc_anti_windup": True})
+
+    assert torch.is_tensor(seen["eta"])
+    assert seen["eta"].shape == (1,)                  # one dual per demand
+    assert seen["eta"].item() == pytest.approx(1.0)   # live head -> full step

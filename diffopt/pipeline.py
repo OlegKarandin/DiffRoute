@@ -126,6 +126,12 @@ class AllocationOutputs:
 
     a: torch.Tensor                   # (D, J-1) priced allocations
     a_physics: torch.Tensor           # (D, J-1) what the fold actually saw
+    score: torch.Tensor               # (D, J-1) raw pre-activation scores,
+                                       # detached. Carried explicitly because
+                                       # it is NOT recoverable from `a`: under
+                                       # alloc_ste `a` is exactly 0/1, so
+                                       # tau*logit(a) reports only float32's
+                                       # clamps. See AllocationHead.last_scores.
     alloc_by_node: torch.Tensor       # (D, N) a scattered onto boundary nodes
     device_count: torch.Tensor        # scalar, sum_n sum_d
     site_view: torch.Tensor           # (N,) max_d, diagnostics only
@@ -806,6 +812,7 @@ class DiffONetPipeline(nn.Module):
             alloc_outputs = AllocationOutputs(
                 a=a,
                 a_physics=a_physics,
+                score=self.allocation_head.last_scores,
                 alloc_by_node=alloc_by_node,
                 device_count=total_device_cost(alloc_by_node),
                 site_view=site_view(alloc_by_node),
@@ -826,6 +833,7 @@ class DiffONetPipeline(nn.Module):
             alloc_outputs = AllocationOutputs(
                 a=empty_dd,
                 a_physics=empty_dd,
+                score=empty_dd,
                 alloc_by_node=torch.zeros(0, self._num_nodes, device=device),
                 device_count=torch.zeros((), device=device),
                 site_view=torch.zeros(self._num_nodes, device=device),

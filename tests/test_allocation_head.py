@@ -683,3 +683,49 @@ def test_alloc_ste_composes_with_greedy_residual():
     a_ste, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, tau=1.0)
     a_hard, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
     assert torch.equal(a_ste.detach(), a_hard)
+
+
+def test_last_scores_records_the_walk_on_real_and_padded_columns():
+    """The score is not recoverable from the allocations the rollout returns:
+    under alloc_ste `a` is exactly 0/1, so inverting the sigmoid reports only
+    float32's clamps. The head therefore publishes the raw scores itself, and
+    DiffONetPipeline hands them on as AllocationOutputs.score.
+    """
+    head = AllocationHead()
+    with torch.no_grad():
+        head.net[-1].bias.fill_(-7.0)
+    seg_noise = db_to_linear_noise(torch.tensor([[12.0, 9.0, 20.0]]))
+    seg_km = torch.tensor([[300.0, 400.0, 500.0]])
+
+    head.rollout(seg_noise, seg_km, torch.tensor([9.5]), torch.tensor([3]))
+
+    assert head.last_scores.shape == (1, 2)
+    assert torch.allclose(head.last_scores, torch.full((1, 2), -7.0))
+    assert not head.last_scores.requires_grad
+
+
+def test_last_scores_is_rebound_per_rollout_not_written_in_place():
+    """train.py logs the SOFT pass's scores, then runs hard_rollout on the
+    same head before writing the CSV row. A caller holding the soft pass's
+    tensor must keep the SOFT values — so the buffer has to be rebound, never
+    written in place. Three segments, so a decision at boundary 0 changes the
+    carry that boundary 1 scores on and the two passes genuinely diverge.
+    """
+    head = AllocationHead()
+    with torch.no_grad():
+        # A zero-weight final layer scores every boundary identically, which
+        # would let an in-place write pass this test unnoticed.
+        head.net[-1].weight.normal_(0.0, 1.0)
+        head.net[-1].bias.zero_()
+    seg_noise = db_to_linear_noise(torch.tensor([[12.0, 9.0, 20.0]]))
+    seg_km = torch.tensor([[300.0, 400.0, 500.0]])
+    bar, nseg = torch.tensor([9.5]), torch.tensor([3])
+
+    head.rollout(seg_noise, seg_km, bar, nseg, tau=1.0)
+    soft_scores = head.last_scores
+    soft_values = soft_scores.clone()
+
+    head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+
+    assert not torch.equal(soft_values, head.last_scores)  # passes really differ
+    assert torch.equal(soft_scores, soft_values)           # soft's record held

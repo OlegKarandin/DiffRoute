@@ -130,6 +130,25 @@ class AllocationHead(nn.Module):
         self.register_buffer(
             "last_max_chunk_noise", torch.zeros(0), persistent=False
         )
+        # Diagnostic only, same contract as the buffer above: (D, J-1) raw
+        # pre-activation scores from the last rollout, detached.
+        #
+        # The score cannot be recovered from the allocations the rollout
+        # returns. Under `alloc_ste` the forward value is EXACTLY 0 or 1, so
+        # inverting the sigmoid pins every boundary to float32's clamps
+        # (-87.336545 / +15.942385 in score units at tau=1) and reports
+        # nothing about magnitude — which is precisely what a saturation
+        # diagnostic needs. Measured on the augmented-Lagrangian gate runs:
+        # all three al_ste_greedy seeds logged those two constants for 60/60
+        # epochs while the true scores ran to -47.
+        # See docs/investigations/augmented_lagrangian_gate.md.
+        #
+        # Rebound rather than mutated in place (like last_max_chunk_noise),
+        # so a caller that kept a reference to an earlier rollout's scores
+        # still holds that rollout's values after a later one — the hard
+        # rollout in train.py runs after the soft pass whose scores are
+        # being logged.
+        self.register_buffer("last_scores", torch.zeros(0), persistent=False)
 
     @property
     def alpha(self) -> float:
@@ -236,6 +255,7 @@ class AllocationHead(nn.Module):
 
         priced_cols = []
         physics_cols = []
+        score_cols = []
         use_dropout = self.training and dropout_p > 0.0 and not hard
 
         for k in range(j - 1):
@@ -314,6 +334,7 @@ class AllocationHead(nn.Module):
 
             priced_cols.append(a_k)
             physics_cols.append(a_phys)
+            score_cols.append(s.detach())
             # The PHYSICS decision resets the carry: under dropout the demand
             # really does lose that regenerator, which is the point — it puts
             # the demand back in the hinge's active region, the only region
@@ -329,8 +350,10 @@ class AllocationHead(nn.Module):
         self.last_max_chunk_noise = max_chunk.detach()
 
         if priced_cols:
+            self.last_scores = torch.stack(score_cols, dim=1)
             return torch.stack(priced_cols, dim=1), torch.stack(physics_cols, dim=1), waste
         empty = torch.zeros(d, 0, dtype=dtype, device=device)
+        self.last_scores = empty
         return empty, empty, torch.zeros((), dtype=dtype, device=device)
 
 
