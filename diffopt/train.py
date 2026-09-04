@@ -342,7 +342,6 @@ def main() -> None:
     pl_cfg = cfg.get("placement", {})
     lookahead: bool = pl_cfg.get("lookahead", True)
     route_context: bool = pl_cfg.get("route_context", True)
-    greedy_residual: bool = pl_cfg.get("greedy_residual", False)
     alloc_ste: bool = pl_cfg.get("alloc_ste", False)
     # Under the STE, tau has no forward job left — the forward decision is the
     # deployed one — so the anneal only sharpens the backward surrogate, and
@@ -391,7 +390,7 @@ def main() -> None:
 
     allocation_head = AllocationHead(
         lookahead=lookahead, route_context=route_context,
-        greedy_residual=greedy_residual, alloc_ste=alloc_ste,
+        alloc_ste=alloc_ste,
     ).to(device)
 
     pipeline = DiffONetPipeline(
@@ -437,9 +436,7 @@ def main() -> None:
     # `net.4.bias` stays at -2.87 from -3.0 — and decaying the bias toward 0
     # would put every boundary at sigmoid(0) = 0.5, the "head opens
     # everything at init" failure the zero-weight/negative-bias init exists
-    # to prevent (AllocationHead's docstring, spec 2.2). `alpha_raw` under
-    # greedy_residual is a scalar and is excluded on the same rule: it sets
-    # WHERE the closed point sits, not how far the score can swing.
+    # to prevent (AllocationHead's docstring, spec 2.2).
     alloc_weight_decay: float = float(cfg["training"].get("alloc_weight_decay", 0.0))
 
     # Optimizer for the allocation head. "adam" is the default and reproduces
@@ -581,7 +578,7 @@ def main() -> None:
             "tau", "vlastelica_lambda",
             "alloc_score_mean", "alloc_score_min", "alloc_score_max",
             "lookahead",
-            "route_context", "greedy_residual", "waste_cost", "alloc_alpha",
+            "route_context", "waste_cost",
             "ste_clamped_segments", "proxy_qot_rank_corr",
             "alloc_dead_frac", "alloc_grad_norm",
         ])
@@ -637,17 +634,6 @@ def main() -> None:
             alloc_head_state_pre_step = {
                 k: v.clone() for k, v in allocation_head.state_dict().items()
             }
-            # Read straight from the pre-step state dict, not the live
-            # module's `.alpha` accessor — by the time the CSV row is
-            # written, opt_alloc.step() has already mutated alpha_raw, and
-            # this row must describe the SAME parameters as the snapshot
-            # above (comment there explains why).
-            alpha_pre_step = (
-                float(F.softplus(alloc_head_state_pre_step["alpha_raw"]))
-                if greedy_residual
-                else float("nan")
-            )
-
             # Selection metrics, measured on the deployed allocation rather
             # than on the relaxation the gradient step is taken through.
             # Pre-step, like the two snapshots above: the checkpoint must
@@ -729,9 +715,7 @@ def main() -> None:
                 f"{score_max:.6f}",
                 lookahead,
                 route_context,
-                greedy_residual,
                 f"{metrics['waste_cost']:.6f}",
-                f"{alpha_pre_step:.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",
                 f"{dead_frac:.6f}",

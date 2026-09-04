@@ -257,10 +257,10 @@ def main() -> None:
     ap.add_argument("--band-target-db", type=float, default=BAND_TARGET_DB,
                     help="Headroom, in dB inside the feasible region, over "
                          "which the penalty stays active at the resting dual")
-    ap.add_argument("--no-ste-greedy", dest="ste_greedy", action="store_false",
+    ap.add_argument("--no-ste", dest="ste", action="store_false",
                     help="Measure the config exactly as written, instead of "
-                         "the alloc_ste + greedy_residual arm this rho is for")
-    ap.set_defaults(ste_greedy=True)
+                         "the alloc_ste arm this rho is for")
+    ap.set_defaults(ste=True)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -273,13 +273,11 @@ def main() -> None:
     # the hinge force. Calibrating there measures phantoms. Applied here
     # rather than required of the config file, so the committed configs stay
     # unmodified and hinge-mode.
-    if args.ste_greedy:
-        cfg.setdefault("placement", {}).update(
-            {"alloc_ste": True, "greedy_residual": True}
-        )
+    if args.ste:
+        cfg.setdefault("placement", {}).update({"alloc_ste": True})
         cfg["training"]["alloc_tau_end"] = cfg["training"]["alloc_tau_start"]
-        print(f"  measuring the alloc_ste + greedy_residual arm (tau pinned "
-              f"at {cfg['training']['alloc_tau_start']}); --no-ste-greedy "
+        print(f"  measuring the alloc_ste arm (tau pinned "
+              f"at {cfg['training']['alloc_tau_start']}); --no-ste "
               f"measures the config as written")
 
     c_cfg, p_cfg = cfg["constraint"], cfg["pipeline"]

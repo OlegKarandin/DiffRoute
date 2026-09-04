@@ -37,10 +37,10 @@ def test_no_arm_references_a_deleted_config_key():
 
 
 def test_the_augmented_arms_are_registered():
-    """Spec section 6 needs four runs: al_ste_greedy on three seeds, plus
+    """Spec section 6 needs four runs: al_ste on three seeds, plus
     baseline-under-AL on one for the no-regression comparison."""
     names = {arm["name"] for arm in ARMS}
-    assert {"al_ste_greedy", "al_baseline"} <= names
+    assert {"al_ste", "al_baseline"} <= names
 
 
 def test_every_augmented_arm_carries_a_measured_rho_and_a_cold_dual():
@@ -60,11 +60,11 @@ def test_every_augmented_arm_carries_a_measured_rho_and_a_cold_dual():
         assert constraint.get("dual_init") == 0.0, arm["name"]
 
 
-def test_the_augmented_ste_arm_pins_tau_and_turns_on_the_ste_and_residual():
+def test_the_augmented_ste_arm_pins_tau_and_turns_on_the_ste():
     """The AL defect only EXISTS once the STE removes the phantom violations
-    (spec 1.2), so the arm this rho was measured for must carry them."""
-    arm = next(a for a in ARMS if a["name"] == "al_ste_greedy")
-    assert arm["overrides"]["placement"] == {"alloc_ste": True, "greedy_residual": True}
+    (spec 1.2), so the arm this rho was measured for must carry it."""
+    arm = next(a for a in ARMS if a["name"] == "al_ste")
+    assert arm["overrides"]["placement"] == {"alloc_ste": True}
     assert arm["overrides"]["training"]["alloc_tau_end"] == 1.0
 
 

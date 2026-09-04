@@ -26,23 +26,13 @@ Three properties are load-bearing and each has a test:
               against an oracle needing ~60-100, with no gradient left to
               escape. Do not "helpfully" restore a warm-up.
 
-              greedy_residual=True carve-out (spec 5.2): the closed point
-              moves, but the CLOSED-ness doesn't. With greedy_residual, the
-              final layer is zero-weight AND zero-bias (MLP == 0 exactly),
-              and the score is instead `alpha * (bar_d - g_after)` — a
-              linear combination of features 1 and 4 that the OLD zero-weight
-              parameterization could already express, just not at a useful
-              point. So this changes WHERE the closed init sits (exactly the
-              oracle's own greedy cut, `score > 0 <=> feature4 < 0`, boundary
-              for boundary) and not WHAT the head can represent, nor whether
-              lambda_dev is live from epoch 0: it still is, with no warm-up
-              schedule, from the very first step. This is a different regime
-              from the failure mode above (which opens near sigmoid(0) ~ 0.5
-              everywhere, i.e. ~2000 saturated devices with no gradient to
-              escape) — the two are observably distinguishable via
-              alloc_score_min/max and the alloc_alpha CSV column, and neither
-              is a warm-up: nothing here anneals or ramps toward this point,
-              it IS the point from epoch 0.
+              A `greedy_residual` carve-out (spec 5.2) used to make the
+              closed point coincide with the oracle's own greedy cut at
+              init. Removed 2026-09 (open_followups.md item #8): it hard-
+              codes the `|S| = 1` optimal rule into the score, so a result
+              obtained with it on would be "the relaxation recovering the
+              optimum because we told it the answer." Recoverable from git
+              history if Stage IV restoration needs it back.
 """
 from __future__ import annotations
 
@@ -86,19 +76,13 @@ class AllocationHead(nn.Module):
         *,
         lookahead: bool = True,
         route_context: bool = True,
-        greedy_residual: bool = False,
         alloc_ste: bool = False,
         init_bias: float = -3.0,
     ) -> None:
         super().__init__()
         self.lookahead = lookahead
         self.route_context = route_context
-        self.greedy_residual = greedy_residual
         self.alloc_ste = alloc_ste
-        if greedy_residual and not lookahead:
-            raise ValueError(
-                "greedy_residual needs feature 4, which lookahead=False masks"
-            )
         self.net = nn.Sequential(
             nn.Linear(ALLOC_FEATURE_DIM, hidden),
             nn.ReLU(),
@@ -106,22 +90,12 @@ class AllocationHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
-        if greedy_residual:
-            # softplus keeps alpha > 0 so the sign test never inverts.
-            # softplus(2.949) = 3.0
-            self.alpha_raw = nn.Parameter(torch.tensor(2.949))
-            # Zero weight AND zero bias, NOT init_bias: the linear residual
-            # below needs MLP == 0 exactly, or the closed point is not the
-            # oracle's own boundary any more.
-            nn.init.zeros_(self.net[-1].weight)
-            nn.init.zeros_(self.net[-1].bias)
-        else:
-            # Zero weights + a negative bias, NOT a small random init: the
-            # head must start closed DETERMINISTICALLY, at the same value on
-            # every variable, so epoch 0's device count is 0.047 * (number
-            # of boundaries) rather than a seed-dependent number.
-            nn.init.zeros_(self.net[-1].weight)
-            nn.init.constant_(self.net[-1].bias, init_bias)
+        # Zero weights + a negative bias, NOT a small random init: the
+        # head must start closed DETERMINISTICALLY, at the same value on
+        # every variable, so epoch 0's device count is 0.047 * (number
+        # of boundaries) rather than a seed-dependent number.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, init_bias)
 
         # Diagnostic only: the worst chunk noise the last rollout saw. Not a
         # parameter, not in the graph, not read by the loss. Registered so a
@@ -150,27 +124,8 @@ class AllocationHead(nn.Module):
         # being logged.
         self.register_buffer("last_scores", torch.zeros(0), persistent=False)
 
-    @property
-    def alpha(self) -> float:
-        """softplus(alpha_raw) when greedy_residual, else nan.
-
-        Always safely callable regardless of the flag — train.py's CSV-row
-        code reads this every epoch unconditionally.
-        """
-        return float(F.softplus(self.alpha_raw).detach()) if self.greedy_residual else float("nan")
-
     def score(self, feats: torch.Tensor) -> torch.Tensor:
         """(..., ALLOC_FEATURE_DIM) -> (...). Positive means "cut here"."""
-        # The residual reads feature 4 from the UNMASKED feats, before the
-        # lookahead/route_context mask below (which only ever applies to the
-        # MLP's input) can touch it. Get this order wrong and
-        # greedy_residual=True, route_context=False would silently zero out
-        # the residual's own feature 4, even though lookahead=True is
-        # required precisely to keep it available.
-        residual = 0.0
-        if self.greedy_residual:
-            residual = -F.softplus(self.alpha_raw) * feats[..., 4]
-
         if not self.lookahead or not self.route_context:
             # Mask rather than shrink the input layer: the arm sweep flips
             # this per run, and a shape change would make the two arms'
@@ -181,7 +136,7 @@ class AllocationHead(nn.Module):
             if not self.route_context:
                 mask[list(ROUTE_CONTEXT_COLS)] = 0.0
             feats = feats * mask
-        return residual + self.net(feats).squeeze(-1)
+        return self.net(feats).squeeze(-1)
 
     def rollout(
         self,

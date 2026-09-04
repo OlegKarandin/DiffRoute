@@ -650,7 +650,7 @@ def test_log_csv_header_is_device_priced(tmp_path):
         "tau", "vlastelica_lambda",
         "alloc_score_mean", "alloc_score_min", "alloc_score_max",
         "lookahead",
-        "route_context", "greedy_residual", "waste_cost", "alloc_alpha",
+        "route_context", "waste_cost",
         "ste_clamped_segments", "proxy_qot_rank_corr",
         "alloc_dead_frac", "alloc_grad_norm",
     ]

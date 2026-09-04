@@ -87,7 +87,6 @@ ARMS = [
     {"name": "lambda_dev_3x",   "overrides": {"pipeline": {"lambda_dev": _CAL * 3.0}}},
     {"name": "no_lookahead", "overrides": {"placement": {"lookahead": False}}},
     {"name": "no_route_context",      "overrides": {"placement": {"route_context": False}}},
-    {"name": "greedy_residual",       "overrides": {"placement": {"greedy_residual": True}}},
     # alloc_ste: the training forward pass takes the DEPLOYED decision, so the
     # relaxation and hard_rollout cannot disagree about who is feasible.
     # Measured at an allocation with oracle_gap == 0, the un-STE'd soft pass
@@ -99,9 +98,6 @@ ARMS = [
     # surrogate; train.py warns if an alloc_ste config leaves it annealing.
     {"name": "alloc_ste", "overrides": {"placement": {"alloc_ste": True},
                                         "training":  {"alloc_tau_end": 1.0}}},
-    {"name": "alloc_ste_greedy", "overrides": {"placement": {"alloc_ste": True,
-                                                             "greedy_residual": True},
-                                               "training":  {"alloc_tau_end": 1.0}}},
     # Augmented Lagrangian (design spec 2026-08-31). The hinge's derivative
     # is dual_d * 1{g_d > 0}, so a satisfied demand contributes EXACTLY zero
     # upward force however large its dual. At an optimum every demand is
@@ -120,13 +116,13 @@ ARMS = [
     # is the intended dynamics — epoch 1 has the head at the oracle with
     # nothing pushing up, lambda_dev sheds, one demand breaks, and that
     # demand's lambda starts rising.
-    {"name": "al_ste_greedy", "overrides": {
+    {"name": "al_ste", "overrides": {
         "constraint": {"penalty": "augmented", "rho": RHO, "dual_init": 0.0},
-        "placement":  {"alloc_ste": True, "greedy_residual": True},
+        "placement":  {"alloc_ste": True},
         "training":   {"alloc_tau_end": 1.0}}},
     # No-regression control for spec section 6: the same penalty change with
     # nothing else moved, so a regression against `baseline` attributes to
-    # the penalty rather than to the STE or the residual.
+    # the penalty rather than to the STE.
     {"name": "al_baseline", "overrides": {
         "constraint": {"penalty": "augmented", "rho": RHO, "dual_init": 0.0}}},
 ]
@@ -135,7 +131,7 @@ ARMS_BY_NAME: Dict[str, dict] = {arm["name"]: arm for arm in ARMS}
 
 CSV_FIELDNAMES = [
     "arm", "seed", "lambda_dev", "lookahead",
-    "route_context", "greedy_residual", "alloc_ste",
+    "route_context", "alloc_ste",
     "hard_num_violated", "hard_num_devices", "hard_num_sites",
     "oracle_devices", "oracle_gap", "oracle_infeasible",
     "hard_worst_margin_db", "device_peak", "device_final", "device_plateaued",
@@ -307,7 +303,6 @@ def score(config_path: Path) -> dict:
         "lambda_dev": cfg["pipeline"]["lambda_dev"],
         "lookahead": pl_cfg.get("lookahead", True),
         "route_context": pl_cfg.get("route_context", True),
-        "greedy_residual": pl_cfg.get("greedy_residual", False),
         "alloc_ste": pl_cfg.get("alloc_ste", False),
         "hard_num_violated": hard["hard_num_violated"],
         "hard_num_devices": hard["hard_num_devices"],
