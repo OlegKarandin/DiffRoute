@@ -18,7 +18,12 @@ class DijkstraSurrogate(torch.autograd.Function):
     """
     Autograd Function wrapping Dijkstra with Vlastelica surrogate gradients.
 
-    Forward: run exact Dijkstra, return binary path indicator.
+    Forward: run exact Dijkstra, return binary path indicator AND the
+             traversal-ordered edge list (Finding 1,
+             docs/investigations/pipeline_profile_and_restoration_scaling.md
+             — Dijkstra already has this from its own prev-chain; a caller
+             re-deriving it from the unordered indicator pays for a second
+             graph walk).
     Backward: perturb edge weights by +lambda * grad_output, re-run Dijkstra,
               compute finite-difference surrogate gradient.
     """
@@ -32,12 +37,14 @@ class DijkstraSurrogate(torch.autograd.Function):
         dst: int,
         num_nodes: int,
         lambda_: float,
-    ) -> torch.Tensor:
+    ):
         # Run Dijkstra on detached numpy arrays
         w_np = edge_weights.detach().cpu().numpy().astype(np.float64)
         ei_np = edge_index.detach().cpu().numpy()
 
-        path_np = dijkstra(w_np, ei_np, src, dst, num_nodes)
+        path_np, ordered_edges = dijkstra(
+            w_np, ei_np, src, dst, num_nodes, return_order=True
+        )
         if path_np is None:
             raise ValueError(f"No path found from {src} to {dst}")
 
@@ -54,10 +61,14 @@ class DijkstraSurrogate(torch.autograd.Function):
         # tensor that is a registered buffer and never changes.
         ctx._ei_np = ei_np
 
-        return path
+        # ordered_edges is a plain list, not a Tensor: autograd passes it
+        # through untouched and calls backward() with None in its slot
+        # (verified — torch.autograd.Function permits non-Tensor forward
+        # outputs; see the second positional arg below).
+        return path, ordered_edges
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx, grad_output: torch.Tensor, _grad_ordered_edges=None):
         edge_weights, edge_index, path = ctx.saved_tensors
         src = ctx._src
         dst = ctx._dst
@@ -99,7 +110,7 @@ def surrogate_shortest_path(
     dst: int,
     num_nodes: int,
     lambda_: float = 10.0,
-) -> torch.Tensor:
+):
     """
     Convenience wrapper for DijkstraSurrogate.apply().
 
@@ -119,6 +130,10 @@ def surrogate_shortest_path(
 
     Returns
     -------
-    (E,) float tensor: binary path indicator (differentiable via surrogate).
+    (path, ordered_edges): `path` is an (E,) float tensor, the binary path
+    indicator (differentiable via surrogate); `ordered_edges` is a
+    List[int] of edge IDs from src to dst — the same traversal order a
+    caller previously had to re-derive from `path` with a second graph
+    walk (docs/investigations/open_followups.md #7b).
     """
     return DijkstraSurrogate.apply(edge_weights, edge_index, src, dst, num_nodes, lambda_)

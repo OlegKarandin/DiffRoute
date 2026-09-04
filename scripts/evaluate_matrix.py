@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
 import yaml
 
 # `scripts/` is not a package (no __init__.py) — every diagnose_*.py uses this
@@ -98,13 +99,17 @@ def main() -> None:
                   f"shortfall {shortfall:.2f} dB")
 
     # The deployed allocation, from the same deterministic rollout
-    # checkpoint selection uses. `gsnr_preds` below comes out of this very
-    # pass — a second, soft forward would describe a different allocation
-    # than the counts printed here.
+    # checkpoint selection uses. `gsnr_preds` below comes out of the hard
+    # rollout itself — the soft pass below is only run for its
+    # routes/segments/GSNRs (hard_rollout reuses them rather than
+    # re-routing; open_followups.md #7b), and its own (soft) allocation is
+    # discarded, never mixed into the counts printed here.
     _, vlastelica_lambda = schedule_at(cfg, cfg["training"]["epochs_e2e"])
+    with torch.no_grad():
+        _, _, _, soft_alloc = ctx.pipeline(demands, lambda_=vlastelica_lambda)
     hard = hard_rollout(
-        ctx.pipeline, demands, ctx.mod_cfg,
-        lambda_=vlastelica_lambda, margin_db=c_cfg["margin_db"],
+        ctx.pipeline, demands, soft_alloc, ctx.mod_cfg,
+        margin_db=c_cfg["margin_db"],
     )
     sites = sorted(hard["site_mask"].nonzero(as_tuple=True)[0].tolist())
     print(f"\nDeployed allocation (hard rollout):")

@@ -192,8 +192,8 @@ def _trial_run(
         )
 
         hard = hard_rollout(
-            ctx.pipeline, demands, ctx.mod_cfg,
-            lambda_=vlastelica_lambda, margin_db=c_cfg["margin_db"],
+            ctx.pipeline, demands, alloc, ctx.mod_cfg,
+            margin_db=c_cfg["margin_db"],
         )
 
         loss.backward()

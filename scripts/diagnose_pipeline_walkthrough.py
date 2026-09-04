@@ -34,9 +34,8 @@ with torch.no_grad():
     # pick a demand with a few segments
     pick = None
     for d in demands:
-        pi = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
-                                     pipe._num_nodes, lambda_=vlastelica_lambda)
-        o = pipe._reconstruct_path(pi, d.src, d.dst)
+        pi, o = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
+                                        pipe._num_nodes, lambda_=vlastelica_lambda)
         s, b = segment_path(o, d.src, cands, edges, d.dst)
         if 3 <= len(s) <= 4 and len(o) >= 5:
             pick = (d, pi, o, s, b); break
@@ -46,7 +45,7 @@ with torch.no_grad():
     print(f"  edge_index shape {tuple(pipe._edge_index.shape)}, "
           f"edge_weights (normalised, unit-mean) shape {tuple(ew.shape)}")
     print(f"\nSTAGE 4a  path_indicator: (E,) binary, {int(pi.sum())} of {len(edges)} edges = 1")
-    print(f"STAGE 4c  _reconstruct_path -> ordered edge IDs: {ordered}")
+    print(f"STAGE 4a  ordered edge IDs (from Dijkstra's own prev-chain): {ordered}")
 
     node = d.src
     print(f"\n  node walk (regen candidates = degree>=3, marked *):")

@@ -1038,10 +1038,14 @@ def test_segment_gsnr_cache_eviction_does_not_read_from_cleared_cache(monkeypatc
 
 def test_pipeline_gsnr_matches_a_per_demand_combiner_loop():
     """The batched fold's equivalence, checked at the level that matters:
-    the pipeline's own output. Rebuilds each demand's segments from its
-    path indicator and folds them one at a time, the way forward() did
+    the pipeline's own output. Rebuilds each demand's segments from a fresh
+    Dijkstra call at the SAME (unit-mean-renormalised) edge weights
+    forward() just used and folds them one at a time, the way forward() did
     before batching."""
+    import torch.nn.functional as F
+
     from diffopt.pipeline import segment_path
+    from diffopt.routing.surrogate import surrogate_shortest_path
 
     topology = make_hub_topology()
     pipeline = make_pipeline(topology)
@@ -1059,9 +1063,13 @@ def test_pipeline_gsnr_matches_a_per_demand_combiner_loop():
     with torch.no_grad():
         _, gsnr_preds, path_indicators, alloc = pipeline(demands, tau=1.0)
 
+        raw_edge_weights = F.softplus(pipeline.edge_log_weight)
+        edge_weights = raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)
+
         for row, demand in enumerate(demands):
-            ordered = pipeline._reconstruct_path(
-                path_indicators[demand.id], demand.src, demand.dst
+            _, ordered = surrogate_shortest_path(
+                edge_weights, pipeline._edge_index, demand.src, demand.dst,
+                pipeline._num_nodes,
             )
             segments, boundary_nodes = segment_path(
                 ordered, demand.src, pipeline._regen_candidate_set,
@@ -1213,6 +1221,39 @@ def test_hard_alloc_is_not_a_threshold_on_the_soft_pass():
         _, _, _, hard = pipeline(demands, hard_alloc=True)
     assert set(hard.a.unique().tolist()) <= {0.0, 1.0}
     assert not hard.a.requires_grad
+
+
+def test_hard_rollout_from_soft_matches_a_fresh_hard_forward_pass():
+    """open_followups.md #7b / A2: hard_rollout_from_soft must reproduce a
+    fresh forward(hard_alloc=True) pass exactly, since routing, segmentation
+    and QoT never depend on hard_alloc -- only AllocationHead.rollout's
+    decision rule does (pipeline_profile_and_restoration_scaling.md,
+    Finding 2). Bit-identical, not merely close, and checked at every field
+    a caller reads."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].weight.normal_(std=0.5)
+        pipeline.allocation_head.net[-1].bias.zero_()
+    demands = make_demands()
+
+    with torch.no_grad():
+        _, _, _, soft_alloc = pipeline(demands, tau=1.0)
+        gsnr_reused, hard_reused = pipeline.hard_rollout_from_soft(demands, soft_alloc)
+
+        _, gsnr_fresh, _, hard_fresh = pipeline(demands, hard_alloc=True)
+
+    for d in demands:
+        assert gsnr_reused[d.id].item() == gsnr_fresh[d.id].item()
+    assert torch.equal(hard_reused.a, hard_fresh.a)
+    assert torch.equal(hard_reused.a_physics, hard_fresh.a_physics)
+    assert torch.equal(hard_reused.alloc_by_node, hard_fresh.alloc_by_node)
+    assert torch.equal(hard_reused.site_view, hard_fresh.site_view)
+    assert hard_reused.device_count.item() == hard_fresh.device_count.item()
+    assert torch.equal(hard_reused.seg_gsnr_db, hard_fresh.seg_gsnr_db)
+    assert torch.equal(hard_reused.boundary_node_ids, hard_fresh.boundary_node_ids)
+    assert hard_reused.demand_ids == hard_fresh.demand_ids
 
 
 def test_hard_alloc_carry_equals_the_combiners_own_fold():

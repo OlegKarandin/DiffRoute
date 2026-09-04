@@ -132,7 +132,8 @@ def dijkstra(
     src: int,
     dst: int,
     num_nodes: int,
-) -> Optional[np.ndarray]:
+    return_order: bool = False,
+):
     """
     Single-source single-target Dijkstra on an undirected graph.
 
@@ -148,11 +149,24 @@ def dijkstra(
         Destination node ID.
     num_nodes:
         Total number of nodes.
+    return_order:
+        If True, also return the path's edge IDs in src->dst traversal
+        order. Dijkstra already builds `prev_node`/`prev_edge` while
+        relaxing; walking that chain here is the SAME data a caller would
+        otherwise recover by re-deriving traversal order from the
+        unordered indicator (see `diffopt.pipeline`'s former
+        `_reconstruct_path`, ~0.7 s/forward on `ind_132`/`constrained_stress`
+        — docs/investigations/open_followups.md #7b / Finding 1 of
+        pipeline_profile_and_restoration_scaling.md).
 
     Returns
     -------
-    (E,) binary numpy array: 1 if edge is on the shortest path, else 0.
-    Returns None if no path exists.
+    return_order=False (default): (E,) binary numpy array, 1 if the edge is
+    on the shortest path, else 0. None if no path exists.
+
+    return_order=True: (path_indicator, ordered_edges) where ordered_edges
+    is a List[int] of edge IDs from src to dst. (None, None) if no path
+    exists.
     """
     adj = _adjacency(edge_index, num_nodes)
     weights = np.asarray(edge_weights, dtype=np.float64).tolist()
@@ -180,16 +194,23 @@ def dijkstra(
                 heapq.heappush(heap, (nd, v))
 
     if dist[dst] == np.inf:
-        return None  # no path
+        return (None, None) if return_order else None  # no path
 
-    # Reconstruct path edges
+    # Reconstruct path edges, walking dst -> src via the chain Dijkstra
+    # already built.
     path_indicator = np.zeros(num_edges, dtype=np.float32)
+    ordered_edges: List[int] = []
     node = dst
     while prev_edge[node] != -1:
-        path_indicator[prev_edge[node]] = 1.0
-        node = prev_node[node]
+        eid = int(prev_edge[node])
+        path_indicator[eid] = 1.0
+        ordered_edges.append(eid)
+        node = int(prev_node[node])
 
-    return path_indicator
+    if not return_order:
+        return path_indicator
+    ordered_edges.reverse()  # src -> dst order
+    return path_indicator, ordered_edges
 
 
 def batched_dijkstra(

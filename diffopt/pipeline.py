@@ -137,6 +137,11 @@ class AllocationOutputs:
     site_view: torch.Tensor           # (N,) max_d, diagnostics only
     seg_gsnr_db: torch.Tensor         # (D, J) STE-blended per-segment GSNR
     seg_noise: torch.Tensor           # (D, J) the same, as linear noise
+    seg_km_matrix: torch.Tensor       # (D, J) segment lengths in km, same
+                                       # masking as seg_noise. Carried so
+                                       # hard_rollout_from_soft can re-run the
+                                       # allocation head without re-routing —
+                                       # see that method's docstring.
     num_segments: torch.Tensor        # (D,) long
     boundary_node_ids: torch.Tensor   # (D, J-1) long, -1 where padded
     demand_ids: List[int]             # row index -> Demand.id
@@ -166,10 +171,11 @@ class DiffONetPipeline(nn.Module):
       3. Compute edge weights from the free per-edge parameter
          edge_log_weight (Softplus, then renormalised to unit mean).
       4. For each demand:
-         a. Run surrogate Dijkstra → binary path indicator (differentiable).
+         a. Run surrogate Dijkstra → binary path indicator (differentiable)
+            plus the src->dst ordered edge list, straight off Dijkstra's own
+            prev-chain.
          b. Accumulate path_noise_cost = (path_indicator · edge_ase_noise).sum()
             — this is the live autograd path into edge_log_weight.
-         c. Reconstruct ordered edge list (using detached indicator).
          d. Segment path at regen candidate nodes.
       5. Run the frozen QoT model on every segment in one batched call.
       6. Roll the AllocationHead along each demand's boundaries → a per-
@@ -343,47 +349,6 @@ class DiffONetPipeline(nn.Module):
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _reconstruct_path(
-        self,
-        path_indicator: torch.Tensor,
-        src: int,
-        dst: int,
-    ) -> List[int]:
-        """Convert binary (E,) path indicator to ordered list of edge IDs.
-
-        Uses path_indicator.detach() for the discrete graph walk, leaving
-        path_indicator live in the autograd graph for path_noise_cost computation.
-        """
-        active = [
-            e for e in range(path_indicator.shape[0])
-            if path_indicator.detach()[e].item() > 0.5
-        ]
-
-        # Build undirected adjacency: node → [(neighbour, edge_id)]
-        adj: Dict[int, List[Tuple[int, int]]] = {}
-        for eid in active:
-            u = self._edges[eid].src
-            v = self._edges[eid].dst
-            adj.setdefault(u, []).append((v, eid))
-            adj.setdefault(v, []).append((u, eid))
-
-        # Walk from src to dst
-        ordered: List[int] = []
-        visited: Set[int] = {src}
-        current = src
-        while current != dst:
-            moved = False
-            for neighbour, eid in adj.get(current, []):
-                if neighbour not in visited:
-                    ordered.append(eid)
-                    visited.add(neighbour)
-                    current = neighbour
-                    moved = True
-                    break
-            if not moved:
-                break  # disconnected (shouldn't happen with valid Dijkstra output)
-        return ordered
-
     def _extract_span_features(
         self,
         segment_edge_ids: List[int],
@@ -508,8 +473,12 @@ class DiffONetPipeline(nn.Module):
         segment_owner_demand_id: List[int] = []
 
         for demand in demands:
-            # 4a. Surrogate Dijkstra → (E,) binary path indicator
-            path_indicator = surrogate_shortest_path(
+            # 4a. Surrogate Dijkstra → (E,) binary path indicator, plus the
+            # src->dst ordered edge list Dijkstra's own prev-chain already
+            # has (open_followups.md #7b / Finding 1 — this used to be
+            # rederived by _reconstruct_path re-walking the unordered
+            # indicator, ~0.7 s/forward on ind_132/constrained_stress).
+            path_indicator, ordered_edges = surrogate_shortest_path(
                 edge_weights,
                 self._edge_index,
                 demand.src,
@@ -538,9 +507,6 @@ class DiffONetPipeline(nn.Module):
             # router for a quantity it cannot control would add noise, not
             # signal. ASE is the routing-controllable part of the physics.
             path_noise_cost = (path_indicator * self._edge_ase_noise).sum()
-
-            # 4c. Ordered edge list via detached indicator
-            ordered_edges = self._reconstruct_path(path_indicator, demand.src, demand.dst)
 
             # 4d. Segment at regen candidate nodes
             segments, boundary_nodes = segment_path(
@@ -810,6 +776,7 @@ class DiffONetPipeline(nn.Module):
                 site_view=site_view(alloc_by_node),
                 seg_gsnr_db=gsnr_matrix,
                 seg_noise=seg_noise,
+                seg_km_matrix=seg_km_matrix,
                 num_segments=num_segments,
                 boundary_node_ids=bnd_matrix,
                 demand_ids=[d.id for d in demands],
@@ -831,6 +798,7 @@ class DiffONetPipeline(nn.Module):
                 site_view=torch.zeros(self._num_nodes, device=device),
                 seg_gsnr_db=empty_dd,
                 seg_noise=empty_dd,
+                seg_km_matrix=empty_dd,
                 num_segments=torch.zeros(0, dtype=torch.long, device=device),
                 boundary_node_ids=torch.zeros(0, 0, dtype=torch.long, device=device),
                 demand_ids=[],
@@ -840,3 +808,99 @@ class DiffONetPipeline(nn.Module):
             )
 
         return path_noise_costs, gsnr_preds, path_indicators, alloc_outputs
+
+    def hard_rollout_from_soft(
+        self,
+        demands: List[Demand],
+        alloc: "AllocationOutputs",
+        tau: float = 1.0,
+    ) -> Tuple[Dict[int, torch.Tensor], "AllocationOutputs"]:
+        """Re-evaluate the DEPLOYED (hard) allocation, reusing the routes,
+        segments and per-segment GSNRs a prior forward() call already
+        produced — instead of running a second full forward pass.
+
+        Valid only when `alloc` is this SAME pipeline's forward() output for
+        these SAME `demands`, at the SAME edge_log_weight this call would
+        otherwise re-derive (i.e. call this before opt_edge.step() moves the
+        weights). Under that condition routing, segmentation and QoT are
+        bit-identical between a soft and a hard pass — hard_alloc only
+        changes what AllocationHead.rollout does with seg_noise/seg_km, which
+        are computed upstream of and independently from hard_alloc — so
+        reusing `alloc.seg_gsnr_db`/`seg_noise`/`seg_km_matrix`/
+        `num_segments`/`boundary_node_ids` is exact, not approximate.
+        Verified bit-identical against a fresh forward(hard_alloc=True) pass
+        on all 346 real demands; see
+        docs/investigations/pipeline_profile_and_restoration_scaling.md,
+        Finding 2 / item A2.
+
+        Runs entirely under torch.no_grad() — hard decisions carry no useful
+        gradient (spec 2.5), so there is nothing to build a graph for.
+        """
+        device = alloc.seg_noise.device
+        num_demands = len(demands)
+        if num_demands == 0:
+            empty_dd = torch.zeros(0, 0, device=device)
+            hard_outputs = AllocationOutputs(
+                a=empty_dd,
+                a_physics=empty_dd,
+                score=empty_dd,
+                alloc_by_node=torch.zeros(0, self._num_nodes, device=device),
+                device_count=torch.zeros((), device=device),
+                site_view=torch.zeros(self._num_nodes, device=device),
+                seg_gsnr_db=empty_dd,
+                seg_noise=empty_dd,
+                seg_km_matrix=empty_dd,
+                num_segments=torch.zeros(0, dtype=torch.long, device=device),
+                boundary_node_ids=torch.zeros(0, 0, dtype=torch.long, device=device),
+                demand_ids=[],
+                ste_clamped_segments=alloc.ste_clamped_segments,
+                proxy_qot_rank_corr=alloc.proxy_qot_rank_corr,
+                waste_cost=torch.zeros((), device=device),
+            )
+            return {}, hard_outputs
+
+        bar_db = bar_db_for_demands(
+            demands, self._modulation_config, self._margin_db
+        ).to(device)
+
+        with torch.no_grad():
+            a, a_physics, waste_cost = self.allocation_head.rollout(
+                alloc.seg_noise, alloc.seg_km_matrix, bar_db, alloc.num_segments,
+                tau=tau, hard=True,
+            )
+
+            bnd_matrix = alloc.boundary_node_ids
+            alloc_by_node = torch.zeros(num_demands, self._num_nodes, device=device)
+            real = bnd_matrix >= 0
+            if real.any():
+                rows_idx = torch.arange(num_demands, device=device).unsqueeze(1)
+                alloc_by_node = alloc_by_node.index_put(
+                    (rows_idx.expand_as(bnd_matrix)[real], bnd_matrix[real]),
+                    a[real],
+                    accumulate=True,      # one demand can cut twice at one node
+                )
+
+            path_gsnrs = self.segment_combiner.forward_batched(
+                alloc.seg_gsnr_db, a_physics, alloc.num_segments
+            )
+
+        gsnr_preds = {d.id: path_gsnrs[row] for row, d in enumerate(demands)}
+
+        hard_outputs = AllocationOutputs(
+            a=a,
+            a_physics=a_physics,
+            score=self.allocation_head.last_scores,
+            alloc_by_node=alloc_by_node,
+            device_count=total_device_cost(alloc_by_node),
+            site_view=site_view(alloc_by_node),
+            seg_gsnr_db=alloc.seg_gsnr_db,
+            seg_noise=alloc.seg_noise,
+            seg_km_matrix=alloc.seg_km_matrix,
+            num_segments=alloc.num_segments,
+            boundary_node_ids=alloc.boundary_node_ids,
+            demand_ids=[d.id for d in demands],
+            ste_clamped_segments=alloc.ste_clamped_segments,
+            proxy_qot_rank_corr=alloc.proxy_qot_rank_corr,
+            waste_cost=waste_cost,
+        )
+        return gsnr_preds, hard_outputs

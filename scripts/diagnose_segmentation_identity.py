@@ -69,9 +69,8 @@ rows_reset, rows_carry, allspans, segspans = [], [], [], []
 with torch.no_grad():
     ew = edge_weights_of(ctx, tau=1.0)
     for d in demands:
-        pi = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
-                                     pipe._num_nodes, lambda_=vlastelica_lambda)
-        ordered = pipe._reconstruct_path(pi, d.src, d.dst)
+        pi, ordered = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
+                                              pipe._num_nodes, lambda_=vlastelica_lambda)
         if not ordered:
             continue
         allspans.append(nspans(ordered))

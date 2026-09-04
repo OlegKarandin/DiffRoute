@@ -70,6 +70,46 @@ def linear_anneal(
     return start + frac * (end - start)
 
 
+def cosine_anneal(
+    epoch: int,
+    start: float,
+    end: float,
+    anneal_start: int,
+    anneal_end: int,
+) -> float:
+    """Cosine-decay a scalar from `start` to `end` over [anneal_start, anneal_end].
+
+    Same interface as `linear_anneal`. Drives `training.lr_alloc` when
+    `lr_alloc_schedule: cosine` (open_followups.md #7a): the binding
+    constraint per optimizer_normalization_and_the_score_runaway.md's
+    Finding 8 is the feasible-EPOCH rate under checkpoint selection, not the
+    trajectory mean, and decaying lr is the standard way to turn an
+    oscillating SGD trajectory into a converging one — which is what would
+    make that rate stop mattering. Cosine (not linear) spends more of the
+    budget near both endpoints: mostly-`start` early (still exploring),
+    mostly-`end` late (settling), with the fastest descent through the
+    middle.
+    """
+    if epoch <= anneal_start:
+        return start
+    if epoch >= anneal_end:
+        return end
+    frac = (epoch - anneal_start) / (anneal_end - anneal_start)
+    return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * frac))
+
+
+def step_decay(epoch: int, start: float, step_size: int, gamma: float) -> float:
+    """Multiply `start` by `gamma` every `step_size` epochs (1-indexed, so
+    the value is still exactly `start` for epochs [1, step_size]) —
+    PyTorch's own StepLR rule, reimplemented here (rather than driving
+    opt_alloc through a torch.optim.lr_scheduler) so the schedule train.py
+    logs and the lr opt_alloc actually steps with can never drift apart.
+    `step_size <= 0` disables decay (start is returned unchanged)."""
+    if step_size <= 0:
+        return start
+    return start * (gamma ** ((epoch - 1) // step_size))
+
+
 def alloc_score_stats(alloc) -> Tuple[float, float, float]:
     """(mean, min, max) of the head's raw scores on REAL boundaries.
 
@@ -157,9 +197,9 @@ def alloc_dead_fraction(alloc, tau: float, threshold: float = ALLOC_DEAD_SLOPE) 
 def hard_rollout(
     pipeline,
     demands: List[Demand],
+    soft_alloc,
     modulation_config: ModulationConfig,
     *,
-    lambda_: float,
     margin_db: float,
 ) -> dict:
     """Evaluate the DEPLOYED allocation — the one that would actually ship.
@@ -171,6 +211,16 @@ def hard_rollout(
     mean-field relaxation whose carry `c * (1 - a)` is an expectation over
     partitions; thresholding it reports a number no single allocation
     produces. Spec 2.5.
+
+    `soft_alloc` must be THIS pipeline's forward() output for these SAME
+    `demands`, at the SAME edge_log_weight this call would otherwise
+    re-derive — i.e. call this before opt_edge.step() moves the weights.
+    Reuses its routes/segments/GSNRs via
+    `DiffONetPipeline.hard_rollout_from_soft` instead of running a second
+    full forward pass: routing, segmentation and QoT never depend on
+    hard_alloc, so this is exact, not approximate (open_followups.md #7b /
+    docs/investigations/pipeline_profile_and_restoration_scaling.md,
+    Finding 2).
 
     Also computes the oracle's minimum on the SAME routes and segment GSNRs,
     so `oracle_gap` costs no extra forward pass. The gap is the acceptance
@@ -213,7 +263,7 @@ def hard_rollout(
     selected on zero violations first) ever reads.
     """
     with torch.no_grad():
-        _, gsnr_preds, _, alloc = pipeline(demands, lambda_=lambda_, hard_alloc=True)
+        gsnr_preds, alloc = pipeline.hard_rollout_from_soft(demands, soft_alloc)
 
         bar_db = bar_db_for_demands(demands, modulation_config, margin_db).to(
             alloc.a.device
@@ -461,6 +511,23 @@ def main() -> None:
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
     epochs: int = t_cfg["epochs_e2e"]
 
+    # lr_alloc schedule (open_followups.md #7a). "none" (default) reproduces
+    # today's flat lr exactly — opt_alloc's own constructor lr, never
+    # touched again — so every existing config's trajectory is unchanged
+    # unless it opts in.
+    lr_alloc_start: float = t_cfg["lr_alloc"]
+    lr_alloc_schedule: str = t_cfg.get("lr_alloc_schedule", "none")
+    if lr_alloc_schedule not in ("none", "cosine", "step"):
+        raise ValueError(
+            f"training.lr_alloc_schedule must be one of 'none', 'cosine', "
+            f"'step', got {lr_alloc_schedule!r}"
+        )
+    lr_alloc_end: float = float(t_cfg.get("lr_alloc_end", lr_alloc_start))
+    lr_alloc_anneal_start_epoch: int = int(t_cfg.get("lr_alloc_anneal_start_epoch", 1))
+    lr_alloc_anneal_end_epoch: int = int(t_cfg.get("lr_alloc_anneal_end_epoch", epochs))
+    lr_alloc_step_size: int = int(t_cfg.get("lr_alloc_step_size", 0))
+    lr_alloc_step_gamma: float = float(t_cfg.get("lr_alloc_step_gamma", 1.0))
+
     log_dir = Path(cfg.get("log_dir", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = Path(cfg.get("checkpoint_dir", "checkpoints"))
@@ -511,7 +578,7 @@ def main() -> None:
             "hard_worst_margin_db", "oracle_devices", "oracle_gap",
             "oracle_infeasible", "worst_margin_db",
             "lambda_max_observed", "num_at_cap",
-            "tau", "vlastelica_lambda",
+            "tau", "vlastelica_lambda", "lr_alloc",
             "alloc_score_mean", "alloc_score_min", "alloc_score_max",
             "lookahead",
             "route_context", "waste_cost",
@@ -527,6 +594,19 @@ def main() -> None:
                 t_cfg["alloc_tau_anneal_start_epoch"],
                 t_cfg["alloc_tau_anneal_end_epoch"],
             )
+
+            if lr_alloc_schedule == "cosine":
+                lr_alloc = cosine_anneal(
+                    epoch, lr_alloc_start, lr_alloc_end,
+                    lr_alloc_anneal_start_epoch, lr_alloc_anneal_end_epoch,
+                )
+            elif lr_alloc_schedule == "step":
+                lr_alloc = step_decay(
+                    epoch, lr_alloc_start, lr_alloc_step_size, lr_alloc_step_gamma,
+                )
+            else:
+                lr_alloc = lr_alloc_start
+            opt_alloc.param_groups[0]["lr"] = lr_alloc
 
             opt_edge.zero_grad()
             opt_alloc.zero_grad()
@@ -574,8 +654,7 @@ def main() -> None:
             # Pre-step, like the two snapshots above: the checkpoint must
             # save the parameters its own key describes.
             hard = hard_rollout(
-                pipeline, demands, mod_cfg,
-                lambda_=vlastelica_lambda,
+                pipeline, demands, alloc, mod_cfg,
                 margin_db=c_cfg["margin_db"],
             )
 
@@ -634,6 +713,7 @@ def main() -> None:
                 num_at_cap,
                 f"{tau:.4f}",
                 f"{vlastelica_lambda:.4f}",
+                f"{lr_alloc:.6e}",
                 f"{score_mean:.6f}",
                 f"{score_min:.6f}",
                 f"{score_max:.6f}",

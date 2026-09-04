@@ -62,9 +62,8 @@ with torch.no_grad():
     ew = edge_weights_of(ctx, tau=1.0)
     vlastelica_lambda = cfg["training"]["vlastelica_lambda"]
     for d in demands:
-        pi = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
-                                     pipe._num_nodes, lambda_=vlastelica_lambda)
-        ordered = pipe._reconstruct_path(pi, d.src, d.dst)
+        pi, ordered = surrogate_shortest_path(ew, pipe._edge_index, d.src, d.dst,
+                                              pipe._num_nodes, lambda_=vlastelica_lambda)
         segs, _ = segment_path(ordered, d.src, pipe._regen_candidate_set,
                                pipe._edges, d.dst)
         nsegs.append(len(segs))

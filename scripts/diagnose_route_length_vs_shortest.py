@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 
 from diffopt.routing.shortest_path import dijkstra
@@ -64,22 +65,23 @@ final_epoch = t_cfg["epochs_e2e"]
 demands = demands_for(ctx, seed=final_epoch)
 print(f"{len(demands)} demands (seed={final_epoch}, matching training's final epoch)\n")
 
-tau_end = t_cfg["alloc_tau_end"]
-vlastelica_lambda = ctx.ckpt["vlastelica_lambda"]
-
 with torch.no_grad():
-    _, _, path_indicators, _ = pipe(
-        demands, tau=tau_end, lambda_=vlastelica_lambda
-    )
+    # Same normalisation forward() applies before routing (softplus, then
+    # renormalised to unit mean). Routing depends only on edge_log_weight,
+    # not on any per-call forward output, so recomputing it directly here
+    # -- with return_order=True -- gets the trained routes' src->dst edge
+    # order in one Dijkstra call instead of a forward pass plus a second
+    # graph walk to recover the ordering (open_followups.md #7b).
+    raw_edge_weights = F.softplus(pipe.edge_log_weight)
+    trained_weights = (raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)).numpy()
 
 rows = []
 for d in demands:
-    trained_edges = pipe._reconstruct_path(path_indicators[d.id], d.src, d.dst)
+    _, trained_edges = dijkstra(trained_weights, ei, d.src, d.dst, topo.num_nodes, return_order=True)
     trained_km = sum(edges[e].length_km for e in trained_edges)
     trained_hops = len(trained_edges)
 
-    pi = dijkstra(lens, ei, d.src, d.dst, topo.num_nodes)
-    shortest_edges = pipe._reconstruct_path(torch.tensor(pi, dtype=torch.float32), d.src, d.dst)
+    _, shortest_edges = dijkstra(lens, ei, d.src, d.dst, topo.num_nodes, return_order=True)
     shortest_km = sum(edges[e].length_km for e in shortest_edges)
 
     rows.append((d.id, d.src, d.dst, d.bitrate_gbps, trained_km, trained_hops, shortest_km))

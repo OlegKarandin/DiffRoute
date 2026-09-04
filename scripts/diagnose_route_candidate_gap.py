@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import yaml
 
 # data/ is not a package (no __init__.py, not installed editable), so
@@ -49,6 +50,7 @@ from generate_qot_dataset import build_nx_graph, get_k_shortest_paths  # noqa: E
 from diffopt.modulation import bar_db_for_demands  # noqa: E402
 from diffopt.pipeline import segment_path  # noqa: E402
 from diffopt.placement.oracle import oracle_allocation  # noqa: E402
+from diffopt.routing.shortest_path import dijkstra  # noqa: E402
 from diffopt.qot.span_features import SPAN_FEATURE_DIM, span_feature_rows  # noqa: E402
 
 from _common import (  # noqa: E402
@@ -153,16 +155,25 @@ def candidate_oracle_devices(
     return best
 
 
-def learned_node_path(ctx: DiagContext, demand, path_indicator: torch.Tensor) -> List[int]:
+def learned_node_path(ctx: DiagContext, demand) -> List[int]:
     """Node path the trained pipeline routes this demand over.
 
-    Rebuilt from the pipeline's own `_reconstruct_path` (private on purpose;
-    scripts/_common.py's docstring records that diagnose scripts reach into
-    the pipeline's private members rather than duplicating them) so the
-    learned side of the comparison is literally the routing the hard
-    rollout evaluated, not a re-derivation of it.
+    Routing depends only on edge_log_weight, not on hard vs. soft
+    decisions, so a fresh Dijkstra call at the pipeline's current (unit-
+    mean-renormalised) weights IS the routing the hard rollout evaluated,
+    not a re-derivation of it (docs/investigations/
+    pipeline_profile_and_restoration_scaling.md, Finding 2 /
+    open_followups.md #7b).
     """
-    eids = ctx.pipeline._reconstruct_path(path_indicator, demand.src, demand.dst)
+    raw_edge_weights = F.softplus(ctx.pipeline.edge_log_weight)
+    edge_weights = (
+        raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)
+    ).detach().numpy()
+    ei = ctx.pipeline._edge_index.numpy()
+    _, eids = dijkstra(
+        edge_weights, ei, demand.src, demand.dst, ctx.pipeline._num_nodes,
+        return_order=True,
+    )
     nodes = [demand.src]
     for eid in eids:
         e = ctx.edges[eid]

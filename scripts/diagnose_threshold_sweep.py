@@ -180,9 +180,13 @@ def main() -> None:
         for delta in delta_grid:
             with torch.no_grad():
                 net[-1].bias.copy_(original_bias + delta)
+            # soft_alloc's routes/segments/GSNRs don't depend on the bias
+            # being swept (only AllocationHead.rollout's fresh `s = score(feats)`
+            # does), so it's reused across every delta rather than re-routed
+            # per iteration -- open_followups.md #7b.
             hard = hard_rollout(
-                ctx.pipeline, demands, ctx.mod_cfg,
-                lambda_=vlastelica_lambda, margin_db=margin_db,
+                ctx.pipeline, demands, soft_alloc, ctx.mod_cfg,
+                margin_db=margin_db,
             )
             rows.append((
                 delta,

@@ -170,8 +170,7 @@ def _first_recruitment_epoch(
         # Pre-step, like train.py: this describes the parameters the forward
         # pass above ran on, not the post-step ones.
         hard = hard_rollout(
-            ctx.pipeline, demands, ctx.mod_cfg,
-            lambda_=vlastelica_lambda,
+            ctx.pipeline, demands, alloc, ctx.mod_cfg,
             margin_db=c_cfg["margin_db"],
         )
 

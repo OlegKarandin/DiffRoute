@@ -83,6 +83,63 @@ def test_generic_across_different_schedules():
 
 
 # ---------------------------------------------------------------------------
+# cosine_anneal / step_decay — open_followups.md #7a's lr_alloc schedule
+# ---------------------------------------------------------------------------
+
+from diffopt.train import cosine_anneal, step_decay  # noqa: E402
+
+
+def test_cosine_anneal_before_start_and_after_end_returns_the_endpoints():
+    assert cosine_anneal(epoch=1, start=1.0, end=0.1, anneal_start=5, anneal_end=20) == 1.0
+    assert cosine_anneal(epoch=5, start=1.0, end=0.1, anneal_start=5, anneal_end=20) == 1.0
+    assert cosine_anneal(epoch=20, start=1.0, end=0.1, anneal_start=5, anneal_end=20) == 0.1
+    assert cosine_anneal(epoch=100, start=1.0, end=0.1, anneal_start=5, anneal_end=20) == 0.1
+
+
+def test_cosine_anneal_midpoint_is_the_arithmetic_mean():
+    """Cosine's own defining property: at exactly the midpoint of the
+    window, cos(pi/2) == 0, so the value is exactly (start+end)/2 — the
+    same point linear interpolation would give, even though the path there
+    differs."""
+    result = cosine_anneal(epoch=5, start=1.0, end=0.0, anneal_start=0, anneal_end=10)
+    assert result == pytest.approx(0.5)
+
+
+def test_cosine_anneal_decays_slower_than_linear_near_the_endpoints():
+    """The whole reason to prefer cosine over linear_anneal for lr_alloc:
+    it spends more of the budget close to `start` (still exploring) and
+    close to `end` (settled), moving fastest through the middle."""
+    linear_early = linear_anneal(epoch=2, start=1.0, end=0.0, anneal_start=0, anneal_end=10)
+    cosine_early = cosine_anneal(epoch=2, start=1.0, end=0.0, anneal_start=0, anneal_end=10)
+    assert cosine_early > linear_early   # cosine has decayed LESS by epoch 2
+
+
+def test_cosine_anneal_monotonic_decrease_across_the_window():
+    values = [
+        cosine_anneal(epoch=e, start=0.5, end=0.01, anneal_start=5, anneal_end=18)
+        for e in range(1, 25)
+    ]
+    for i in range(1, len(values)):
+        assert values[i] <= values[i - 1] + 1e-12
+    assert values[0] == 0.5
+    assert values[-1] == 0.01
+
+
+def test_step_decay_holds_start_within_the_first_step_size_epochs():
+    assert step_decay(epoch=1, start=1.0, step_size=10, gamma=0.5) == 1.0
+    assert step_decay(epoch=10, start=1.0, step_size=10, gamma=0.5) == 1.0
+
+
+def test_step_decay_multiplies_by_gamma_each_step():
+    assert step_decay(epoch=11, start=1.0, step_size=10, gamma=0.5) == pytest.approx(0.5)
+    assert step_decay(epoch=21, start=1.0, step_size=10, gamma=0.5) == pytest.approx(0.25)
+
+
+def test_step_decay_disabled_below_zero_step_size_returns_start_unchanged():
+    assert step_decay(epoch=1000, start=1.0, step_size=0, gamma=0.5) == 1.0
+
+
+# ---------------------------------------------------------------------------
 # hard_rollout, against a REAL pipeline
 # ---------------------------------------------------------------------------
 
@@ -122,14 +179,26 @@ def _tiny_e2e_setup():
     return topology, pipeline, make_demands(), mod_cfg
 
 
+def _soft_alloc(pipeline, demands, *, lambda_: float = 10.0, tau: float = 1.0):
+    """The soft-pass AllocationOutputs hard_rollout now requires (open_
+    followups.md #7b): it reuses this pass's routes/segments/GSNRs instead
+    of running its own fresh forward. `tau` doesn't matter to anything
+    hard_rollout reads off it — only the routing/segmentation/QoT fields,
+    which are tau-independent."""
+    with torch.no_grad():
+        _, _, _, alloc = pipeline(demands, tau=tau, lambda_=lambda_)
+    return alloc
+
+
 def test_hard_rollout_reports_devices_sites_and_the_oracle_gap():
     """Spec 2.5 + 2.6. hard_num_placed is DELETED; hard_num_sites is
     logged and never priced."""
     topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
     with torch.no_grad():
         pipeline.allocation_head.net[-1].bias.fill_(5.0)   # cut everywhere
+    alloc = _soft_alloc(pipeline, demands)
     hard = train_mod.hard_rollout(
-        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+        pipeline, demands, alloc, mod_cfg, margin_db=0.5
     )
     assert "hard_num_placed" not in hard
     assert hard["hard_num_devices"] >= hard["hard_num_sites"]
@@ -139,8 +208,9 @@ def test_hard_rollout_reports_devices_sites_and_the_oracle_gap():
 
 def test_hard_rollout_is_deterministic_and_leaves_no_graph():
     topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
-    a = train_mod.hard_rollout(pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5)
-    b = train_mod.hard_rollout(pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5)
+    alloc = _soft_alloc(pipeline, demands)
+    a = train_mod.hard_rollout(pipeline, demands, alloc, mod_cfg, margin_db=0.5)
+    b = train_mod.hard_rollout(pipeline, demands, alloc, mod_cfg, margin_db=0.5)
     assert a["hard_num_devices"] == b["hard_num_devices"]
     for p in pipeline.allocation_head.parameters():
         assert p.grad is None
@@ -167,8 +237,9 @@ def test_oracle_gap_is_measured_only_on_demands_the_head_made_feasible():
     pipeline = make_pipeline(topology)      # the 20.0 dB threshold config
     demands, mod_cfg = make_demands(), make_mod_config()
 
+    alloc = _soft_alloc(pipeline, demands)
     hard = train_mod.hard_rollout(
-        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+        pipeline, demands, alloc, mod_cfg, margin_db=0.5
     )
     assert hard["hard_num_devices"] == 0          # closed head buys nothing
     assert hard["oracle_devices"] > 0             # the floor is not zero
@@ -185,8 +256,9 @@ def test_oracle_gap_survives_an_under_buying_head_at_epoch_one():
     every training run. The shortfall is reported as hard_num_violated.
     """
     topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
+    alloc = _soft_alloc(pipeline, demands)
     hard = train_mod.hard_rollout(
-        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+        pipeline, demands, alloc, mod_cfg, margin_db=0.5
     )
     assert hard["oracle_infeasible"] == 0        # the route admits a solution
     assert hard["oracle_devices"] > 0            # and it needs devices
@@ -198,8 +270,9 @@ def test_oracle_gap_survives_an_under_buying_head_at_epoch_one():
 def test_hard_rollout_counts_violations_against_threshold_plus_margin():
     """num_violated is the margin-inclusive count, matching compute_loss."""
     topology, pipeline, demands, mod_cfg = _tiny_e2e_setup()
+    alloc = _soft_alloc(pipeline, demands)
     hard = train_mod.hard_rollout(
-        pipeline, demands, mod_cfg, lambda_=10.0, margin_db=0.5
+        pipeline, demands, alloc, mod_cfg, margin_db=0.5
     )
     threshold = mod_cfg.required_snr_threshold(400.0)
     with torch.no_grad():
@@ -265,7 +338,9 @@ class _DummyPipeline:
     no-op satisfying main()'s call shape:
     `pipeline(demands, tau=..., lambda_=...)` ->
     (path_noise_costs, gsnr_preds, path_indicators, AllocationOutputs), plus
-    the `hard_alloc=True` variant hard_rollout uses.
+    `hard_rollout_from_soft(demands, alloc, ...)` -> (gsnr_preds,
+    AllocationOutputs), the reuse path `train.hard_rollout` now calls
+    instead of a second `hard_alloc=True` forward (open_followups.md #7b).
 
     `gsnr_value` is a class attribute rather than a constructor argument
     because main() constructs the pipeline itself — the test has no handle
@@ -290,6 +365,11 @@ class _DummyPipeline:
         gsnr = {d.id: torch.tensor(_DummyPipeline.gsnr_value) for d in demands}
         noise = {d.id: torch.zeros(()) for d in demands}
         return noise, gsnr, {}, alloc
+
+    def hard_rollout_from_soft(self, demands, alloc, tau=1.0):
+        hard_alloc = _DummyAlloc(hard=True)
+        gsnr = {d.id: torch.tensor(_DummyPipeline.gsnr_value) for d in demands}
+        return gsnr, hard_alloc
 
 
 def _write_config(
@@ -647,13 +727,102 @@ def test_log_csv_header_is_device_priced(tmp_path):
         "hard_worst_margin_db", "oracle_devices", "oracle_gap",
         "oracle_infeasible", "worst_margin_db",
         "lambda_max_observed", "num_at_cap",
-        "tau", "vlastelica_lambda",
+        "tau", "vlastelica_lambda", "lr_alloc",
         "alloc_score_mean", "alloc_score_min", "alloc_score_max",
         "lookahead",
         "route_context", "waste_cost",
         "ste_clamped_segments", "proxy_qot_rank_corr",
         "alloc_dead_frac", "alloc_grad_norm",
     ]
+
+
+def test_lr_alloc_schedule_defaults_to_flat(tmp_path):
+    """The whole point of defaulting to 'none': every existing config's
+    trajectory is unchanged unless it opts into a schedule. lr_alloc must
+    read back exactly the configured constant on every epoch."""
+    _run_training(tmp_path, epochs=3, training_overrides={"lr_alloc": 0.0005})
+    rows = _read_csv(tmp_path / "logs" / "e2e_train_log.csv")
+    header, body = rows[0], rows[1:]
+    col = header.index("lr_alloc")
+    assert len(body) == 3
+    for row in body:
+        assert float(row[col]) == pytest.approx(0.0005)
+
+
+def test_lr_alloc_cosine_schedule_decays_monotonically_to_lr_alloc_end(tmp_path):
+    _run_training(
+        tmp_path, epochs=5,
+        training_overrides={
+            "lr_alloc": 1.0e-2,
+            "lr_alloc_schedule": "cosine",
+            "lr_alloc_end": 1.0e-4,
+            "lr_alloc_anneal_start_epoch": 1,
+            "lr_alloc_anneal_end_epoch": 5,
+        },
+    )
+    rows = _read_csv(tmp_path / "logs" / "e2e_train_log.csv")
+    header, body = rows[0], rows[1:]
+    col = header.index("lr_alloc")
+    values = [float(row[col]) for row in body]
+    assert values[0] == pytest.approx(1.0e-2)
+    assert values[-1] == pytest.approx(1.0e-4)
+    for i in range(1, len(values)):
+        assert values[i] <= values[i - 1] + 1e-12
+
+
+def test_lr_alloc_step_schedule_drops_by_gamma_at_the_step(tmp_path):
+    _run_training(
+        tmp_path, epochs=4,
+        training_overrides={
+            "lr_alloc": 1.0e-2,
+            "lr_alloc_schedule": "step",
+            "lr_alloc_step_size": 2,
+            "lr_alloc_step_gamma": 0.1,
+        },
+    )
+    rows = _read_csv(tmp_path / "logs" / "e2e_train_log.csv")
+    header, body = rows[0], rows[1:]
+    col = header.index("lr_alloc")
+    values = [float(row[col]) for row in body]
+    assert values[0] == pytest.approx(1.0e-2)
+    assert values[1] == pytest.approx(1.0e-2)
+    assert values[2] == pytest.approx(1.0e-3)
+    assert values[3] == pytest.approx(1.0e-3)
+
+
+def test_lr_alloc_schedule_rejects_an_unknown_value(tmp_path):
+    with pytest.raises(ValueError, match="lr_alloc_schedule"):
+        _run_training(
+            tmp_path, epochs=1,
+            training_overrides={"lr_alloc_schedule": "exponential"},
+        )
+
+
+def test_lr_alloc_actually_drives_the_optimizer_not_only_the_log(tmp_path, monkeypatch):
+    """The log column is read off opt_alloc.param_groups[0]['lr'] itself,
+    not recomputed separately -- assert on the live optimizer state so a
+    version that logs the right number but forgets to set the lr can't
+    pass."""
+    seen_lrs = []
+    real_step = torch.optim.SGD.step
+
+    def spying_step(self, *a, **kw):
+        seen_lrs.append(self.param_groups[0]["lr"])
+        return real_step(self, *a, **kw)
+
+    monkeypatch.setattr(torch.optim.SGD, "step", spying_step)
+    _run_training(
+        tmp_path, epochs=3,
+        training_overrides={
+            "lr_alloc": 1.0,
+            "lr_alloc_schedule": "step",
+            "lr_alloc_step_size": 1,
+            "lr_alloc_step_gamma": 0.1,
+        },
+    )
+    # opt_edge also uses SGD-free Adam, so every spied call here is
+    # opt_alloc.step() -- three epochs, three steps, decaying by 0.1 each.
+    assert seen_lrs == pytest.approx([1.0, 0.1, 0.01])
 
 
 def test_log_csv_records_a_non_negative_oracle_gap(tmp_path):

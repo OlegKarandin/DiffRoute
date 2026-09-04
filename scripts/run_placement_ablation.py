@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Set
 
+import torch
 import yaml
 
 from _common import build_context, fixed_traffic_demands
@@ -227,9 +228,13 @@ def score(config_path: Path) -> dict:
     # improvement, not only the final epoch) -- see _common.build_context's
     # docstring for why this is preferred over recomputing a schedule at a
     # guessed epoch.
+    # A soft pass just to get routes/segments/GSNRs -- hard_rollout reuses
+    # them rather than re-routing (open_followups.md #7b); its own soft
+    # allocation is discarded.
+    with torch.no_grad():
+        _, _, _, soft_alloc = ctx.pipeline(demands, lambda_=ckpt["vlastelica_lambda"])
     hard = hard_rollout(
-        ctx.pipeline, demands, ctx.mod_cfg,
-        lambda_=ckpt["vlastelica_lambda"],
+        ctx.pipeline, demands, soft_alloc, ctx.mod_cfg,
         margin_db=cfg["constraint"]["margin_db"],
     )
 

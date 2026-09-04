@@ -55,11 +55,11 @@ demands = demands_for(ctx, seed=args.seed, num_demands=args.num_demands)
 rows = []
 with torch.no_grad():
     for d in demands:
-        pi = dijkstra(lens, ei, d.src, d.dst, ctx.topology.num_nodes)
+        pi, ordered = dijkstra(
+            lens, ei, d.src, d.dst, ctx.topology.num_nodes, return_order=True
+        )
         if pi is None:
             continue
-        pit = torch.tensor(pi, dtype=torch.float32)
-        ordered = pipe._reconstruct_path(pit, d.src, d.dst)
         if not ordered:
             continue
         km = sum(edges[e].length_km for e in ordered)

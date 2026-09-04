@@ -203,6 +203,85 @@ def test_cached_structure_does_not_freeze_the_weights():
     np.testing.assert_array_equal(cheap_bottom, np.array([0.0, 1.0, 0.0, 1.0], dtype=np.float32))
 
 
+# ---------------------------------------------------------------------------
+# return_order — open_followups.md #7b / Finding 1: Dijkstra's own
+# prev-chain already has the src->dst edge order, so a caller should not
+# need a second graph walk to recover it from the unordered indicator.
+# ---------------------------------------------------------------------------
+
+def test_return_order_false_is_the_default_and_unchanged():
+    """Every existing caller relies on the plain (E,) indicator return —
+    return_order defaults to False and must not change that contract."""
+    edge_index = _edges([(0, 1), (1, 2), (0, 2)])
+    edge_weights = np.array([1.0, 1.0, 5.0])
+
+    path = dijkstra(edge_weights, edge_index, src=0, dst=2, num_nodes=3)
+
+    assert isinstance(path, np.ndarray)
+    np.testing.assert_array_equal(path, np.array([1.0, 1.0, 0.0], dtype=np.float32))
+
+
+def test_return_order_true_gives_the_src_to_dst_edge_order():
+    """0-1-2, edges e0 (0-1) then e1 (1-2) — ordered_edges must read [0, 1],
+    not just {0, 1} in some order, and path_indicator must be unchanged."""
+    edge_index = _edges([(0, 1), (1, 2), (0, 2)])
+    edge_weights = np.array([1.0, 1.0, 5.0])
+
+    path, ordered_edges = dijkstra(
+        edge_weights, edge_index, src=0, dst=2, num_nodes=3, return_order=True
+    )
+
+    np.testing.assert_array_equal(path, np.array([1.0, 1.0, 0.0], dtype=np.float32))
+    assert ordered_edges == [0, 1]
+
+
+def test_return_order_true_matches_a_manual_walk_of_the_indicator():
+    """On a real multi-hop path (a tied 4-node square from the test above,
+    forced onto the top route), ordered_edges must be exactly the same
+    src->dst walk a caller would get by manually tracing the indicator's
+    active edges from src — which is what the deleted
+    diffopt.pipeline._reconstruct_path used to do as a second graph walk
+    (verified equivalent on all 346 real ind_132 demands per
+    pipeline_profile_and_restoration_scaling.md, Finding 1)."""
+    edge_index = _edges([(0, 1), (0, 2), (1, 3), (2, 3)])
+    weights = np.array([1.0, 9.0, 1.0, 9.0])
+
+    path, ordered_edges = dijkstra(weights, edge_index, 0, 3, 4, return_order=True)
+
+    np.testing.assert_array_equal(path, np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32))
+
+    # Manual walk: from src (0), follow active edges until dst (3).
+    edges_by_id = {i: (int(edge_index[0, i]), int(edge_index[1, i]))
+                   for i in range(edge_index.shape[1])}
+    adj = {}
+    for eid, active in enumerate(path):
+        if active > 0.5:
+            u, v = edges_by_id[eid]
+            adj.setdefault(u, []).append((v, eid))
+            adj.setdefault(v, []).append((u, eid))
+    manual_order = []
+    node, dst = 0, 3
+    while node != dst:
+        for nxt, eid in adj[node]:
+            if eid not in manual_order:
+                manual_order.append(eid)
+                node = nxt
+                break
+
+    assert ordered_edges == manual_order
+
+
+def test_return_order_true_no_path_returns_none_none():
+    edge_index = _edges([(0, 1)])
+    edge_weights = np.array([1.0])
+
+    result = dijkstra(
+        edge_weights, edge_index, src=0, dst=2, num_nodes=3, return_order=True
+    )
+
+    assert result == (None, None)
+
+
 def test_adjacency_cache_is_bounded():
     """A diagnostic sweeping many synthetic graphs must not grow the cache
     without limit. Real use has one topology per process."""

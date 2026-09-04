@@ -42,12 +42,20 @@ def make_weights(*vals) -> torch.Tensor:
 def test_correct_path_selection():
     """S-A-T cheaper than S-B-T: path indicator should select e0, e2."""
     weights = make_weights(1.0, 2.0, 1.0, 2.0)  # S-A-T cost=2, S-B-T cost=4
-    path = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES)
+    path, ordered_edges = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES)
 
     assert path[E_SA].item() == 1.0, "Expected S-A edge on path"
     assert path[E_AT].item() == 1.0, "Expected A-T edge on path"
     assert path[E_SB].item() == 0.0, "Expected S-B edge NOT on path"
     assert path[E_BT].item() == 0.0, "Expected B-T edge NOT on path"
+
+
+def test_ordered_edges_is_src_to_dst_traversal_order():
+    """`ordered_edges` (open_followups.md #7b) must be e0, e2 in that order —
+    the S->A->T walk, not just the same two edges in any order."""
+    weights = make_weights(1.0, 2.0, 1.0, 2.0)
+    _, ordered_edges = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES)
+    assert ordered_edges == [E_SA, E_AT]
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +70,7 @@ def test_nonzero_gradient():
     weights = make_weights(1.0, 3.0, 1.0, 3.0)
     weights.requires_grad_(True)
 
-    path = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES, lambda_=10.0)
+    path, _ = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES, lambda_=10.0)
 
     # Loss: penalise use of A-path edges (push optimizer to prefer B-path)
     loss = path[E_SA] + path[E_AT]
@@ -89,7 +97,7 @@ def test_gradient_direction():
     weights = make_weights(1.0, 3.0, 1.0, 3.0)
     weights.requires_grad_(True)
 
-    path = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES, lambda_=10.0)
+    path, _ = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES, lambda_=10.0)
     loss = path[E_SA] + path[E_AT]
     loss.backward()
 
@@ -127,7 +135,7 @@ def test_zero_gradient_for_irrelevant_edge():
     weights_ext = make_weights(1.0, 3.0, 1.0, 3.0, 1.0)  # 5 edges
     weights_ext.requires_grad_(True)
 
-    path = surrogate_shortest_path(
+    path, _ = surrogate_shortest_path(
         weights_ext, edge_index_ext, S, T, num_nodes_ext, lambda_=10.0
     )
     # Penalise A-path edges: this creates non-zero gradients on SA/AT/SB/BT
@@ -156,7 +164,7 @@ def test_path_switch_under_gradient_descent():
 
     for step in range(50):
         w = w.detach().clone().requires_grad_(True)
-        path = surrogate_shortest_path(w, EDGE_INDEX, S, T, NUM_NODES, lambda_=5.0)
+        path, _ = surrogate_shortest_path(w, EDGE_INDEX, S, T, NUM_NODES, lambda_=5.0)
         # Loss: strongly penalise A-path edges
         loss = 10.0 * (path[E_SA] + path[E_AT])
         loss.backward()
@@ -169,14 +177,14 @@ def test_path_switch_under_gradient_descent():
 
         # Check if B-path is now selected
         with torch.no_grad():
-            test_path = surrogate_shortest_path(
+            test_path, _ = surrogate_shortest_path(
                 w.requires_grad_(False), EDGE_INDEX, S, T, NUM_NODES
             )
             if test_path[E_SB].item() == 1.0 and test_path[E_BT].item() == 1.0:
                 return  # path switched — test passes
 
     # If we didn't switch, check final state
-    final_path = surrogate_shortest_path(
+    final_path, _ = surrogate_shortest_path(
         w.requires_grad_(False), EDGE_INDEX, S, T, NUM_NODES
     )
     assert final_path[E_SB].item() == 1.0 and final_path[E_BT].item() == 1.0, (
