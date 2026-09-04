@@ -188,6 +188,7 @@ def test_gradient_flow_edge_weight_net():
         device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
+        rho=20.0,
     )
     loss.backward()
 
@@ -215,6 +216,7 @@ def test_qot_frozen():
         device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
+        rho=20.0,
     )
     loss.backward()
 
@@ -294,6 +296,7 @@ def test_loss_backward_no_nan():
         device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
+        rho=20.0,
     )
     loss.backward()
 
@@ -378,6 +381,7 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
         gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
         device_count=alloc.device_count, modulation_config=always_infeasible_cfg,
         duals=torch.ones(1),
+        rho=20.0,
     )
     loss.backward()
 
@@ -416,6 +420,7 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
             gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs, demands=[demand],
             device_count=alloc.device_count, modulation_config=always_infeasible_cfg,
             duals=torch.ones(1),
+            rho=20.0,
         )
         loss.backward()
         return pipeline.edge_log_weight.grad.clone()
@@ -647,6 +652,7 @@ def test_scale_direction_gradient_is_zero(monkeypatch):
         device_count=alloc.device_count,
         modulation_config=mod_cfg,
         duals=torch.ones(len(demands)),
+        rho=20.0,
     )
     loss.backward()
 
@@ -698,6 +704,7 @@ def test_total_loss_invariant_to_edge_weight_scale(monkeypatch):
                 device_count=alloc.device_count,
                 modulation_config=mod_cfg,
                 duals=torch.ones(len(demands)),
+                rho=20.0,
             )
             return loss.item(), path_indicators[0].detach().clone()
         finally:
@@ -889,6 +896,7 @@ def test_edge_weights_do_not_collapse_over_training():
             device_count=alloc.device_count,
             modulation_config=mod_cfg,
             duals=torch.ones(len(demands)),
+            rho=20.0,
         )
         loss.backward()
         optimizer.step()

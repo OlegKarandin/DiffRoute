@@ -16,16 +16,26 @@ Two independent checks, and if they conflict CHECK 2 WINS:
                          all, so a larger lambda buys nothing but a worse
                          conditioned problem.
 
-  check 2 (flip time)    a violated demand's dual rises by
-                         dual_lr * shortfall per epoch. Verify that this
-                         flips one a[d,k] from closed to open within a
+  check 2 (flip time)    a violated demand's dual rises by rho * g per
+                         epoch under the augmented penalty (`--rho`; see
+                         `python -m scripts.calibrate_rho`). Verify that
+                         this flips one a[d,k] from closed to open within a
                          handful of epochs. If a needed cut takes 40 epochs
                          at a 60-epoch budget, lambda_dev is too high no
                          matter what the force ratio said: feasibility that
                          arrives after training ends is not feasibility.
 
+Check 1's own force-ratio measurement below still uses the ORIGINAL
+one-sided hinge-shaped quantity `sum_d dual_d * relu(bar_d - gsnr_d)` as its
+proxy for "the feasibility push" — a quantity `compute_loss` itself no
+longer computes (open_followups.md item #8 removed the hinge penalty). This
+is the SAME known limitation `calibrate_rho.py`'s docstring already flags:
+that quantity is unmeasurable at the state that actually matters, an
+allocation where every demand is already feasible. Only check 2, which
+drives a real training loop, needs `compute_loss` and therefore `--rho`.
+
 Usage:
-    python scripts/calibrate_lambda_dev.py --config configs/experiment/constrained_stress.yaml
+    python scripts/calibrate_lambda_dev.py --config configs/experiment/constrained_stress.yaml --rho 0.310338
 
 Writes nothing. Its output is hand-copied into the configs' pipeline.lambda_dev.
 """
@@ -75,6 +85,7 @@ def _first_recruitment_epoch(
     demands: List[Demand],
     *,
     lambda_dev: float,
+    rho: float,
     max_epochs: int,
 ) -> Optional[int]:
     """Epoch at which the DEPLOYED allocation first buys a device, or None.
@@ -88,18 +99,20 @@ def _first_recruitment_epoch(
     What is replicated from `main()`, in `main()`'s order:
 
       * both optimizers, Adam over `[pipeline.edge_log_weight]` at
-        `lr_edge_net` and over `allocation_head.parameters()` at `lr_alloc`;
+        `lr_edge_net` and SGD over `allocation_head.parameters()` at
+        `lr_alloc`;
       * `zero_grad()` on both BEFORE the forward pass;
       * `tau` and `vlastelica_lambda` from the epoch's schedule
         (`schedule_at` replays `main()`'s anneal and decay exactly);
       * the soft forward pass;
-      * `compute_loss` with the trial `lambda_dev` and the live duals;
+      * `compute_loss` with the trial `lambda_dev` and the live duals, under
+        the augmented penalty at `rho`;
       * `hard_rollout` PRE-STEP — before `backward()`/`step()`, exactly where
         `main()` measures it, so the reported epoch describes the parameters
         the epoch's forward pass actually ran on rather than next epoch's;
       * `backward()`, then both `step()`s;
-      * `update_duals` AFTER the primal step, on the same shortfalls the loss
-        consumed, with `dual_lr`/`dual_max`/`dual_decay`.
+      * `update_duals` AFTER the primal step, on the SIGNED constraint_g the
+        loss consumed, at `eta=rho`.
 
     What is deliberately dropped: the CSV logs, the trajectory file, the
     checkpoint and its lexicographic selection key, and the printed
@@ -118,17 +131,18 @@ def _first_recruitment_epoch(
     # one step removed from it.
     ctx.pipeline.train()
 
-    # One dual per demand, persisted across epochs, uniform at lambda_0 —
-    # NOT an nn.Parameter and on no optimizer (train.py's comment).
-    duals = torch.full(
-        (len(demands),), float(c_cfg["dual_init"]), device=ctx.device
-    )
+    # Cold start: every lambda = 0, so slack demands exert nothing and a
+    # violated demand feels the pure quadratic penalty rho*g (spec section
+    # 3) — the same cold start diffopt.train.main uses under the augmented
+    # penalty.
+    duals = torch.zeros(len(demands), device=ctx.device)
 
     opt_edge = optim.Adam(
         [ctx.pipeline.edge_log_weight], lr=t_cfg["lr_edge_net"]
     )
-    opt_alloc = optim.Adam(
-        ctx.pipeline.allocation_head.parameters(), lr=t_cfg["lr_alloc"]
+    opt_alloc = optim.SGD(
+        ctx.pipeline.allocation_head.parameters(), lr=t_cfg["lr_alloc"],
+        momentum=0.0,
     )
 
     for epoch in range(1, max_epochs + 1):
@@ -150,6 +164,7 @@ def _first_recruitment_epoch(
             margin_db=c_cfg["margin_db"],
             lambda_dev=lambda_dev,
             lambda_cost=p_cfg["lambda_cost"],
+            rho=rho,
         )
 
         # Pre-step, like train.py: this describes the parameters the forward
@@ -164,14 +179,14 @@ def _first_recruitment_epoch(
         opt_edge.step()
         opt_alloc.step()
 
-        # Dual ascent AFTER the primal step, on the shortfalls the loss
-        # actually consumed this epoch.
+        # Dual ascent AFTER the primal step, on the SIGNED constraint_g the
+        # loss actually consumed this epoch, at the same rho the penalty
+        # uses.
         duals = update_duals(
             duals,
-            metrics["shortfalls"],
-            eta=c_cfg["dual_lr"],
+            metrics["constraint_g"],
+            eta=rho,
             dual_max=c_cfg["dual_max"],
-            decay=c_cfg.get("dual_decay", 0.0),
         )
 
         if hard["hard_num_devices"] > 0:
@@ -185,6 +200,14 @@ def main() -> None:
                          with_demands=False)
     ap.add_argument("--flip-epochs", type=int, default=20,
                     help="How many epochs check 2 simulates before giving up")
+    ap.add_argument("--rho", type=float, required=True,
+                    help="Augmented-penalty coefficient check 2's real "
+                         "trial loop runs under (compute_loss now requires "
+                         "one unconditionally). Get a value from "
+                         "`python -m scripts.calibrate_rho`; an exact "
+                         "value is not needed here since check 1's force "
+                         "ratio does not depend on it — check 2 only asks "
+                         "whether recruitment happens soon enough.")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -229,7 +252,7 @@ def main() -> None:
           f"feasibility): [{lo:.2f}, {hi:.2f}]")
 
     flip = _first_recruitment_epoch(cfg, ctx, demands, lambda_dev=lo,
-                                    max_epochs=args.flip_epochs)
+                                    rho=args.rho, max_epochs=args.flip_epochs)
     print(f"\n  check 2: at lambda_dev = {lo:.2f}, first device recruited at "
           f"epoch {flip if flip else '>' + str(args.flip_epochs)}.")
     if flip is None or flip > args.flip_epochs // 4:

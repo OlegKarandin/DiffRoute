@@ -121,6 +121,7 @@ def main() -> None:
         duals=torch.full((len(demands),), cfg["constraint"]["dual_init"]),
         margin_db=cfg["constraint"]["margin_db"],
         lambda_cost=lambda_cost,
+        rho=cfg["constraint"]["rho"],
     )
     loss.backward()
 

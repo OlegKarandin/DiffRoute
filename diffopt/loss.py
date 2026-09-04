@@ -18,22 +18,34 @@ def compute_loss(
     device_count: torch.Tensor,
     modulation_config: ModulationConfig,
     duals: torch.Tensor,
+    *,
+    rho: float,
     margin_db: float = 0.5,
     lambda_dev: float = 1.0,
     lambda_cost: float = 0.01,
     waste_cost: Optional[torch.Tensor] = None,
-    penalty: str = "hinge",
-    rho: Optional[float] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the constrained training loss.
 
-        L = sum_d lambda_d * relu(thr_d + delta - gsnr_d)
+        L = sum_d (relu(lambda_d + rho*g_d)^2 - lambda_d^2) / (2*rho)
           + lambda_dev   * sum_n sum_d a[d,n]
           + lambda_cost  * path_noise
 
-    That feasibility term is the `penalty="hinge"` form only. Under
-    `penalty="augmented"` the first line is replaced by the squared term
-    described in the `penalty` arg's own docstring entry below.
+    The feasibility term is the augmented Lagrangian (method of multipliers:
+    Hestenes / Powell / Rockafellar) on the SIGNED `g_d = bar_d - gsnr_d`, so
+    the force is `max(0, lambda_d + rho*g_d)` — nonzero for a band of width
+    `lambda_d/rho` dB INSIDE the feasible region, wider for demands whose
+    duals grew, and EXACTLY zero past it. A one-sided hinge term,
+    `dual_d * relu(g_d)`, was the original design; its derivative
+    `dual_d * 1{g_d > 0}` is exactly zero for a satisfied demand no matter
+    how large its dual, so at an optimum where every demand is satisfied AND
+    the marginal cut is load-bearing, the only surviving force on an
+    allocation variable is `-lambda_dev`, and stationarity would require
+    `lambda_dev = 0`. The augmented penalty's nonzero band inside the
+    feasible region is what lets a satisfied demand defend the cut that
+    satisfies it. Removed 2026-09 (open_followups.md item #8, Finding 7):
+    recoverable from git history if a short-budget arm needs the hinge's
+    faster early convergence again.
 
     This replaces a weighted sum of three soft penalties in which feasibility
     competed with regenerator count on a fixed exchange rate. `lambda_dev`
@@ -74,7 +86,7 @@ def compute_loss(
                       A per-demand dual does that selectively for the demands
                       that keep failing; a global scalar does it for every node
                       at once and over-places.
-        margin_db:    delta — added inside the hinge so the term stays active
+        margin_db:    delta — added to the bar so the constraint stays active
                       above the threshold. Without it `relu(thr - gsnr)` is
                       exactly zero the moment a demand clears, nothing pushes
                       for headroom, and the system sits on the boundary by
@@ -98,75 +110,41 @@ def compute_loss(
                       on the score carries gradient). Logged as a diagnostic
                       only — it carries no weight in the total loss. None
                       (the default) logs 0.0.
-        penalty:      "hinge" (the default and the shipped behaviour) or
-                      "augmented". The hinge prices feasibility with
-                      `dual_d * relu(g_d)`, whose derivative is
-                      `dual_d * 1{g_d > 0}` — exactly zero for a satisfied
-                      demand, no matter how large its dual. At an optimum
-                      every demand is satisfied AND the marginal cut is
-                      load-bearing, so the only surviving force on an
-                      allocation variable is `-lambda_dev`, and stationarity
-                      would require `lambda_dev = 0`. "augmented" is the canonical
-                      method of multipliers (Hestenes / Powell /
-                      Rockafellar): the term becomes
-                      `(relu(lambda_d + rho*g_d)^2 - lambda_d^2) / (2*rho)`
-                      on the SIGNED `g_d = bar_d - gsnr_d`, so the force is
-                      `max(0, lambda_d + rho*g_d)` — nonzero for a band of
-                      width `lambda_d/rho` dB INSIDE the feasible region,
-                      wider for demands whose duals grew, and EXACTLY zero
-                      past it. That last exactness is the point: a merely
-                      small force on 346 slack demands sums into systematic
-                      over-buy, which is why a softplus hinge was rejected.
         rho:          Augmented-Lagrangian penalty coefficient, and ALSO the
-                      dual step: `update_duals` is called with `eta=rho` in
-                      that mode, which is gradient ascent on the dual
-                      function with a step the penalty's own curvature makes
-                      well-scaled. Required whenever `penalty="augmented"`
-                      and ignored otherwise; there is no default, because a
-                      guessed rho sets the band width. MEASURE it with
+                      dual step: `update_duals` is called with `eta=rho`,
+                      which is gradient ascent on the dual function with a
+                      step the penalty's own curvature makes well-scaled.
+                      Required — there is no default, because a guessed rho
+                      sets the band width. MEASURE it with
                       `python -m scripts.calibrate_rho`; do not hand-tune.
 
     Returns:
         (total_loss, metrics_dict). `metrics["shortfalls"]` is a detached
-        (num_demands,) tensor indexed by `Demand.id`, to be fed straight into
-        `update_duals` after the optimizer step in HINGE mode.
-        `metrics["constraint_g"]` is the same tensor unclipped — the SIGNED
-        `bar_d - gsnr_d`, negative when the demand has headroom — and is what
-        `update_duals` consumes in AUGMENTED mode. Both are returned in both
-        modes, so the dict has one shape regardless of penalty.
+        (num_demands,) tensor indexed by `Demand.id` — the one-sided
+        `relu(g_d)`, kept as a diagnostic. `metrics["constraint_g"]` is the
+        SIGNED `bar_d - gsnr_d`, negative when the demand has headroom, and
+        is what `update_duals` consumes: `duals = update_duals(duals,
+        metrics["constraint_g"], eta=rho, dual_max=...)` after the optimizer
+        step.
     """
     device = duals.device
 
-    # Named errors, never a silent fallback. A mistyped penalty that
-    # quietly ran the hinge would produce a plausible number measured
-    # against the wrong objective, and an unset rho would silently pick a
-    # band width nobody measured.
-    if penalty not in ("hinge", "augmented"):
+    # Named error, never a silent fallback. A guessed rho would silently
+    # pick a band width nobody measured.
+    if rho <= 0.0:
         raise ValueError(
-            f"unknown penalty {penalty!r}; expected 'hinge' or 'augmented'"
+            f"rho must be > 0 (it divides the penalty term and scales the "
+            f"dual step), got {rho}"
         )
-    if penalty == "augmented":
-        if rho is None:
-            raise ValueError(
-                "penalty='augmented' requires rho — the penalty coefficient, "
-                "which is also the dual step. There is no default: measure it "
-                "with `python -m scripts.calibrate_rho`."
-            )
-        if rho <= 0.0:
-            raise ValueError(
-                f"rho must be > 0 under penalty='augmented' (it divides the "
-                f"penalty term and scales the dual step), got {rho}"
-            )
 
     # Start as zero tensors (not float 0) so the graph is valid even when
     # all demands are feasible and no shortfall terms are added.
     weighted_feasibility = torch.zeros((), device=device)
     feasibility_loss = torch.zeros((), device=device)
-    # Detached record for the dual update — deliberately not part of the graph.
+    # Detached diagnostic — deliberately not part of the graph.
     shortfalls = torch.zeros(duals.shape[0], device=device)
-    # The same quantity UNCLIPPED. `update_duals` needs the one-sided version
-    # under the hinge (a slack demand's violation is 0, not -3) and the signed
-    # one under the augmented penalty (where falling on slack is the point).
+    # The same quantity UNCLIPPED — the SIGNED g, negative on slack, which is
+    # what `update_duals` consumes (falling on slack is the point).
     constraint_g = torch.zeros(duals.shape[0], device=device)
 
     num_infeasible = 0
@@ -179,20 +157,16 @@ def compute_loss(
         bar_t = torch.tensor(threshold + margin_db, device=device, dtype=torch.float32)
 
         # SIGNED and live in the graph. The relu is taken separately below
-        # for the two consumers that genuinely want a one-sided quantity —
-        # the logged `feasibility_loss` and the hinge-mode dual record —
-        # because the augmented term needs `g` itself: carrying force while
-        # g < 0 is its entire purpose.
+        # for the one consumer that genuinely wants a one-sided quantity —
+        # the logged `feasibility_loss` — because the augmented term needs
+        # `g` itself: carrying force while g < 0 is its entire purpose.
         g = bar_t - gsnr_preds[demand.id]
         shortfall = F.relu(g)
 
-        if penalty == "augmented":
-            z = F.relu(duals[demand.id] + rho * g)
-            weighted_feasibility = weighted_feasibility + (
-                (z * z - duals[demand.id] ** 2) / (2.0 * rho)
-            )
-        else:
-            weighted_feasibility = weighted_feasibility + duals[demand.id] * shortfall
+        z = F.relu(duals[demand.id] + rho * g)
+        weighted_feasibility = weighted_feasibility + (
+            (z * z - duals[demand.id] ** 2) / (2.0 * rho)
+        )
 
         # Unweighted sum kept so the logged feasibility_loss column stays
         # comparable across epochs while the duals are deliberately
@@ -249,19 +223,23 @@ def compute_loss(
 
 def update_duals(
     duals: torch.Tensor,
-    shortfalls: torch.Tensor,
+    constraint_g: torch.Tensor,
     *,
     eta: Union[float, torch.Tensor],
     dual_max: float,
-    decay: float = 0.0,
 ) -> torch.Tensor:
-    """Dual ascent step: `lambda_d <- clamp(lambda_d + eta * shortfall_d, 0, lambda_max)`.
+    """Dual ascent step: `lambda_d <- clamp(lambda_d + eta * g_d, 0, lambda_max)`.
 
-    `eta` may be a scalar (every demand steps at the same rate — the shipped
-    behaviour) or a per-demand tensor broadcast elementwise over `shortfalls`.
-    The tensor form is what `diffopt.train`'s anti-windup gate passes: a
-    demand whose head is saturated steps at ~0 so its dual cannot accumulate
-    pressure nothing can act on. See `alloc_live_fraction_per_demand`.
+    `constraint_g` is the SIGNED `bar_d - gsnr_d` (`compute_loss`'s
+    `metrics["constraint_g"]`), negative when the demand has headroom. `eta`
+    is `rho`, the augmented penalty's own coefficient (see `compute_loss`'s
+    `rho` arg) — this is gradient ascent on the dual function with a step
+    the penalty's own curvature makes well-scaled. `eta` may instead be a
+    per-demand tensor broadcast elementwise over `constraint_g`.
+
+    A slack demand (`g_d < 0`) DECREASES its own dual by construction —
+    no separate decay term is needed, unlike a one-sided hinge dual that
+    only ever ascends.
 
     Returns a NEW tensor; `duals` is not mutated, so a caller can keep a
     previous epoch's vector for diagnostics.
@@ -272,36 +250,7 @@ def update_duals(
     at the end of the run by `diffopt/train.py`, so a non-converging constraint
     surfaces as a named list rather than as silent oscillation.
 
-    This docstring describes the HINGE caller's contract: `diffopt/train.py`
-    calls this function with `shortfalls=metrics["shortfalls"]` (one-sided,
-    never negative) at `eta=c_cfg["dual_lr"]` when `penalty="hinge"`. Under
-    `penalty="augmented"`, the SAME call site instead passes
-    `shortfalls=metrics["constraint_g"]` — the SIGNED `bar_d - gsnr_d`,
-    negative on a slack demand — at `eta=rho`, the augmented penalty's own
-    coefficient (see `compute_loss`'s `rho` arg). The `shortfalls` parameter
-    name and the `torch.where(shortfalls > 0, ...)` condition below are
-    unchanged for both callers; under the augmented call, that condition
-    routes every non-violated entry — including `g == 0`, the fixed point of
-    spec §2.3 in
-    `docs/superpowers/specs/2026-08-31-augmented-lagrangian-design.md` — onto
-    the decay branch below, not just genuinely slack ones. That branch is a
-    no-op whenever `decay=0.0`, which is the shipped default (`dual_decay` is
-    not set in `constrained_stress.yaml`), so `g == 0` and `g < 0` both leave
-    the dual unchanged in that case; ascent still only happens on `g > 0`.
-
-    `decay` (default 0.0, i.e. no decay — pure ratchet, the original
-    behaviour) multiplicatively relaxes a dual by `(1 - decay)` on any epoch
-    where its shortfall is exactly 0. Without this, a dual that was bid up to
-    buy feasibility during an early crisis never comes back down even once
-    its demand is comfortably feasible, which pins `lambda_regen`'s (fixed,
-    weak) downward pressure out of contention indefinitely — see
-    open_followups.md item #3's over-provisioning investigation. Only
-    satisfied demands decay; a demand still in shortfall keeps ascending,
-    undamped, same as before.
-
     No autograd here by design: duals are Lagrange multipliers updated by an
     explicit ascent rule, not parameters optimised by Adam.
     """
-    ascended = duals + eta * shortfalls
-    relaxed = torch.where(shortfalls > 0, ascended, ascended * (1.0 - decay))
-    return torch.clamp(relaxed, min=0.0, max=dual_max)
+    return torch.clamp(duals + eta * constraint_g, min=0.0, max=dual_max)

@@ -316,8 +316,8 @@ def _write_config(
         },
         "constraint": {
             "margin_db": 0.5,
-            "dual_init": 10.0,
-            "dual_lr": 1.0,
+            "dual_init": 0.0,
+            "rho": 20.0,
             "dual_max": 1000.0,
         },
         "pipeline": {
@@ -343,8 +343,8 @@ def _write_config(
         "log_dir": str(tmp_path / "logs"),
         "checkpoint_dir": str(tmp_path / "checkpoints"),
     }
-    # Merged rather than replaced so a test naming only `penalty`/`rho` still
-    # gets the margin_db/dual_max the rest of main() reads.
+    # Merged rather than replaced so a test naming only `rho` still gets the
+    # margin_db/dual_max the rest of main() reads.
     if constraint_overrides:
         config["constraint"].update(constraint_overrides)
     if training_overrides:
@@ -761,34 +761,23 @@ def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# Augmented-Lagrangian wiring (spec 2026-08-31 sections 2.2 and 3)
+# Augmented-Lagrangian wiring (spec 2026-08-31 sections 2.2 and 3; the only
+# penalty since open_followups.md item #8 removed the hinge)
 # ---------------------------------------------------------------------------
-
-_AUGMENTED = {"penalty": "augmented", "rho": 20.0, "dual_init": 0.0}
 
 
 def _spy_on_update_duals(monkeypatch, seen: dict):
-    def spy(duals, signal, *, eta, dual_max, decay=0.0):
+    def spy(duals, signal, *, eta, dual_max):
         seen["signal"] = signal.clone()
         seen["eta"] = eta
-        seen["decay"] = decay
         return duals
     monkeypatch.setattr(train_mod, "update_duals", spy)
 
 
-def test_hinge_is_the_default_when_the_config_names_no_penalty(tmp_path):
-    """constrained_stress.yaml and every other shipped config name no
-    penalty, and must keep running the hinge."""
+def test_rho_reaches_compute_loss(tmp_path):
     calls = []
-    _run_training(tmp_path, loss_calls=calls)
-    assert calls[0]["penalty"] == "hinge"
-    assert calls[0]["rho"] is None
-
-
-def test_augmented_penalty_and_rho_reach_compute_loss(tmp_path):
-    calls = []
-    _run_training(tmp_path, loss_calls=calls, constraint_overrides=_AUGMENTED)
-    assert calls[0]["penalty"] == "augmented"
+    _run_training(tmp_path, loss_calls=calls,
+                  constraint_overrides={"rho": 20.0})
     assert calls[0]["rho"] == pytest.approx(20.0)
 
 
@@ -799,42 +788,10 @@ def test_augmented_dual_step_uses_signed_g_at_step_rho(tmp_path, monkeypatch):
     step well-scaled against the penalty's curvature."""
     seen = {}
     _spy_on_update_duals(monkeypatch, seen)
-    _run_training(tmp_path, monkeypatch=monkeypatch, constraint_overrides=_AUGMENTED)
+    _run_training(tmp_path, monkeypatch=monkeypatch,
+                  constraint_overrides={"rho": 20.0})
     assert seen["eta"] == pytest.approx(20.0)
     assert torch.equal(seen["signal"], torch.full((1,), -3.0))
-
-
-def test_hinge_dual_step_still_uses_shortfalls_at_dual_lr(tmp_path, monkeypatch):
-    """Regression guard: adding the augmented branch must not move the
-    default path off `shortfalls` / `dual_lr`. One-sidedness is CORRECT for
-    the hinge's dual — a slack demand's violation is 0, not a negative
-    number — and only wrong for the force the same relu carries to the
-    head."""
-    seen = {}
-    _spy_on_update_duals(monkeypatch, seen)
-    _run_training(tmp_path, monkeypatch=monkeypatch)
-    assert seen["eta"] == pytest.approx(1.0)          # constraint.dual_lr
-    assert torch.equal(seen["signal"], torch.zeros(1))
-
-
-def test_dual_decay_under_augmented_warns_rather_than_overriding(tmp_path, capsys):
-    """Mirrors the alloc_ste/alloc_tau_end warning: a config is the record of
-    what a run actually did, so main() says the setting is redundant instead
-    of silently rewriting it."""
-    _run_training(tmp_path, constraint_overrides={**_AUGMENTED, "dual_decay": 0.1})
-    out = capsys.readouterr().out
-    assert "dual_decay" in out
-    assert "augmented" in out
-
-
-def test_dual_decay_still_reaches_update_duals_under_augmented(tmp_path, monkeypatch):
-    """The warning is a warning. main() must not quietly zero the value it
-    warned about — that would make the printed config a lie."""
-    seen = {}
-    _spy_on_update_duals(monkeypatch, seen)
-    _run_training(tmp_path, monkeypatch=monkeypatch,
-                  constraint_overrides={**_AUGMENTED, "dual_decay": 0.1})
-    assert seen["decay"] == pytest.approx(0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -933,89 +890,7 @@ def test_dead_fraction_sharpens_as_tau_anneals():
 
 
 # ---------------------------------------------------------------------------
-# Weight decay on the allocation head
-# ---------------------------------------------------------------------------
-#
-# lambda_dev * device_count is the only loss term that touches every boundary
-# unconditionally, and its derivative lambda_dev * sigmoid'(s/tau)/tau is
-# strictly positive -- so it pushes every score down, every step, forever. The
-# only opposing force is weighted_feasibility, which under the augmented
-# penalty acts inside the feasible region across a band of width lambda/rho:
-# ZERO once the dual decays to 0, which is exactly what complementary
-# slackness is designed to make happen. Constant force, no restoring force ->
-# the head drifts until saturation stops it (measured: scores to -329 and
-# +229, dead_frac 1.0000 for 50/50 final epochs on all three seeds).
-#
-# Weight decay is the restoring force, applied where the drift lives: the
-# score's reach comes from the WEIGHTS (net.4.weight grows 0.0 -> 0.55-0.77
-# while net.4.bias stays at -2.87 from -3.0), so biases are excluded. Decaying
-# the bias would pull it toward 0, i.e. sigmoid(0) = 0.5 -- the "head opens
-# everything at init" failure AllocationHead's docstring warns against.
-
-
-def _spy_on_optimizers(monkeypatch):
-    """Record the (class, param_groups) of every optimizer main() builds."""
-    built = []
-    for name in ("Adam", "AdamW", "SGD"):
-        real = getattr(train_mod.optim, name)
-
-        def make(real=real, name=name):
-            def spy(params, **kwargs):
-                opt = real(params, **kwargs)
-                built.append((name, opt))
-                return opt
-            return spy
-
-        monkeypatch.setattr(train_mod.optim, name, make())
-    return built
-
-
-def test_head_optimizer_defaults_to_adam_without_weight_decay(tmp_path, monkeypatch):
-    """The shipped behaviour. A weight decay nobody asked for is a silent
-    change to every existing run's optimiser."""
-    built = _spy_on_optimizers(monkeypatch)
-    _run_training(tmp_path, monkeypatch=monkeypatch)
-
-    assert [name for name, _ in built] == ["Adam", "Adam"]
-    for _, opt in built:
-        assert all(g["weight_decay"] == 0.0 for g in opt.param_groups)
-
-
-def test_alloc_weight_decay_reaches_the_head_via_adamw(tmp_path, monkeypatch):
-    """Decoupled (AdamW), not Adam's coupled L2: the drift is sustained by
-    Adam's own normalisation, which divides a consistently-signed gradient by
-    its own running magnitude and so delivers a full-size step however small
-    that gradient is. A coupled L2 penalty goes through that same division;
-    a decoupled one does not."""
-    built = _spy_on_optimizers(monkeypatch)
-    _run_training(tmp_path, monkeypatch=monkeypatch,
-                  training_overrides={"alloc_weight_decay": 0.05})
-
-    kinds = [name for name, _ in built]
-    assert kinds == ["Adam", "AdamW"], f"edge net stays on Adam; head moves: {kinds}"
-    head = built[1][1]
-    assert max(g["weight_decay"] for g in head.param_groups) == pytest.approx(0.05)
-
-
-def test_weight_decay_never_touches_a_bias(tmp_path, monkeypatch):
-    """AllocationHead starts CLOSED at bias -3.0 so lambda_dev is live from
-    epoch 0 with no warm-up (spec 2.2). Decaying that bias toward 0 is
-    sigmoid(0) = 0.5 on every boundary -- the saturation-at-~2000-devices
-    failure the zero-weight/negative-bias init exists to prevent."""
-    built = _spy_on_optimizers(monkeypatch)
-    _run_training(tmp_path, monkeypatch=monkeypatch,
-                  training_overrides={"alloc_weight_decay": 0.05})
-
-    head = built[1][1]
-    decayed = [p for g in head.param_groups if g["weight_decay"] > 0 for p in g["params"]]
-    biases = [p for p in decayed if p.ndim < 2]
-    assert not biases, f"{len(biases)} bias/scalar tensors are being decayed"
-    assert decayed, "nothing is being decayed at all"
-
-
-# ---------------------------------------------------------------------------
-#
-# Optimizer choice for the allocation head, and gradient clipping.
+# Optimizer choice for the allocation head.
 #
 # Adam's step is a RATIO, m/(sqrt(v)+eps), so a consistently-signed gradient
 # gives ~lr HOWEVER SMALL that gradient has become. Two measured consequences
@@ -1030,50 +905,40 @@ def test_weight_decay_never_touches_a_bias(tmp_path, monkeypatch):
 #   moves the head no faster. A rate-limited actuator under an integral
 #   controller is the textbook wind-up setup.
 #
-# Neither is a reason to change the default. "adam" stays shipped; "sgd" is
-# the isolating arm.
+# SGD is now the only optimizer (open_followups.md item #8 removed Adam,
+# AdamW and the alloc_weight_decay knob along with it — Finding 9 found no
+# viable weight-decay sizing under SGD anyway).
 
 
-def test_alloc_optimizer_sgd_selects_sgd_with_no_momentum(tmp_path, monkeypatch):
+def _spy_on_optimizers(monkeypatch):
+    """Record the (class, param_groups) of every optimizer main() builds."""
+    built = []
+    for name in ("Adam", "SGD"):
+        real = getattr(train_mod.optim, name)
+
+        def make(real=real, name=name):
+            def spy(params, **kwargs):
+                opt = real(params, **kwargs)
+                built.append((name, opt))
+                return opt
+            return spy
+
+        monkeypatch.setattr(train_mod.optim, name, make())
+    return built
+
+
+def test_head_optimizer_is_always_sgd_with_no_momentum_or_weight_decay(tmp_path, monkeypatch):
     """momentum stays 0 on purpose: Adam's beta1 = 0.9 IS a momentum term,
     and it is what makes the plant second-order. A second-order plant under
     the augmented dual's PI-shaped force is what oscillates."""
     built = _spy_on_optimizers(monkeypatch)
-    _run_training(tmp_path, monkeypatch=monkeypatch,
-                  training_overrides={"alloc_optimizer": "sgd"})
+    _run_training(tmp_path, monkeypatch=monkeypatch)
 
     kinds = [name for name, _ in built]
-    assert kinds == ["Adam", "SGD"], f"edge net stays on Adam; head moves: {kinds}"
+    assert kinds == ["Adam", "SGD"], f"edge net stays on Adam; head is SGD: {kinds}"
     head = built[1][1]
     assert all(g["momentum"] == 0.0 for g in head.param_groups)
-
-
-def test_alloc_optimizer_defaults_to_adam_when_the_config_is_silent(tmp_path,
-                                                                    monkeypatch):
-    """The shipped behaviour. Every run recorded before this key existed used
-    Adam, and a silent optimizer swap would invalidate all of them."""
-    built = _spy_on_optimizers(monkeypatch)
-    _run_training(tmp_path, monkeypatch=monkeypatch)
-    assert [name for name, _ in built] == ["Adam", "Adam"]
-
-
-def test_unknown_alloc_optimizer_is_rejected(tmp_path):
-    with pytest.raises(ValueError, match="alloc_optimizer"):
-        _run_training(tmp_path, training_overrides={"alloc_optimizer": "adamw"})
-
-
-def test_sgd_excludes_biases_from_weight_decay_too(tmp_path, monkeypatch):
-    """Same rule as the AdamW branch: the score's reach lives in the weights,
-    and decaying net.4.bias toward 0 is sigmoid(0) = 0.5 on every boundary."""
-    built = _spy_on_optimizers(monkeypatch)
-    _run_training(tmp_path, monkeypatch=monkeypatch,
-                  training_overrides={"alloc_optimizer": "sgd",
-                                      "alloc_weight_decay": 0.05})
-
-    head = built[1][1]
-    decayed = [p for g in head.param_groups if g["weight_decay"] > 0 for p in g["params"]]
-    assert decayed, "nothing is being decayed at all"
-    assert not [p for p in decayed if p.ndim < 2], "a bias/scalar is being decayed"
+    assert all(g["weight_decay"] == 0.0 for g in head.param_groups)
 
 
 def _clip_spy(monkeypatch):

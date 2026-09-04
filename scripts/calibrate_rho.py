@@ -27,32 +27,30 @@ feasible region, so fixing that width fixes rho:
 estimator is a ratio of L1 gradient norms over the allocation head's
 parameters, which stands in for `lambda_dev / s`.
 
-Two checks, and if they conflict CHECK 2 WINS:
-
-  check 1 (fixed point)  separate backward passes, one per loss term,
-                         recording ||dL/dw||_1 on the allocation head. The
-                         feasibility pass differentiates the LINEAR signed
-                         constraint sum, sum_d (bar_d - gsnr_d), with NO relu
-                         and NO duals. That is the deliberate departure from
-                         the companion scripts and the reason this
-                         measurement is possible at all: the relu'd hinge is
-                         unmeasurable at the state that matters, while the
-                         signed constraint has a gradient everywhere. It also
-                         means the denominator sums over ALL demands rather
-                         than only the violated ones, so expect lambda* to
-                         come out substantially smaller than any figure
-                         derived from a hinge-mode measurement.
-
-  check 2 (the gate)     real epochs at the candidate against hinge mode on
-                         the same config. The design's own primary gate is
-                         `hard_num_violated == 0` over the final 10 epochs,
-                         so that is what is reported, alongside the device
-                         count and the oracle gap.
+The calibration (check 1, fixed point): separate backward passes, one per
+loss term, recording ||dL/dw||_1 on the allocation head. The feasibility
+pass differentiates the LINEAR signed constraint sum, sum_d (bar_d -
+gsnr_d), with NO relu and NO duals. That is the deliberate departure from
+the companion scripts and the reason this measurement is possible at all:
+the relu'd hinge is unmeasurable at the state that matters, while the
+signed constraint has a gradient everywhere. It also means the denominator
+sums over ALL demands rather than only the violated ones, so expect
+lambda* to come out substantially smaller than any figure derived from a
+hinge-mode measurement.
 
 A ceiling applies on top of check 1: `rho <= CEILING_MULTIPLE * lambda*`, so
 one epoch's dual step on a 1 dB violation cannot move a dual more than ~10x
 its own resting value. At the default band target it is not binding
 (rho = 2.857 * lambda*); a run that hits it is reporting something unusual.
+
+A confirmatory trial (previously "check 2") then runs the candidate rho for
+real epochs under the augmented penalty and reports whether
+`hard_num_violated == 0` holds over the final `TAIL_EPOCHS`. This USED TO be
+a comparison against hinge mode; the hinge penalty was removed
+(open_followups.md item #8, since Finding 7 measured augmented winning past
+~150 epochs at the shipped 300-epoch budget), so there is no longer a second
+arm to compare against or a tiebreak to win — the trial is a confirmation of
+the candidate, not a gate between two systems.
 
 Usage (module form — `python scripts/calibrate_rho.py` does NOT work,
 because that puts scripts/ on sys.path but not the project root, and the
@@ -65,7 +63,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.optim as optim
@@ -89,15 +87,16 @@ from scripts._common import (
 # 4), so rho is uniquely determined by the measurement rather than chosen
 # from an interval. 0.35 dB sits inside the 0.5 dB margin, which is the
 # point: the margin's surrogate-error allowance is not AL's to spend, and the
-# band stacks inside it. Check 2 may move this; if it does, the moved value
-# is what ships.
+# band stacks inside it. If the confirmatory trial below shows the candidate
+# is not holding hard_num_violated == 0, re-run with a smaller value and
+# hand-pick what ships.
 BAND_TARGET_DB = 0.35
 
 # rho is also the dual step, so a 1 dB violation moves a dual by rho in one
 # epoch. Cap that at 10x the dual's own resting value.
 CEILING_MULTIPLE = 10.0
 
-# The design's primary gate is measured over the final 10 epochs.
+# The confirmatory trial is read over the final 10 epochs.
 TAIL_EPOCHS = 10
 
 
@@ -138,13 +137,12 @@ def _trial_run(
     ctx: DiagContext,
     demands: List[Demand],
     *,
-    penalty: str,
-    rho: Optional[float],
-    dual_init: float,
-    dual_lr: Optional[float],
+    rho: float,
     max_epochs: int,
 ) -> List[Dict[str, float]]:
-    """`diffopt.train.main`'s per-epoch step in miniature, at a trial mode.
+    """`diffopt.train.main`'s per-epoch step in miniature, at a trial mode,
+    under the augmented penalty at a cold-start dual (every lambda = 0 —
+    spec section 3).
 
     Same construction and the same deliberate omissions as `diffopt.train`'s
     own loop — both optimizers, zero_grad before the forward, the
@@ -152,25 +150,21 @@ def _trial_run(
     the dual update on what the loss consumed. Drops the CSV, the trajectory
     file, the checkpoint and its selection key. Writes nothing.
 
-    The one addition that matters here: the dual update branches exactly the
-    way train.py's does — `metrics["constraint_g"]` at step `rho` under
-    `augmented`, `metrics["shortfalls"]` at `dual_lr` under `hinge`. A trial
-    that ran the augmented penalty against the hinge's ratchet would measure
-    a system nobody ships.
-
-    Returns one row per epoch so the caller can compare TRAJECTORIES rather
-    than endpoints: the gate is a property of the final ten epochs, and a
-    single final number cannot tell "held" from "broke and recovered".
+    Returns one row per epoch so the caller can read the TRAJECTORY rather
+    than an endpoint: the confirmation is a property of the final ten
+    epochs, and a single final number cannot tell "held" from "broke and
+    recovered".
 
     MUTATES `ctx.pipeline` — rebuild the context before a second call.
     """
     c_cfg, p_cfg, t_cfg = cfg["constraint"], cfg["pipeline"], cfg["training"]
 
     ctx.pipeline.train()
-    duals = torch.full((len(demands),), float(dual_init), device=ctx.device)
+    duals = torch.zeros(len(demands), device=ctx.device)
     opt_edge = optim.Adam([ctx.pipeline.edge_log_weight], lr=t_cfg["lr_edge_net"])
-    opt_alloc = optim.Adam(
-        ctx.pipeline.allocation_head.parameters(), lr=t_cfg["lr_alloc"]
+    opt_alloc = optim.SGD(
+        ctx.pipeline.allocation_head.parameters(), lr=t_cfg["lr_alloc"],
+        momentum=0.0,
     )
 
     rows: List[Dict[str, float]] = []
@@ -194,7 +188,6 @@ def _trial_run(
             lambda_dev=p_cfg["lambda_dev"],
             lambda_cost=p_cfg["lambda_cost"],
             waste_cost=alloc.waste_cost,
-            penalty=penalty,
             rho=rho,
         )
 
@@ -207,14 +200,9 @@ def _trial_run(
         opt_edge.step()
         opt_alloc.step()
 
-        if penalty == "augmented":
-            dual_signal, dual_eta = metrics["constraint_g"], rho
-        else:
-            dual_signal, dual_eta = metrics["shortfalls"], dual_lr
         duals = update_duals(
-            duals, dual_signal, eta=dual_eta,
+            duals, metrics["constraint_g"], eta=rho,
             dual_max=c_cfg["dual_max"],
-            decay=c_cfg.get("dual_decay", 0.0),
         )
 
         rows.append({
@@ -229,7 +217,7 @@ def _trial_run(
 
 
 def _tail_max_violated(rows: List[Dict[str, float]]) -> float:
-    """The gate, on the final TAIL_EPOCHS epochs of a trial."""
+    """Read over the final TAIL_EPOCHS epochs of a trial."""
     return max(r["violated"] for r in rows[-TAIL_EPOCHS:])
 
 
@@ -270,9 +258,10 @@ def main() -> None:
     # deployed rollout about who is feasible: measured at an allocation with
     # oracle_gap == 0 and hard_num_violated == 0, the soft pass called 10 of
     # 346 demands violated, and those phantoms carried 8.58e4 of 8.58e4 of
-    # the hinge force. Calibrating there measures phantoms. Applied here
-    # rather than required of the config file, so the committed configs stay
-    # unmodified and hinge-mode.
+    # the hinge force (hinge itself has since been removed — see
+    # open_followups.md item #8 — but the STE's own defect is penalty-
+    # agnostic). Applied here rather than required of the config file, so
+    # the committed configs stay unmodified.
     if args.ste:
         cfg.setdefault("placement", {}).update({"alloc_ste": True})
         cfg["training"]["alloc_tau_end"] = cfg["training"]["alloc_tau_start"]
@@ -312,7 +301,6 @@ def main() -> None:
 
     print(f"  demands={len(demands)}  lambda_dev={lambda_dev}  "
           f"margin_db={c_cfg['margin_db']}  "
-          f"current penalty={c_cfg.get('penalty', 'hinge')}  "
           f"current rho={c_cfg.get('rho')}")
     print(f"  device_count={alloc.device_count.item():.2f}")
     print(f"\n  device push           ||dL/dw||_1 = {dev_push:.4e}   "
@@ -336,44 +324,26 @@ def main() -> None:
               f"Using the ceiling, which widens the band to "
               f"{lambda_star / ceiling:.4f} dB.")
 
-    print(f"\n  check 2: {args.trial_epochs} epochs, hinge vs augmented at "
-          f"rho={candidate:.6f} (the last-{TAIL_EPOCHS} violated count is "
-          f"the gate; check 2 wins on conflict)")
-    hinge_rows = _trial_run(
-        cfg, ctx, demands,
-        penalty="hinge", rho=None,
-        dual_init=float(c_cfg["dual_init"]),
-        dual_lr=float(c_cfg["dual_lr"]),
-        max_epochs=args.trial_epochs,
-    )
-    print(f"    hinge                {_summarise(hinge_rows)}")
-
-    # _trial_run trains in place, so the second arm needs a fresh context.
-    ctx2 = build_context(cfg, load_e2e_checkpoint=False)
-    demands2, _ = fixed_traffic_demands(ctx2)
+    print(f"\n  confirmatory trial: {args.trial_epochs} epochs under the "
+          f"augmented penalty at rho={candidate:.6f} "
+          f"(the last-{TAIL_EPOCHS} violated count is what's read)")
     aug_rows = _trial_run(
-        cfg, ctx2, demands2,
-        penalty="augmented", rho=candidate,
-        # Cold start: every lambda = 0, so slack demands exert nothing and a
-        # violated demand feels the pure quadratic penalty rho*g. Intended
-        # dynamics, not an edge case — spec section 3.
-        dual_init=0.0, dual_lr=None,
+        cfg, ctx, demands,
+        rho=candidate,
         max_epochs=args.trial_epochs,
     )
     print(f"    augmented rho={candidate:<8.4f} {_summarise(aug_rows)}")
 
-    hinge_tail = _tail_max_violated(hinge_rows)
     aug_tail = _tail_max_violated(aug_rows)
-    if aug_tail > hinge_tail:
-        print(f"\n  !! check 2 is the tiebreak and it is UNHAPPY: the "
-              f"last-{TAIL_EPOCHS} violated count rose {hinge_tail:.0f} -> "
-              f"{aug_tail:.0f}. A WIDER band (SMALLER rho) gives a satisfied "
-              f"demand more reach inside the feasible region; try "
-              f"{candidate / 3:.6f} and re-run.")
+    if aug_tail > 0:
+        print(f"\n  !! the confirmatory trial is UNHAPPY: the last-"
+              f"{TAIL_EPOCHS} violated count peaked at {aug_tail:.0f}, not "
+              f"0. A WIDER band (SMALLER rho) gives a satisfied demand more "
+              f"reach inside the feasible region; try {candidate / 3:.6f} "
+              f"and re-run.")
     else:
         print(f"\n  RECOMMEND constraint.rho: {candidate:.6f}   "
-              f"(with constraint.penalty: augmented and "
-              f"constraint.dual_init: 0.0)")
+              f"(with constraint.dual_init: 0.0)")
 
 
 if __name__ == "__main__":

@@ -365,28 +365,14 @@ def main() -> None:
             f"you are deliberately measuring that."
         )
 
-    # Constraint penalty mode. "hinge" (the default) is the shipped
-    # one-sided term; "augmented" is the method of multipliers, whose primal
-    # derivative max(0, lambda + rho*g) stays nonzero for a band of width
-    # lambda/rho INSIDE the feasible region — the only reason a satisfied
-    # demand can defend the cut that satisfies it. Validation of the
-    # (penalty, rho) pair lives in compute_loss, so a diagnostic script
-    # calling compute_loss directly gets the same named errors main() does.
-    penalty: str = c_cfg.get("penalty", "hinge")
-    rho = c_cfg.get("rho")
-    dual_decay: float = c_cfg.get("dual_decay", 0.0)
-    # Warn rather than override, same rule as the alloc_ste warning above.
-    if penalty == "augmented" and dual_decay != 0.0:
-        print(
-            f"WARNING: constraint.dual_decay ({dual_decay}) is set together "
-            f"with constraint.penalty=augmented. The augmented dual step "
-            f"lambda <- clamp(lambda + rho*g, 0, dual_max) already decreases "
-            f"on slack by construction, so a multiplicative relaxation on top "
-            f"of it is a second, unmodelled one. dual_decay was bolted on for "
-            f"open_followups.md item #3 to unstick a pure ratchet the "
-            f"augmented dual does not have. Set it to 0.0 unless you are "
-            f"deliberately measuring that."
-        )
+    # Augmented Lagrangian (method of multipliers): the primal derivative
+    # max(0, lambda + rho*g) stays nonzero for a band of width lambda/rho
+    # INSIDE the feasible region — the only reason a satisfied demand can
+    # defend the cut that satisfies it. rho has no default: a guessed value
+    # sets the band width. Validation lives in compute_loss, so a diagnostic
+    # script calling compute_loss directly gets the same named error main()
+    # does. MEASURE rho with `python -m scripts.calibrate_rho`.
+    rho = c_cfg["rho"]
 
     allocation_head = AllocationHead(
         lookahead=lookahead, route_context=route_context,
@@ -424,25 +410,7 @@ def main() -> None:
     # with tau, so |s|/tau lands at 71-110 whatever tau is.
     # See docs/investigations/augmented_lagrangian_gate.md.
     #
-    # DECOUPLED decay (AdamW), not Adam's coupled L2: the drift is sustained
-    # by Adam's own normalisation, which divides a consistently-signed
-    # gradient by its running magnitude and so delivers a full-size step
-    # however small that gradient has become. A coupled L2 term goes through
-    # that same division and is damped with everything else; a decoupled one
-    # is applied straight to the parameters.
-    #
-    # WEIGHTS ONLY. The score's reach lives in the weights — measured across
-    # checkpoints, `net.4.weight` grows from exactly 0 to 0.55-0.77 while
-    # `net.4.bias` stays at -2.87 from -3.0 — and decaying the bias toward 0
-    # would put every boundary at sigmoid(0) = 0.5, the "head opens
-    # everything at init" failure the zero-weight/negative-bias init exists
-    # to prevent (AllocationHead's docstring, spec 2.2).
-    alloc_weight_decay: float = float(cfg["training"].get("alloc_weight_decay", 0.0))
-
-    # Optimizer for the allocation head. "adam" is the default and reproduces
-    # every run recorded before this key existed.
-    #
-    # "sgd" exists because Adam's step is a RATIO, m/(sqrt(v)+eps). A
+    # SGD, not Adam: Adam's step is a RATIO, m/(sqrt(v)+eps), so a
     # consistently-signed gradient gives m ~ sqrt(v) and therefore a step of
     # ~lr HOWEVER SMALL that gradient has become. Two measured consequences,
     # both in docs/investigations/score_runaway_and_dual_windup.md:
@@ -459,62 +427,30 @@ def main() -> None:
     #      is a rate-limited actuator driven by an integral controller, the
     #      textbook wind-up setup this file's Finding 7 records.
     #
-    # momentum stays 0: Adam's beta1 = 0.9 is a momentum term, and it is what
-    # makes the plant second-order. A second-order plant under the augmented
-    # dual's PI-shaped force is what oscillates in the first place.
-    alloc_optimizer: str = str(
-        cfg["training"].get("alloc_optimizer", "adam")
-    ).lower()
-    if alloc_optimizer not in ("adam", "sgd"):
-        raise ValueError(
-            f"unknown training.alloc_optimizer {alloc_optimizer!r}; "
-            f"expected 'adam' or 'sgd'"
-        )
+    # No weight decay: Finding 9 found no viable sizing under SGD (acting
+    # within a 300-step run needs wd ~ 6.7, but by wd = 3 the decay force is
+    # already 103% of the loss gradient). No momentum: Adam's beta1 = 0.9 is
+    # a momentum term, and it is what makes the plant second-order — a
+    # second-order plant under the augmented dual's PI-shaped force is what
+    # oscillates in the first place. Removed 2026-09 (open_followups.md
+    # item #8); recoverable from git history if Adam is needed again.
+    opt_alloc = optim.SGD(
+        allocation_head.parameters(),
+        lr=cfg["training"]["lr_alloc"],
+        momentum=0.0,
+    )
 
     # Max total grad-norm on the allocation head, 0.0 = off (the shipped
-    # default, and what every recorded run used). This exists for the same
-    # reason the SGD arm needs it: with a proportional step, one transient
-    # gradient at the epoch 7-9 whipsaw would force lr down far enough to
-    # make the remaining 50 epochs useless. Clipping caps the transient so a
-    # healthy lr survives the whole run. Under Adam it also stops that
-    # transient being burned into exp_avg_sq, which at beta2 = 0.999 over a
-    # 60-STEP run (one optimizer step per epoch) is never forgotten:
-    # measured sqrt(v_hat) = 52.1 against a live gradient of 0.15, an
-    # effective step of 4.1e-5.
+    # default, and what every recorded run used). This exists because with a
+    # proportional (SGD) step, one transient gradient at the epoch 7-9
+    # whipsaw would force lr down far enough to make the remaining 50 epochs
+    # useless. Clipping caps the transient so a healthy lr survives the
+    # whole run.
     alloc_grad_clip: float = float(cfg["training"].get("alloc_grad_clip", 0.0))
     if alloc_grad_clip < 0.0:
         raise ValueError(
             f"training.alloc_grad_clip must be >= 0 (0.0 disables it), "
             f"got {alloc_grad_clip}"
-        )
-
-    _alloc_params = list(allocation_head.parameters())
-    # WEIGHTS ONLY for decay under either optimizer, same rule and same
-    # reasoning as the AdamW branch documents below.
-    _decay_groups = [
-        {"params": [p for p in _alloc_params if p.ndim >= 2],
-         "weight_decay": alloc_weight_decay},
-        {"params": [p for p in _alloc_params if p.ndim < 2],
-         "weight_decay": 0.0},
-    ]
-    if alloc_optimizer == "sgd":
-        # Coupled weight_decay is correct here: SGD has no normalisation to
-        # decouple FROM, so torch's L2 term already lands straight on the
-        # parameter, which is exactly what AdamW's decoupling buys elsewhere.
-        opt_alloc = optim.SGD(
-            _decay_groups,
-            lr=cfg["training"]["lr_alloc"],
-            momentum=0.0,
-        )
-    elif alloc_weight_decay > 0.0:
-        opt_alloc = optim.AdamW(
-            _decay_groups,
-            lr=cfg["training"]["lr_alloc"],
-        )
-    else:
-        opt_alloc = optim.Adam(
-            allocation_head.parameters(),
-            lr=cfg["training"]["lr_alloc"],
         )
 
     t_cfg = cfg["training"]
@@ -609,7 +545,6 @@ def main() -> None:
                 lambda_dev=p_cfg["lambda_dev"],
                 lambda_cost=p_cfg["lambda_cost"],
                 waste_cost=alloc.waste_cost,
-                penalty=penalty,
                 rho=rho,
             )
 
@@ -660,28 +595,17 @@ def main() -> None:
 
             # Dual ascent, using the same constraint values the loss consumed
             # this epoch. Runs AFTER the primal step so the duals price the
-            # constraint violation the step was actually taken against.
-            #
-            # The two modes feed it different vectors on purpose. The hinge's
-            # dual must NOT fall on a slack demand — that demand's violation
-            # is 0, not a negative number — so it ascends on relu(g) at
-            # `dual_lr`. One-sidedness is correct there, and fatal only in the
-            # force the same relu carries to the head. The augmented dual is
-            # gradient ascent on the dual function, so it takes the SIGNED g
-            # at the SAME rho the penalty uses: that shared coefficient is
-            # what makes the step well-scaled against the penalty's own
-            # curvature, and what makes the pair's fixed point g* = 0,
-            # lambda* = lambda_dev / s.
-            if penalty == "augmented":
-                dual_signal, dual_eta = metrics["constraint_g"], rho
-            else:
-                dual_signal, dual_eta = metrics["shortfalls"], c_cfg["dual_lr"]
+            # constraint violation the step was actually taken against. The
+            # augmented dual is gradient ascent on the dual function, so it
+            # takes the SIGNED g at the SAME rho the penalty uses: that
+            # shared coefficient is what makes the step well-scaled against
+            # the penalty's own curvature, and what makes the pair's fixed
+            # point g* = 0, lambda* = lambda_dev / s.
             duals = update_duals(
                 duals,
-                dual_signal,
-                eta=dual_eta,
+                metrics["constraint_g"],
+                eta=rho,
                 dual_max=c_cfg["dual_max"],
-                decay=dual_decay,
             )
             lambda_max_observed = duals.max().item()
             num_at_cap = int((duals >= c_cfg["dual_max"]).sum().item())

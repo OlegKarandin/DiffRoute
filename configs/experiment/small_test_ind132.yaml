@@ -85,11 +85,20 @@ traffic:
 # is whatever the constraint requires. Values are reasoned starting
 # points, not measured optima — see the design spec §4.
 constraint:
-  margin_db: 0.5          # delta, added inside the hinge
-  dual_init: 10.0         # lambda_0 — matches the old lambda_infeasible, so
-                          # epoch 1 reproduces the previous behaviour
-  dual_lr: 1.0            # eta — a 1 dB shortfall moves a dual 10% of lambda_0
-  dual_max: 1000.0        # lambda_max — 100x lambda_0; a diagnostic cap
+  margin_db: 0.5          # delta, added to the bar
+  dual_init: 0.0          # lambda_0 — cold start (spec section 3): every
+                          # dual starts at 0 under the augmented penalty
+  # rho — the augmented penalty coefficient and the dual step. compute_loss
+  # requires rho > 0 unconditionally (open_followups.md item #8 removed the
+  # hinge penalty, which needed no rho); 0.0 here is a PLACEHOLDER that
+  # fails loudly rather than silently. MEASURE it with
+  #   python -m scripts.calibrate_rho --config configs/experiment/small_test_ind132.yaml
+  # before running this config — see constrained_stress.yaml's rho comment
+  # for a worked example (rho: 0.310338 there, measured on ind_132/stress —
+  # this config shares that topology but not the traffic scenario, so its
+  # own rho still needs measuring).
+  rho: 0.0
+  dual_max: 1000.0        # lambda_max — a diagnostic cap, not tuned
 
 training:
   lr_edge_net: 1.0e-3

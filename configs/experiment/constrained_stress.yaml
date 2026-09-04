@@ -97,16 +97,30 @@ traffic:
   scale: 2500000.0        # total offered load in Gbps
   holdout_seed: 1         # a different matrix, for the generalisation gap
 
-# Feasibility as a constraint, not a penalty. `lambda_dev` above stays
-# fixed; these duals rise until feasibility is bought, so the device count
-# is whatever the constraint requires. Values are reasoned starting
-# points, not measured optima — see the design spec §4.
+# Feasibility as a constraint, not a penalty, via the augmented Lagrangian
+# (method of multipliers) — the only penalty compute_loss implements as of
+# open_followups.md item #8 (2026-09), which removed the one-sided hinge:
+# Finding 7 measured augmented winning 4 vs 24 over-buy at the shipped
+# 300-epoch budget. `lambda_dev` above stays fixed; the duals rise (and, on
+# a slack demand, fall) until feasibility is bought, so the device count is
+# whatever the constraint requires.
 constraint:
-  margin_db: 0.5          # delta, added inside the hinge
-  dual_init: 10.0         # lambda_0 — matches the old lambda_infeasible, so
-                          # epoch 1 reproduces the previous behaviour
-  dual_lr: 1.0            # eta — a 1 dB shortfall moves a dual 10% of lambda_0
-  dual_max: 1000.0        # lambda_max — 100x lambda_0; a diagnostic cap
+  margin_db: 0.5          # delta, added to the bar
+  dual_init: 0.0          # lambda_0 — cold start (spec section 3): every
+                          # dual starts at 0, so a slack demand exerts
+                          # nothing until it is ever violated
+  # rho — the augmented penalty coefficient and the dual step —
+  # MEASURED 2026-09-04 by
+  #   python -m scripts.calibrate_rho --config configs/experiment/constrained_stress.yaml
+  # device push 7.9842e+01, unit (linear, un-relu'd) feasibility push
+  # 7.3507e+02 -> lambda* = lambda_dev / s = 0.108618 -> rho = lambda* /
+  # 0.35 dB = 0.310338 (ceiling 10*lambda* = 1.086182, not binding).
+  # Confirmatory trial (20 epochs, augmented): violated max=31 final=0,
+  # last-10 violated max=0 zero_in=10/10, gap min=0 final=0, devices
+  # final=31 oracle=31, lambda_max=0.019. Re-run the script if the physics,
+  # the topology, lambda_dev or margin_db changes.
+  rho: 0.310338
+  dual_max: 1000.0        # lambda_max — a diagnostic cap, not tuned
 
 training:
   lr_edge_net: 1.0e-3

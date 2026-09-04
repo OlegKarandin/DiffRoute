@@ -34,6 +34,7 @@ def simple_loss_inputs():
         device_count=torch.zeros(()),
         modulation_config=mod_cfg,
         duals=torch.tensor([10.0, 10.0]),
+        rho=20.0,
     )
 
 
@@ -50,6 +51,7 @@ def test_empty_demand_list_does_not_crash():
         device_count=torch.zeros(()),
         modulation_config=None,
         duals=torch.zeros(0),
+        rho=20.0,
     )
     assert total.shape == ()
     assert metrics["num_infeasible"] == 0
@@ -87,13 +89,14 @@ def test_num_infeasible_counts_only_below_threshold_demands(simple_loss_inputs):
 from diffopt.loss import update_duals
 
 
-def test_margin_keeps_hinge_active_above_threshold():
+def test_margin_keeps_the_penalty_active_above_threshold():
     """The fix for spec finding #3.
 
     `relu(thr - gsnr)` is exactly zero the moment a demand clears, so nothing
     pushes for headroom — measured |g_feas|_1 = 0.000 on fully-feasible epochs,
     every logit pushed down and none up. With a margin, a demand sitting at
-    thr + delta/2 still contributes loss.
+    thr + delta/2 still contributes force under the augmented penalty too
+    (its bar is thr + delta, so g = delta/2 > 0 — still on the violated side).
     """
     mod_cfg = make_mod_config()          # single 400 G format, 20 dB threshold
     demands = [Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)]
@@ -110,19 +113,21 @@ def test_margin_keeps_hinge_active_above_threshold():
         margin_db=margin_db,
         lambda_dev=0.0,
         lambda_cost=0.0,
+        rho=20.0,
     )
-    assert total.item() == pytest.approx(margin_db / 2)
+    # z = relu(1.0 + 20.0*0.25) = 6.0 -> (36 - 1) / 40 = 0.875.
+    assert total.item() == pytest.approx(0.875)
     assert metrics["num_violated"] == 1, "violates threshold + margin"
     assert metrics["num_infeasible"] == 0, "but is physically feasible"
 
     total.backward()
-    assert gsnr.grad.item() < 0, (
+    assert gsnr.grad.item() == pytest.approx(-6.0), (
         "raising GSNR must reduce the loss — without a margin this gradient "
         "is exactly zero above the threshold"
     )
 
 
-def test_zero_loss_only_once_the_margin_is_cleared():
+def test_num_violated_is_zero_once_the_margin_is_cleared():
     mod_cfg = make_mod_config()
     demands = [Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)]
     total, metrics = compute_loss(
@@ -135,8 +140,12 @@ def test_zero_loss_only_once_the_margin_is_cleared():
         margin_db=0.5,
         lambda_dev=0.0,
         lambda_cost=0.0,
+        rho=20.0,
     )
-    assert total.item() == pytest.approx(0.0)
+    # Not exactly 0: the augmented term carries a negative constant on a
+    # comfortably-slack demand (test_augmented_term_value_matches_the_closed_form),
+    # unlike the removed hinge's exact zero past the bar. What survives is
+    # that the demand no longer counts as violated.
     assert metrics["num_violated"] == 0
 
 
@@ -157,10 +166,13 @@ def test_duals_weight_demands_independently():
         margin_db=0.0,
         lambda_dev=0.0,
         lambda_cost=0.0,
+        rho=20.0,
     )
     base, _ = compute_loss(duals=torch.tensor([1.0, 1.0]), **common)
     bumped, _ = compute_loss(duals=torch.tensor([2.0, 1.0]), **common)
-    # demand 0 shortfall = 20 - 18 = 2.0
+    # Both demands stay violated (g > 0) at both dual values, so the
+    # augmented term is LINEAR in dual there — same as the removed hinge —
+    # and the difference is exactly demand 0's shortfall, 20 - 18 = 2.0.
     assert bumped.item() - base.item() == pytest.approx(2.0)
 
 
@@ -180,6 +192,7 @@ def test_shortfalls_are_returned_indexed_by_demand_id():
         margin_db=0.0,
         lambda_dev=0.0,
         lambda_cost=0.0,
+        rho=20.0,
     )
     shortfalls = metrics["shortfalls"]
     assert shortfalls.shape == (2,)
@@ -204,6 +217,7 @@ def test_worst_margin_db_is_reported_against_the_bare_threshold():
         modulation_config=mod_cfg,
         duals=torch.tensor([1.0, 1.0]),
         margin_db=0.5,
+        rho=20.0,
     )
     assert metrics["worst_margin_db"] == pytest.approx(-0.6)
 
@@ -239,23 +253,6 @@ def test_update_duals_does_not_mutate_its_input():
     duals = torch.tensor([10.0])
     update_duals(duals, torch.tensor([1.0]), eta=1.0, dual_max=1000.0)
     assert duals[0].item() == pytest.approx(10.0)
-
-
-def test_dual_stationary_when_satisfied_and_decay_zero():
-    """decay defaults to 0.0 -- must reproduce the pre-decay ratchet exactly."""
-    duals = torch.tensor([10.0, 42.0])
-    updated = update_duals(duals, torch.zeros(2), eta=1.0, dual_max=1000.0, decay=0.0)
-    assert updated.tolist() == pytest.approx([10.0, 42.0])
-
-
-def test_dual_decays_only_when_satisfied():
-    duals = torch.tensor([10.0, 10.0])
-    shortfalls = torch.tensor([1.0, 0.0])
-    updated = update_duals(duals, shortfalls, eta=1.0, dual_max=1000.0, decay=0.1)
-    # index 0 still violated: ascends undamped, decay does not apply.
-    assert updated[0].item() == pytest.approx(11.0)
-    # index 1 satisfied: decays by (1 - decay).
-    assert updated[1].item() == pytest.approx(9.0)
 
 
 def test_device_count_is_priced_by_lambda_dev(simple_loss_inputs):
@@ -321,7 +318,7 @@ def test_waste_cost_is_diagnostic_only_and_never_changes_the_total(simple_loss_i
 # margin_db = 0.5 the bar is 20.5 dB and g = 20.5 - gsnr throughout.
 # ---------------------------------------------------------------------------
 
-def _one_demand_loss(gsnr_value, *, dual, penalty, rho=None, margin_db=0.5):
+def _one_demand_loss(gsnr_value, *, dual, rho, margin_db=0.5):
     """compute_loss over a single demand, with every term but feasibility
     switched off, returning (total, metrics, the gsnr leaf)."""
     mod_cfg = make_mod_config()
@@ -336,27 +333,21 @@ def _one_demand_loss(gsnr_value, *, dual, penalty, rho=None, margin_db=0.5):
         margin_db=margin_db,
         lambda_dev=0.0,
         lambda_cost=0.0,
-        penalty=penalty,
         rho=rho,
     )
     return total, metrics, gsnr
 
 
 def test_augmented_is_active_inside_the_feasible_region():
-    """The reason this change exists (spec 1.1).
-
-    A demand 0.2 dB INSIDE its bar contributes exactly zero force under the
-    hinge, no matter how large its dual — relu'(g) = 0 for g < 0 — so at an
-    optimum where every demand is feasible the only surviving force is
-    -lambda_dev, and stationarity would require lambda_dev = 0. Under the
-    augmented penalty the same demand
-    at lambda = 10, rho = 20 feels max(0, 10 + 20*(-0.2)) = 6.
+    """The reason this design exists (spec 1.1): a one-sided hinge term,
+    `dual_d * relu(g_d)`, contributes exactly zero force for a demand 0.2 dB
+    INSIDE its bar, no matter how large its dual — relu'(g) = 0 for g < 0 —
+    so at an optimum where every demand is feasible the only surviving force
+    is -lambda_dev, and stationarity would require lambda_dev = 0. The
+    augmented penalty does not have this defect: at lambda = 10, rho = 20
+    the same demand feels max(0, 10 + 20*(-0.2)) = 6.
     """
-    hinge_total, _, hinge_gsnr = _one_demand_loss(20.7, dual=10.0, penalty="hinge")
-    hinge_total.backward()
-    assert hinge_gsnr.grad.item() == 0.0, "the defect: a satisfied demand pushes nothing"
-
-    aug_total, _, aug_gsnr = _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=20.0)
+    aug_total, _, aug_gsnr = _one_demand_loss(20.7, dual=10.0, rho=20.0)
     aug_total.backward()
     assert aug_gsnr.grad.item() == pytest.approx(-6.0, abs=1e-4)
 
@@ -366,75 +357,45 @@ def test_augmented_collapses_to_zero_past_the_band():
     disqualifies the softplus variant (spec 7): past g < -lambda/rho the
     force is EXACTLY zero, not merely small."""
     # lambda/rho = 10/20 = 0.5 dB, so g = -0.6 is outside the band.
-    total, _, gsnr = _one_demand_loss(21.1, dual=10.0, penalty="augmented", rho=20.0)
+    total, _, gsnr = _one_demand_loss(21.1, dual=10.0, rho=20.0)
     total.backward()
     assert gsnr.grad.item() == 0.0
 
 
 def test_augmented_force_is_max_zero_lambda_plus_rho_g():
     """The derivative in spec 2.1, by direct autograd, on the violated side."""
-    total, _, gsnr = _one_demand_loss(20.2, dual=10.0, penalty="augmented", rho=20.0)
+    total, _, gsnr = _one_demand_loss(20.2, dual=10.0, rho=20.0)
     total.backward()
     # g = +0.3 -> lambda + rho*g = 16.0, and raising gsnr lowers the loss.
     assert gsnr.grad.item() == pytest.approx(-16.0)
 
 
-def test_augmented_matches_the_hinge_force_on_the_bar():
-    """Continuity with today at g = 0: the augmented force is exactly lambda,
-    the value the hinge takes on its violated side."""
-    aug_total, _, aug_gsnr = _one_demand_loss(20.5, dual=10.0, penalty="augmented", rho=20.0)
+def test_augmented_force_at_the_bar_equals_lambda():
+    """At g = 0 the force is exactly lambda — the same value a one-sided
+    hinge takes on its violated side, so the two agree at the boundary."""
+    aug_total, _, aug_gsnr = _one_demand_loss(20.5, dual=10.0, rho=20.0)
     aug_total.backward()
     assert aug_gsnr.grad.item() == pytest.approx(-10.0)
-
-    hinge_total, _, hinge_gsnr = _one_demand_loss(20.4, dual=10.0, penalty="hinge")
-    hinge_total.backward()
-    assert hinge_gsnr.grad.item() == pytest.approx(-10.0)
 
 
 def test_augmented_term_value_matches_the_closed_form():
     """(relu(lambda + rho*g)^2 - lambda^2) / (2*rho), including the negative
     constant a comfortably-slack demand contributes — that constant is what
     makes the term continuous at the kink."""
-    inside, m_inside, _ = _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=20.0)
+    inside, m_inside, _ = _one_demand_loss(20.7, dual=10.0, rho=20.0)
     # z = relu(10 + 20*(-0.2)) = 6 -> (36 - 100) / 40 = -1.6
     assert inside.item() == pytest.approx(-1.6, abs=1e-4)
     assert m_inside["weighted_feasibility_loss"] == pytest.approx(-1.6, abs=1e-4)
 
-    outside, _, _ = _one_demand_loss(21.1, dual=10.0, penalty="augmented", rho=20.0)
+    outside, _, _ = _one_demand_loss(21.1, dual=10.0, rho=20.0)
     # z = relu(10 - 12) = 0 -> (0 - 100) / 40 = -2.5
     assert outside.item() == pytest.approx(-2.5)
 
 
-def test_feasibility_loss_is_sum_relu_g_in_both_modes():
-    """Spec 2.4: the LOGGED diagnostic must stay comparable across arms, so
-    only the weighted term changes shape."""
-    mod_cfg = make_mod_config()
-    demands = [
-        Demand(id=0, src=0, dst=1, bitrate_gbps=400.0),
-        Demand(id=1, src=1, dst=2, bitrate_gbps=400.0),
-    ]
-    common = dict(
-        gsnr_preds={0: torch.tensor(18.0), 1: torch.tensor(25.0)},
-        path_noise_costs={0: torch.tensor(0.0), 1: torch.tensor(0.0)},
-        demands=demands,
-        device_count=torch.zeros(()),
-        modulation_config=mod_cfg,
-        duals=torch.tensor([10.0, 10.0]),
-        margin_db=0.5,
-        lambda_dev=0.0,
-        lambda_cost=0.0,
-    )
-    _, hinge_m = compute_loss(penalty="hinge", **common)
-    _, aug_m = compute_loss(penalty="augmented", rho=20.0, **common)
-    # bar = 20.5: relu(2.5) + relu(-4.5) = 2.5 in both modes.
-    assert hinge_m["feasibility_loss"] == pytest.approx(2.5)
-    assert aug_m["feasibility_loss"] == pytest.approx(2.5)
-
-
-def test_constraint_g_is_signed_and_detached():
-    """update_duals' augmented input. A slack demand's entry must be
-    NEGATIVE — that is the whole difference from `shortfalls`, and it is what
-    lets the dual fall on slack instead of ratcheting."""
+def test_feasibility_loss_is_sum_relu_g():
+    """The LOGGED diagnostic — the one-sided sum kept comparable across
+    epochs while the duals are non-stationary — stays sum(relu(g))
+    regardless of the weighted term's own shape."""
     mod_cfg = make_mod_config()
     demands = [
         Demand(id=0, src=0, dst=1, bitrate_gbps=400.0),
@@ -450,7 +411,31 @@ def test_constraint_g_is_signed_and_detached():
         margin_db=0.5,
         lambda_dev=0.0,
         lambda_cost=0.0,
-        penalty="augmented",
+        rho=20.0,
+    )
+    # bar = 20.5: relu(2.5) + relu(-4.5) = 2.5.
+    assert metrics["feasibility_loss"] == pytest.approx(2.5)
+
+
+def test_constraint_g_is_signed_and_detached():
+    """update_duals' input. A slack demand's entry must be NEGATIVE — that
+    is the whole difference from `shortfalls`, and it is what lets the dual
+    fall on slack instead of ratcheting."""
+    mod_cfg = make_mod_config()
+    demands = [
+        Demand(id=0, src=0, dst=1, bitrate_gbps=400.0),
+        Demand(id=1, src=1, dst=2, bitrate_gbps=400.0),
+    ]
+    _, metrics = compute_loss(
+        gsnr_preds={0: torch.tensor(18.0), 1: torch.tensor(25.0)},
+        path_noise_costs={0: torch.tensor(0.0), 1: torch.tensor(0.0)},
+        demands=demands,
+        device_count=torch.zeros(()),
+        modulation_config=mod_cfg,
+        duals=torch.tensor([10.0, 10.0]),
+        margin_db=0.5,
+        lambda_dev=0.0,
+        lambda_cost=0.0,
         rho=20.0,
     )
     g = metrics["constraint_g"]
@@ -458,41 +443,28 @@ def test_constraint_g_is_signed_and_detached():
     assert not g.requires_grad, "dual updates must not build a graph"
     assert g[0].item() == pytest.approx(2.5)
     assert g[1].item() == pytest.approx(-4.5)
-    # `shortfalls` stays one-sided, for hinge mode and the violated count.
+    # `shortfalls` stays one-sided, for the violated count and the diagnostic.
     assert metrics["shortfalls"][1].item() == pytest.approx(0.0)
 
 
-def test_constraint_g_is_returned_in_hinge_mode_too():
-    """It costs one subtraction and keeps the metrics dict one shape, so a
-    diagnostic reading it does not have to know which mode produced it."""
-    _, metrics, _ = _one_demand_loss(20.7, dual=10.0, penalty="hinge")
-    assert metrics["constraint_g"][0].item() == pytest.approx(-0.2, abs=1e-4)
-
-
-def test_augmented_without_rho_raises():
-    """Spec 3: never a silent fallback."""
-    with pytest.raises(ValueError, match="rho"):
-        _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=None)
+def test_compute_loss_requires_rho():
+    """Spec 3: never a silent fallback. rho is keyword-only with no
+    default, so omitting it is a TypeError at the call boundary, not a
+    guessed band width."""
+    with pytest.raises(TypeError, match="rho"):
+        compute_loss(
+            gsnr_preds={0: torch.tensor(20.7)},
+            path_noise_costs={0: torch.tensor(0.0)},
+            demands=[Demand(id=0, src=0, dst=1, bitrate_gbps=400.0)],
+            device_count=torch.zeros(()),
+            modulation_config=make_mod_config(),
+            duals=torch.tensor([10.0]),
+        )
 
 
 def test_non_positive_rho_raises():
     with pytest.raises(ValueError, match="rho"):
-        _one_demand_loss(20.7, dual=10.0, penalty="augmented", rho=0.0)
-
-
-def test_unknown_penalty_raises():
-    with pytest.raises(ValueError, match="penalty"):
-        _one_demand_loss(20.7, dual=10.0, penalty="softplus")
-
-
-def test_hinge_mode_is_bit_identical_to_the_default(simple_loss_inputs):
-    """Regression guard. `penalty` defaults to hinge, and naming it
-    explicitly must change nothing — not the total, not a metric."""
-    default_total, default_m = compute_loss(**simple_loss_inputs)
-    explicit_total, explicit_m = compute_loss(penalty="hinge", **simple_loss_inputs)
-    assert torch.equal(default_total, explicit_total)
-    assert default_m["weighted_feasibility_loss"] == explicit_m["weighted_feasibility_loss"]
-    assert torch.equal(default_m["shortfalls"], explicit_m["shortfalls"])
+        _one_demand_loss(20.7, dual=10.0, rho=0.0)
 
 
 def test_augmented_dual_falls_on_slack_under_the_signed_update():
@@ -539,7 +511,7 @@ def test_augmented_composed_seam_dual_dynamics_across_epochs():
             gsnr_preds=gsnr_preds, path_noise_costs=path_noise_costs,
             demands=demands, device_count=torch.zeros(()),
             modulation_config=mod_cfg, duals=duals, margin_db=0.5,
-            lambda_dev=0.0, lambda_cost=0.0, penalty="augmented", rho=rho,
+            lambda_dev=0.0, lambda_cost=0.0, rho=rho,
         )
         g = metrics["constraint_g"]
         # force = max(0, lambda + rho*g); the slack demand's lambda is 0

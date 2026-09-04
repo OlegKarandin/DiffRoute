@@ -29,47 +29,23 @@ def test_no_arm_references_a_deleted_config_key():
     """Regression guard: an arm overriding `placement.gate` would write a
     config key nothing reads, and the arm would silently be a duplicate of
     baseline."""
-    dead = {"gate", "gate_dropout_p", "hard_concrete", "lambda_regen", "lr_regen"}
+    dead = {
+        "gate", "gate_dropout_p", "hard_concrete", "lambda_regen", "lr_regen",
+        "penalty", "dual_lr", "dual_decay", "alloc_optimizer",
+        "alloc_weight_decay", "greedy_residual", "alloc_dropout_p",
+        "lambda_waste", "alloc_anti_windup", "alloc_ste_tau10", "alloc_ste_tau30",
+    }
     for arm in ARMS:
         for section in arm["overrides"].values():
             assert not (set(section) & dead), arm["name"]
     assert not (set(CSV_FIELDNAMES) & dead)
 
 
-def test_the_augmented_arms_are_registered():
-    """Spec section 6 needs four runs: al_ste on three seeds, plus
-    baseline-under-AL on one for the no-regression comparison."""
-    names = {arm["name"] for arm in ARMS}
-    assert {"al_ste", "al_baseline"} <= names
-
-
-def test_every_augmented_arm_carries_a_measured_rho_and_a_cold_dual():
-    """rho has no default and compute_loss raises without it, so an arm that
-    forgot it would fail at epoch 1 rather than silently run the hinge. And
-    dual_init must drop to 0: under AL a slack demand's force is
-    max(0, lambda + rho*g), so a nonzero starting lambda pushes every demand
-    up before any of them has ever been violated."""
-    augmented = [
-        arm for arm in ARMS
-        if arm["overrides"].get("constraint", {}).get("penalty") == "augmented"
-    ]
-    assert augmented, "no augmented arm registered"
-    for arm in augmented:
-        constraint = arm["overrides"]["constraint"]
-        assert constraint.get("rho", 0.0) > 0.0, arm["name"]
-        assert constraint.get("dual_init") == 0.0, arm["name"]
-
-
-def test_the_augmented_ste_arm_pins_tau_and_turns_on_the_ste():
-    """The AL defect only EXISTS once the STE removes the phantom violations
-    (spec 1.2), so the arm this rho was measured for must carry it."""
-    arm = next(a for a in ARMS if a["name"] == "al_ste")
+def test_alloc_ste_arm_pins_tau_and_turns_on_the_ste():
+    """The STE defect (spec 1.2) is what the augmented penalty needs fixed
+    to have a nonzero band; every arm now runs under the augmented penalty
+    via constrained_stress.yaml's own constraint.rho, so this is the arm
+    that carries the STE."""
+    arm = next(a for a in ARMS if a["name"] == "alloc_ste")
     assert arm["overrides"]["placement"] == {"alloc_ste": True}
     assert arm["overrides"]["training"]["alloc_tau_end"] == 1.0
-
-
-def test_the_augmented_baseline_arm_changes_only_the_penalty():
-    """Its whole job is the no-regression comparison against `baseline`, so
-    it must differ from it in the constraint block and nowhere else."""
-    arm = next(a for a in ARMS if a["name"] == "al_baseline")
-    assert set(arm["overrides"]) == {"constraint"}
