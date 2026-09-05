@@ -217,6 +217,36 @@
     font-size: var(--text-sm);
   }
 
+  /* ---- map panel (Task 8) ------------------------------------------- */
+  #map-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .map-counter {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  .map-svg {
+    flex: 1 1 auto;
+    width: 100%;
+    height: 100%;
+    min-height: 220px;
+  }
+
+  .map-node text {
+    font-family: var(--font-mono);
+    pointer-events: none;
+    user-select: none;
+  }
+
   /* ---- scrubber ---------------------------------------------------------- */
   #scrubber {
     position: sticky;
@@ -290,7 +320,9 @@
   <main id="panels">
     <section class="panel" id="map-panel" aria-label="Network map">
       <div class="panel-head"><h2>Network</h2></div>
-      <div class="panel-body placeholder-body">Topology map — nodes, edges and regenerator sites render here.</div>
+      <div class="panel-body" id="map-body">
+        <div class="placeholder-body">Topology map — nodes, edges and regenerator sites render here.</div>
+      </div>
     </section>
 
     <section class="panel" id="strip-panel" aria-label="Physics strip">
@@ -363,6 +395,190 @@
   }
 
   // -------------------------------------------------------------------
+  // Map panel (Task 8): SVG network map. Draw order is edges -> ribbons
+  // (Task 9 fills #map-ribbons) -> nodes; nodes are always opaque and
+  // always drawn last so no ROADM or pip is ever buried under a line.
+  // -------------------------------------------------------------------
+  const MAP_VB_W = 1000, MAP_VB_H = 700, MAP_PAD = 54;
+  const MAP_PLOT_W = MAP_VB_W - 2 * MAP_PAD;
+  const MAP_PLOT_H = MAP_VB_H - 2 * MAP_PAD;
+  const REGEN_SET = new Set(TOPO.regen_candidates);
+
+  function nodeXY(nodeId) {
+    const [ux, uy] = TOPO.layout[nodeId];
+    return [MAP_PAD + ux * MAP_PLOT_W, MAP_PAD + uy * MAP_PLOT_H];
+  }
+
+  // markScale(): every map dimension derives from num_nodes -- never a
+  // constant -- so a 17-node and a 130-node topology both stay legible.
+  // Node radius ∝ 1/sqrt(num_nodes) over the unit-box layout (the plot
+  // box IS that unit box, mapped into viewBox units); everything else
+  // (regen ring, pips, ribbon/casing width for Task 9) derives from it.
+  function markScale() {
+    const n = Math.max(1, TOPO.num_nodes);
+    const unit = Math.min(MAP_PLOT_W, MAP_PLOT_H) / Math.sqrt(n);
+    const nodeR = Math.max(3, unit * 0.16);
+    const regenR = nodeR * 1.45;
+    const pipR = Math.max(1.3, nodeR * 0.30);
+    const pipHaloR = pipR * 1.9;
+    const pipOrbit = nodeR * 1.55;
+    const ribbonW = nodeR * 0.5;               // consumed by Task 9
+    const casingW = ribbonW + nodeR * 0.32;    // scales with ribbonW, per spec
+    const edgeUnit = Math.max(0.35, nodeR * 0.10);
+    const showLabels = TOPO.num_nodes <= 40;   // else: hover only, via <title>
+    return { nodeR, regenR, pipR, pipHaloR, pipOrbit, ribbonW, casingW, edgeUnit, showLabels };
+  }
+
+  // edgeLoad(frame): how many lightpaths use each edge id, over EVERY
+  // lightpath in the frame (frameAt already reconstructed the full set,
+  // not just whatever a panel chooses to draw) -- by flattening lp.segs.
+  function edgeLoad(frame) {
+    const counts = new Float64Array(TOPO.edges.length);
+    for (const lp of frame.lightpaths.values()) {
+      for (const seg of lp.segs) {
+        for (const eid of seg) counts[eid]++;
+      }
+    }
+    return counts;
+  }
+
+  // Mean margin per edge -- the continuous channel that keeps evolving
+  // after the last red clears. Per-edge WORST margin is banned (a single
+  // bad demand would paint a large fraction of the network red); mean is
+  // not. NaN for an edge no lightpath touches.
+  function edgeMeanMargin(frame) {
+    const sums = new Float64Array(TOPO.edges.length);
+    const counts = new Float64Array(TOPO.edges.length);
+    for (const lp of frame.lightpaths.values()) {
+      for (const seg of lp.segs) {
+        for (const eid of seg) { sums[eid] += lp.margin_db; counts[eid]++; }
+      }
+    }
+    const means = new Float64Array(TOPO.edges.length);
+    for (let i = 0; i < means.length; i++) means[i] = counts[i] ? sums[i] / counts[i] : NaN;
+    return means;
+  }
+
+  function escHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function renderMap() {
+    const mapBody = document.getElementById('map-body');
+    if (!mapBody) return;
+    if (!EPOCHS.length || state.epoch === null) {
+      mapBody.innerHTML = '<div class="placeholder-body">no frames in this dump</div>';
+      return;
+    }
+    const frame = frameAt(state.epoch);
+    const scale = markScale();
+    const loads = edgeLoad(frame);
+    const means = edgeMeanMargin(frame);
+
+    // ---- edges: neutral load channel, √-scaled width; idle = hairline.
+    let edgesSvg = '';
+    for (const e of TOPO.edges) {
+      const [x1, y1] = nodeXY(e.src);
+      const [x2, y2] = nodeXY(e.dst);
+      const load = loads[e.id];
+      const w = load > 0 ? scale.edgeUnit * Math.sqrt(load) : scale.edgeUnit * 0.22;
+      const mean = means[e.id];
+      const stroke = Number.isFinite(mean)
+        ? `color-mix(in srgb, var(--load) 55%, var(--${colourOf(mean)}) 45%)`
+        : 'var(--line)';
+      const tip = Number.isFinite(mean)
+        ? `edge ${e.id}: node ${e.src}–${e.dst}, ${load} lightpath${load === 1 ? '' : 's'}, mean margin ${mean.toFixed(2)} dB`
+        : `edge ${e.id}: node ${e.src}–${e.dst}, idle`;
+      edgesSvg +=
+        `<line x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" ` +
+        `stroke="${stroke}" stroke-width="${w.toFixed(2)}" stroke-opacity="${load > 0 ? 0.85 : 0.5}" ` +
+        `stroke-linecap="round"><title>${escHtml(tip)}</title></line>`;
+    }
+
+    // ---- nodes: opaque, drawn last. Ordinary / regen candidate / device
+    // site are three independent facts about a node, layered together.
+    let nodesSvg = '';
+    for (let i = 0; i < TOPO.num_nodes; i++) {
+      const [cx, cy] = nodeXY(i);
+      const isRegen = REGEN_SET.has(i);
+      const site = frame.sites[String(i)];
+      const count = site ? site.deployed : 0;
+      const r = isRegen ? scale.regenR : scale.nodeR;
+      const label = `node ${i}${isRegen ? ' (regen candidate)' : ''}${count ? `, ${count} device${count === 1 ? '' : 's'}` : ''}`;
+      // <title> first: some browsers only pick up the hover tooltip when
+      // it is the group's first child.
+      let g = `<g class="map-node"><title>${escHtml(label)}</title>`;
+
+      if (count > 0) {
+        // Device site: a filled disc behind the pips (and behind the
+        // node's own opaque circle, drawn next).
+        g += `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${(r * 1.35).toFixed(2)}" fill="var(--load)" fill-opacity="0.16"/>`;
+      }
+
+      // The node itself: always opaque, so it is never buried by an edge
+      // or ribbon. Regen candidates get a larger circle + heavier stroke.
+      g +=
+        `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${r.toFixed(2)}" fill="var(--surface)" ` +
+        `stroke="${isRegen ? 'var(--ink)' : 'var(--muted)'}" ` +
+        `stroke-width="${(isRegen ? scale.edgeUnit * 2.4 : scale.edgeUnit * 1.1).toFixed(2)}"/>`;
+
+      if (count > 0) {
+        if (count > 8) {
+          // Degrade honestly: past ~8 devices, swap to a numbered badge
+          // for THIS site only -- never a rescale of every mark.
+          g += `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${(scale.pipR * 2.2).toFixed(2)}" fill="var(--ink)"/>`;
+          g +=
+            `<text x="${cx.toFixed(2)}" y="${cy.toFixed(2)}" text-anchor="middle" dominant-baseline="central" ` +
+            `font-size="${(scale.pipR * 1.7).toFixed(2)}" fill="var(--surface)">${count}</text>`;
+        } else {
+          for (let k = 0; k < count; k++) {
+            const angle = (2 * Math.PI * k) / count - Math.PI / 2;
+            const px = cx + scale.pipOrbit * Math.cos(angle);
+            const py = cy + scale.pipOrbit * Math.sin(angle);
+            // Faint halo first, so pips stay findable against a busy map.
+            g += `<circle cx="${px.toFixed(2)}" cy="${py.toFixed(2)}" r="${scale.pipHaloR.toFixed(2)}" fill="var(--surface)" fill-opacity="0.85" stroke="var(--line)" stroke-width="${(scale.edgeUnit * 0.5).toFixed(2)}"/>`;
+            g += `<circle cx="${px.toFixed(2)}" cy="${py.toFixed(2)}" r="${scale.pipR.toFixed(2)}" fill="var(--ink)"/>`;
+          }
+        }
+      }
+
+      if (scale.showLabels) {
+        g +=
+          `<text x="${cx.toFixed(2)}" y="${(cy - r - 4).toFixed(2)}" text-anchor="middle" ` +
+          `font-size="${Math.max(9, Math.min(15, scale.nodeR * 0.55)).toFixed(2)}" fill="var(--muted)">${i}</text>`;
+      }
+      g += '</g>';
+      nodesSvg += g;
+    }
+
+    // ---- split counter: wired off colourOf so labels cannot drift from
+    // the marks. "showing" == everything NOT green (a future ribbon
+    // overlay's subject); the zero state gets words, not blankness.
+    let red = 0, orange = 0;
+    for (const lp of frame.lightpaths.values()) {
+      const c = colourOf(lp.margin_db);
+      if (c === 'red') red++;
+      else if (c === 'orange') orange++;
+    }
+    const total = DOC.demands.length;
+    const nonGreen = red + orange;
+    const counterHtml = nonGreen === 0
+      ? `showing <span class="num">0</span> / <span class="num">${total}</span> lightpaths ` +
+        `&mdash; every lightpath clears the ${RUN.margin_db.toFixed(1)} dB margin`
+      : `showing <span class="num">${nonGreen}</span> / <span class="num">${total}</span> lightpaths &middot; ` +
+        `<span class="num" style="color:var(--red)">${red}</span> below threshold &middot; ` +
+        `<span class="num" style="color:var(--orange)">${orange}</span> in margin`;
+
+    mapBody.innerHTML =
+      `<div class="map-counter" id="map-counter">${counterHtml}</div>` +
+      `<svg class="map-svg" viewBox="0 0 ${MAP_VB_W} ${MAP_VB_H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Network map for epoch ${state.epoch}">` +
+      `<g id="map-edges">${edgesSvg}</g>` +
+      `<g id="map-ribbons"></g>` +
+      `<g id="map-nodes">${nodesSvg}</g>` +
+      `</svg>`;
+  }
+
+  // -------------------------------------------------------------------
   // Shell state + wiring. Later tasks (8-11) extend render(); they must
   // not rename `state`, `render`, or the data-layer symbols above.
   // -------------------------------------------------------------------
@@ -412,6 +628,7 @@
     epochLabel.innerHTML = EPOCHS.length
       ? `epoch <strong>${state.epoch}</strong> &middot; frame ${idx + 1}/${EPOCHS.length}`
       : 'no frames';
+    renderMap();
   }
 
   function initHeader() {
