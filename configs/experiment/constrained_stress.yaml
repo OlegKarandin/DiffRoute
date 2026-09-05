@@ -180,9 +180,9 @@ training:
 
 # Phase 1d trajectory dump. OFF by default everywhere else; this is the
 # config the demo artifact is built from, so it opts in.
-# `every: 1` at 300 epochs is ~2 MB of JSON — comfortably inside the
-# Artifact's 16 MB cap with the file inlined, so subsampling is a fallback
-# rather than a requirement.
+# `every: 1` at 300 epochs measured ~5.4 MB of JSON (frames.json, demo run) —
+# comfortably inside the Artifact's 16 MB cap with the file inlined, so
+# subsampling is a fallback rather than a requirement.
 viz:
   dump_frames: true
   every: 1

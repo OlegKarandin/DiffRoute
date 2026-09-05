@@ -541,6 +541,14 @@
   // Self-check on load: the worst chunk recomputed from seg_gsnr_db + cut_idx
   // must equal the dumped gsnr_db. A mismatch means the DP fold and the
   // deployed rollout disagree, which is worth shouting about (spec 6.7).
+  //
+  // SELF_CHECK_TOL_DB is shared by runSelfCheck() (scans every lightpath in
+  // every frame, on load) and renderStrip()'s per-focus check (Task 10) so
+  // the two self-checks can never disagree on what counts as a mismatch.
+  // The fold's own inputs are rounded to 4 decimal places when dumped, so
+  // 1e-2 is comfortably above accumulated rounding error while still
+  // catching a genuine fold/rollout disagreement.
+  const SELF_CHECK_TOL_DB = 1e-2;
   function worstChunkDb(segs, cuts) {
     const bounds = [0, ...[...cuts].sort((a,b)=>a-b).map(k => k + 1), segs.length];
     let worst = 0;
@@ -1191,7 +1199,7 @@
     // banner pattern the header's load-time check already established,
     // rather than a second, differently-styled failure mechanism.
     const recomputed = worstChunkDb(lp.seg_gsnr_db, lp.cut_idx);
-    const mismatch = !Number.isFinite(recomputed) || Math.abs(recomputed - lp.gsnr_db) >= 1e-2;
+    const mismatch = !Number.isFinite(recomputed) || Math.abs(recomputed - lp.gsnr_db) >= SELF_CHECK_TOL_DB;
     if (mismatch) {
       console.error(
         `strip self-check: epoch ${state.epoch} demand ${demandId} — recomputed ` +
@@ -1808,7 +1816,7 @@
       for (const lp of frame.lightpaths) {
         checked++;
         const recomputed = worstChunkDb(lp.seg_gsnr_db, lp.cut_idx);
-        if (!Number.isFinite(recomputed) || Math.abs(recomputed - lp.gsnr_db) > 1e-3) {
+        if (!Number.isFinite(recomputed) || Math.abs(recomputed - lp.gsnr_db) > SELF_CHECK_TOL_DB) {
           mismatches++;
           console.error(
             `self-check: epoch ${frame.epoch} demand ${lp.d} — recomputed ` +

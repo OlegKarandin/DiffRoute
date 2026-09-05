@@ -240,7 +240,13 @@ class FrameWriter:
     # -- teardown ----------------------------------------------------------
 
     def close(self, selected_epoch: Optional[int], stats_csv: Path) -> None:
-        """Assemble frames.json from the sidecar plus the training CSV."""
+        """Assemble frames.json from the sidecar plus the training CSV.
+
+        The `.jsonl` sidecar is intentionally left in place after a
+        successful close (not deleted) — it stays inspectable if a later
+        run crashes before assembling frames.json, at the cost of keeping
+        both files on disk indefinitely.
+        """
         self._fh.close()
         lines = self.sidecar.read_text(encoding="utf-8").splitlines()
         header = json.loads(lines[0])

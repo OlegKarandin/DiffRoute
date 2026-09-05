@@ -47,7 +47,7 @@ def frozen_layout(topology: "Topology") -> List[List[float]]:
     }
 
     pos = nx.kamada_kawai_layout(
-        g, dist=dist, pos=nx.circular_layout(g), weight="km",
+        g, dist=dist, pos=nx.circular_layout(g),
     )
     xs = [float(pos[n][0]) for n in range(topology.num_nodes)]
     ys = [float(pos[n][1]) for n in range(topology.num_nodes)]
