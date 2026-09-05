@@ -314,6 +314,45 @@
     font-family: var(--font-mono);
   }
 
+  /* ---- stats panel (Task 11) ------------------------------------------- */
+  #stats-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .stats-head {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  .stats-head strong {
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .stats-chart {
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 240px;
+  }
+
+  .stats-chart text {
+    font-family: var(--font-mono);
+  }
+
+  .stats-legend {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
   /* ---- scrubber ---------------------------------------------------------- */
   #scrubber {
     position: sticky;
@@ -344,9 +383,49 @@
 
   .scrub-btn:hover { background: var(--line); }
 
+  /* Task 11: the range and its selected-checkpoint marker share this
+     positioning context so the marker can sit at an absolute % along the
+     track without disturbing the native slider's own layout. */
+  .scrub-track-wrap {
+    position: relative;
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+  }
+
   #scrub-range {
     flex: 1 1 auto;
+    width: 100%;
     accent-color: var(--load);
+  }
+
+  /* The main scrubber's OWN flag for RUN.selected_epoch (Task 11 step 6's
+     "the scrubber must also visually mark the selected-checkpoint epoch" --
+     this is a second, independent marker from the stats panel's filled
+     pin, positioned by index along EPOCHS the same way the native thumb
+     is). Pointer-events: none so it never intercepts the drag/click the
+     native <input type="range"> handles. */
+  .scrub-selected-marker {
+    position: absolute;
+    top: 50%;
+    width: 3px;
+    height: 12px;
+    background: var(--ink);
+    border-radius: 1px;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+
+  .scrub-selected-marker::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: -6px;
+    width: 6px;
+    height: 6px;
+    background: var(--ink);
+    border-radius: 50%;
+    transform: translateX(-50%);
   }
 
   .scrub-readout {
@@ -401,13 +480,18 @@
 
     <section class="panel" id="stats-panel" aria-label="Training statistics">
       <div class="panel-head"><h2>Training statistics</h2></div>
-      <div class="panel-body placeholder-body">Loss and constraint curves render here.</div>
+      <div class="panel-body" id="stats-body">
+        <div class="placeholder-body">Loss and constraint curves render here.</div>
+      </div>
     </section>
   </main>
 
   <footer id="scrubber">
     <button class="scrub-btn" id="scrub-prev" aria-label="Previous epoch (Left arrow)">&#8249;</button>
-    <input type="range" id="scrub-range" min="0" step="1" value="0" aria-label="Epoch scrubber">
+    <div class="scrub-track-wrap">
+      <input type="range" id="scrub-range" min="0" step="1" value="0" aria-label="Epoch scrubber">
+      <div class="scrub-selected-marker" id="scrub-selected-marker" aria-hidden="true" hidden></div>
+    </div>
     <button class="scrub-btn" id="scrub-next" aria-label="Next epoch (Right arrow)">&#8250;</button>
     <div class="scrub-readout">
       <span class="epoch-label num" id="epoch-label">&mdash;</span>
@@ -1259,6 +1343,392 @@
   }
 
   // -------------------------------------------------------------------
+  // Stats panel (Task 11): two stacked rails driven by DOC.stats
+  // (`e2e_train_log.csv` verbatim, at FULL epoch resolution -- this is a
+  // DIFFERENT, denser epoch axis than EPOCHS/frameAt, which only cover
+  // whatever cadence `viz.every` dumped). col(name) is the only way this
+  // panel reads a column: look up its position in DOC.stats.columns once,
+  // then read that position from every row -- never a hard-coded index,
+  // since the CSV's column order is not part of this plan's contract.
+  //
+  // Reporting rule (hard, project-wide invariant -- see train.py's and
+  // scripts/dump_frames.py's own comments on `oracle_gap`): the gap sums
+  // only over demands the allocation head actually made feasible, so a
+  // head that makes FEWER demands feasible can show a deceptively good
+  // "gap" while doing strictly worse work overall (about 109 of 123
+  // zero-gap epochs in the plan's own measured run actually bought FEWER
+  // devices than the oracle minimum). This file never reads the
+  // `oracle_gap` column at all. Every "how good is this epoch" readout
+  // below instead pairs `hard_num_devices` against `oracle_devices`
+  // directly -- both real, unconditional per-epoch numbers -- immediately
+  // alongside `hard_num_violated`.
+  // -------------------------------------------------------------------
+  const _statsColCache = new Map();
+  function col(name) {
+    if (_statsColCache.has(name)) return _statsColCache.get(name);
+    const idx = DOC.stats.columns.indexOf(name);
+    const rows = DOC.stats.rows;
+    const out = idx === -1 ? new Array(rows.length).fill(undefined) : rows.map(r => r[idx]);
+    _statsColCache.set(name, out);
+    return out;
+  }
+
+  function arrMax(arr, fallback) {
+    let m = fallback;
+    for (const v of arr) if (typeof v === 'number' && Number.isFinite(v) && v > m) m = v;
+    return m;
+  }
+
+  // argmin over total_loss -- the hollow-pin epoch (Step 6). A hole in the
+  // column (NaN in the CSV becomes `null` via frames.py's `_num()`) is
+  // skipped rather than winning the argmin by comparing false as < Infinity.
+  function argminBy(arr) {
+    let best = -1, bestVal = Infinity;
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i];
+      if (typeof v === 'number' && Number.isFinite(v) && v < bestVal) { bestVal = v; best = i; }
+    }
+    return best;
+  }
+
+  // Nearest entry in a numeric array to `target` -- used both to place
+  // RUN.selected_epoch on axes that may not contain that exact epoch
+  // (frames.py dumps at `viz.every` cadence; stats is full resolution) and
+  // to snap a hover position to the closest actual epoch.
+  function nearestIndexTo(arr, target) {
+    if (!arr.length || target == null) return -1;
+    let best = 0, bestDist = Infinity;
+    for (let i = 0; i < arr.length; i++) {
+      const d = Math.abs(arr[i] - target);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+  }
+
+  // Step 4: mean-Hamming-distance-flavoured churn between consecutive
+  // DUMPED frames' SITE SETS -- there is no per-epoch site-set column in
+  // DOC.stats, only frameAt's delta-reconstruction, so this walks EPOCHS
+  // (not the stats CSV's own epoch column) and calls frameAt for each
+  // adjacent pair, exactly as the brief specifies. One entry per adjacent
+  // EPOCHS pair (the first epoch has no predecessor and is skipped),
+  // normalized by candidate count into a [0, 1] fraction so it reads the
+  // same way regardless of topology size. This is the explicit-number
+  // counterpart to Task 9's halo-decay glow -- same underlying churn,
+  // different evidence.
+  function computeChurn() {
+    const candidateCount = Math.max(1, TOPO.regen_candidates.length);
+    const out = [];
+    for (let i = 1; i < EPOCHS.length; i++) {
+      const prevSites = frameAt(EPOCHS[i - 1]).sites;
+      const curSites = frameAt(EPOCHS[i]).sites;
+      const curKeys = Object.keys(curSites);
+      const curKeySet = new Set(curKeys);
+      let diff = 0;
+      for (const k of Object.keys(prevSites)) if (!curKeySet.has(k)) diff++;
+      for (const k of curKeys) if (!Object.prototype.hasOwnProperty.call(prevSites, k)) diff++;
+      out.push({ epoch: EPOCHS[i], raw: diff, frac: diff / candidateCount });
+    }
+    return out;
+  }
+
+  const STATS_VB_W = 760;
+  const STATS_PAD = { l: 42, r: 14, t: 26, b: 26 };
+  const STATS_PLOT_W = STATS_VB_W - STATS_PAD.l - STATS_PAD.r;
+  const STATS_RAIL_V_H = 58;   // upper rail: hard_num_violated, linear
+  const STATS_RAIL_GAP = 10;
+  const STATS_RAIL_D_H = 92;   // lower rail: hard_num_devices, log(1+x)
+  const STATS_TICK_GAP = 10;
+  const STATS_TICK_H = 10;     // quiet tick rail: every zero-violated epoch
+  const STATS_CHURN_GAP = 10;
+  const STATS_CHURN_H = 26;    // site-set churn sparkline
+
+  const STATS_Y_V_TOP = STATS_PAD.t;
+  const STATS_Y_V_BOT = STATS_Y_V_TOP + STATS_RAIL_V_H;
+  const STATS_Y_D_TOP = STATS_Y_V_BOT + STATS_RAIL_GAP;
+  const STATS_Y_D_BOT = STATS_Y_D_TOP + STATS_RAIL_D_H;
+  const STATS_Y_TICK_TOP = STATS_Y_D_BOT + STATS_TICK_GAP;
+  const STATS_Y_TICK_BOT = STATS_Y_TICK_TOP + STATS_TICK_H;
+  const STATS_Y_CHURN_TOP = STATS_Y_TICK_BOT + STATS_CHURN_GAP;
+  const STATS_Y_CHURN_BOT = STATS_Y_CHURN_TOP + STATS_CHURN_H;
+  const STATS_PLOT_BOTTOM = STATS_Y_CHURN_BOT;
+  const STATS_VB_H = STATS_PLOT_BOTTOM + STATS_PAD.b;
+
+  function makeXOf(epochs) {
+    if (!epochs.length) return () => STATS_PAD.l;
+    let xMin = epochs[0], xMax = epochs[0];
+    for (const e of epochs) { if (e < xMin) xMin = e; if (e > xMax) xMax = e; }
+    const span = (xMax - xMin) || 1;
+    return e => STATS_PAD.l + ((e - xMin) / span) * STATS_PLOT_W;
+  }
+
+  // Genuine log(1+x) (Step 1's binding requirement -- not merely a
+  // relabelled linear axis): returns v's log1p as a 0..1 fraction of
+  // `domainMax`'s own log1p, so the 0-1472 device-count range compresses
+  // while the 14-96 settled band stays legible instead of flattening to a
+  // hairline under the early spike.
+  function log1pFrac(domainMax) {
+    const denom = Math.log1p(Math.max(1, domainMax));
+    return v => Math.log1p(Math.max(0, v || 0)) / denom;
+  }
+
+  function statsLinePath(xs, ys) {
+    if (!xs.length) return '';
+    let d = `M ${xs[0].toFixed(2)} ${ys[0].toFixed(2)}`;
+    for (let i = 1; i < xs.length; i++) d += ` L ${xs[i].toFixed(2)} ${ys[i].toFixed(2)}`;
+    return d;
+  }
+
+  // Step 2: the oracle minimum as an AREA -- filled from the rail's own
+  // 0-devices baseline up to oracle_devices at each epoch -- rather than a
+  // bare line, so "how close to optimal" reads as the vertical gap between
+  // this band's top edge and the actual device curve: a spatial
+  // relationship that is UNCONDITIONAL (always meaningful), unlike a
+  // derived oracle_gap number (see the reporting-rule note above).
+  function statsAreaPath(xs, topYs, bottomY) {
+    if (!xs.length) return '';
+    let d = `M ${xs[0].toFixed(2)} ${bottomY.toFixed(2)}`;
+    for (let i = 0; i < xs.length; i++) d += ` L ${xs[i].toFixed(2)} ${topYs[i].toFixed(2)}`;
+    d += ` L ${xs[xs.length - 1].toFixed(2)} ${bottomY.toFixed(2)} Z`;
+    return d;
+  }
+
+  function nearestEpochIndexAtX(epochs, xOf, xSvg) {
+    let best = 0, bestDist = Infinity;
+    for (let i = 0; i < epochs.length; i++) {
+      const d = Math.abs(xOf(epochs[i]) - xSvg);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+  }
+
+  // Step 5: client (pointer event) coordinates -> this SVG's own user
+  // space, via the standard createSVGPoint/getScreenCTM round trip -- the
+  // only correct way to invert a viewBox + preserveAspectRatio transform.
+  function clientToSvgPoint(svgEl, clientX, clientY) {
+    if (!svgEl.createSVGPoint || !svgEl.getScreenCTM) return null;
+    const ctm = svgEl.getScreenCTM();
+    if (!ctm) return null;
+    const pt = svgEl.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const loc = pt.matrixTransform(ctm.inverse());
+    return { x: loc.x, y: loc.y };
+  }
+
+  // Reporting-rule-safe headline: devices-against-oracle-minimum (both
+  // real per-epoch numbers), with the violation count immediately beside
+  // it -- never a bare gap (see the reporting-rule note above).
+  function statsHeadlineFor(epochs, devices, oracle, violated, epoch) {
+    const idx = nearestIndexTo(epochs, epoch);
+    if (idx === -1) return 'no data';
+    const d = devices[idx], o = oracle[idx], v = violated[idx];
+    return `${d} devices vs. oracle ${o == null ? '&mdash;' : o} (${v} violated)`;
+  }
+
+  // Step 5: the hover crosshair. Bound to pointermove (not mousemove) so
+  // it also works on touch devices. Rebuilds only the #stats-hover overlay
+  // group's contents -- the static rails/band/marks/ticks drawn by
+  // renderStats() itself are left untouched, so this never fights the
+  // per-render() full-innerHTML rebuild the other panels also do.
+  function onStatsHover(ev, ctx) {
+    const p = clientToSvgPoint(ctx.svgEl, ev.clientX, ev.clientY);
+    if (!p) return;
+    const plotLeft = STATS_PAD.l, plotRight = STATS_PAD.l + STATS_PLOT_W;
+    if (p.x < plotLeft || p.x > plotRight || p.y < STATS_PAD.t || p.y > STATS_PLOT_BOTTOM) {
+      ctx.hoverGroup.innerHTML = '';
+      return;
+    }
+    const idx = nearestEpochIndexAtX(ctx.epochs, ctx.xOf, p.x);
+    const ep = ctx.epochs[idx];
+    const xPix = ctx.xOf(ep);
+    const vVal = ctx.violated[idx] || 0;
+    const dVal = ctx.devices[idx] || 0;
+    const oVal = ctx.oracle[idx];
+    const vY = ctx.yOfV(vVal);
+    const dY = ctx.yOfD(dVal);
+
+    const boxW = 190, boxH = 34, margin = 8;
+    // Flip the readout box to the LEFT of the cursor near the right edge
+    // of the chart, so it never gets clipped off the visible plot area.
+    const flip = xPix + margin + boxW > plotRight;
+    const boxX = flip ? Math.max(plotLeft, xPix - margin - boxW) : Math.min(xPix + margin, plotRight - boxW);
+    const boxY = STATS_PAD.t;
+
+    const line1 = `epoch ${ep}`;
+    const line2 = `${vVal} violated, ${dVal} devices (oracle ${oVal == null ? '—' : oVal})`;
+
+    ctx.hoverGroup.innerHTML =
+      `<line x1="${xPix.toFixed(2)}" y1="${STATS_PAD.t}" x2="${xPix.toFixed(2)}" y2="${STATS_PLOT_BOTTOM}" ` +
+      `stroke="var(--ink)" stroke-opacity="0.4" stroke-width="1"/>` +
+      `<circle cx="${xPix.toFixed(2)}" cy="${vY.toFixed(2)}" r="3.2" fill="var(--ink)"/>` +
+      `<circle cx="${xPix.toFixed(2)}" cy="${dY.toFixed(2)}" r="3.2" fill="var(--load)"/>` +
+      `<g transform="translate(${boxX.toFixed(2)},${boxY.toFixed(2)})">` +
+        `<rect width="${boxW}" height="${boxH}" rx="4" fill="var(--panel)" stroke="var(--line)"/>` +
+        `<text x="7" y="14" font-size="9.5" fill="var(--ink)">${escHtml(line1)}</text>` +
+        `<text x="7" y="27" font-size="9.5" fill="var(--muted)">${escHtml(line2)}</text>` +
+      `</g>`;
+  }
+
+  function renderStats() {
+    const statsBody = document.getElementById('stats-body');
+    if (!statsBody) return;
+    const epochs = col('epoch');
+    if (!epochs.length) {
+      statsBody.innerHTML = '<div class="placeholder-body">no training stats in this dump</div>';
+      return;
+    }
+
+    const violated = col('hard_num_violated');
+    const devices = col('hard_num_devices');
+    const oracle = col('oracle_devices');
+    const totalLoss = col('total_loss');
+
+    const xOf = makeXOf(epochs);
+
+    // ---- Step 1, upper rail: violations, linear ----
+    const maxViolated = arrMax(violated, 1) * 1.08;
+    const yOfV = v => STATS_Y_V_BOT - (Math.max(0, v || 0) / maxViolated) * STATS_RAIL_V_H;
+
+    // ---- Step 1, lower rail: devices, log(1+x). The domain always covers
+    // at least 0-1000 so the brief's fixed 0/10/100/1000 ticks stay
+    // meaningful even on a short/small fixture, not just a full 300-epoch run.
+    const deviceDomainMax = Math.max(1000, arrMax(devices, 0), arrMax(oracle, 0));
+    const toFrac = log1pFrac(deviceDomainMax);
+    const yOfD = v => STATS_Y_D_BOT - toFrac(v) * STATS_RAIL_D_H;
+
+    const xs = epochs.map(xOf);
+    const violatedPath = statsLinePath(xs, violated.map(v => yOfV(v)));
+    const devicePath = statsLinePath(xs, devices.map(v => yOfD(v)));
+    const oracleTopYs = oracle.map(v => yOfD(v == null ? 0 : v));
+    const oracleBand = statsAreaPath(xs, oracleTopYs, STATS_Y_D_BOT);
+
+    // Fixed ticks at 0/10/100/1000 -- not derived from the data, so the
+    // rail reads the same way across every run (Step 1's binding rule).
+    let deviceTickSvg = '';
+    for (const t of [0, 10, 100, 1000]) {
+      if (t > deviceDomainMax * 1.001) continue;
+      const ty = yOfD(t);
+      deviceTickSvg +=
+        `<line x1="${STATS_PAD.l}" y1="${ty.toFixed(2)}" x2="${(STATS_PAD.l + STATS_PLOT_W).toFixed(2)}" y2="${ty.toFixed(2)}" ` +
+        `stroke="var(--line)" stroke-width="1"/>` +
+        `<text x="2" y="${(ty + 3).toFixed(2)}" font-size="8" fill="var(--muted)">${t}</text>`;
+    }
+    const violatedTickSvg =
+      `<line x1="${STATS_PAD.l}" y1="${STATS_Y_V_BOT.toFixed(2)}" x2="${(STATS_PAD.l + STATS_PLOT_W).toFixed(2)}" y2="${STATS_Y_V_BOT.toFixed(2)}" stroke="var(--line)" stroke-width="1"/>` +
+      `<text x="2" y="${(STATS_Y_V_TOP + 7).toFixed(2)}" font-size="8" fill="var(--muted)">${(maxViolated / 1.08).toFixed(0)}</text>` +
+      `<text x="2" y="${(STATS_Y_V_BOT + 3).toFixed(2)}" font-size="8" fill="var(--muted)">0</text>`;
+
+    // ---- Step 6: three DISTINCT epoch marks. Never merged into one
+    // "best epoch" marker -- they answer three different questions and
+    // in a full run land on genuinely different, often widely separated
+    // epochs.
+    const selEpoch = RUN.selected_epoch;
+    const selIdx = selEpoch == null ? -1 : nearestIndexTo(epochs, selEpoch);
+    const minLossIdx = argminBy(totalLoss);
+    const zeroViolatedIdx = [];
+    for (let i = 0; i < epochs.length; i++) if (violated[i] === 0) zeroViolatedIdx.push(i);
+
+    let pinsSvg = '';
+    if (minLossIdx !== -1) {
+      // Hollow pin: argmin(total_loss).
+      const mx = xs[minLossIdx];
+      pinsSvg +=
+        `<line x1="${mx.toFixed(2)}" y1="${STATS_PAD.t}" x2="${mx.toFixed(2)}" y2="${STATS_PLOT_BOTTOM}" ` +
+        `stroke="var(--load)" stroke-width="1.3" stroke-dasharray="4,3" stroke-opacity="0.75"/>` +
+        `<circle cx="${mx.toFixed(2)}" cy="${(STATS_PAD.t - 9).toFixed(2)}" r="3.6" fill="none" stroke="var(--load)" stroke-width="1.6">` +
+        `<title>${escHtml(`min-loss epoch ${epochs[minLossIdx]} (total_loss ${totalLoss[minLossIdx].toFixed(3)})`)}</title></circle>`;
+    }
+    if (selIdx !== -1) {
+      // Filled pin: RUN.selected_epoch, the actual deployed checkpoint --
+      // what the whole demo's final claim is based on.
+      const sx = xs[selIdx];
+      const exact = epochs[selIdx] === selEpoch;
+      pinsSvg +=
+        `<line x1="${sx.toFixed(2)}" y1="${STATS_PAD.t}" x2="${sx.toFixed(2)}" y2="${STATS_PLOT_BOTTOM}" ` +
+        `stroke="var(--ink)" stroke-width="1.3" stroke-opacity="0.6"/>` +
+        `<circle cx="${sx.toFixed(2)}" cy="${(STATS_PAD.t - 9).toFixed(2)}" r="3.6" fill="var(--ink)">` +
+        `<title>${escHtml(exact ? `selected checkpoint: epoch ${selEpoch}` : `selected checkpoint: epoch ${selEpoch} (nearest stats row: epoch ${epochs[selIdx]})`)}</title></circle>`;
+    }
+
+    // Quiet tick rail: every zero-violated epoch, as a scattered set of
+    // small ticks -- NOT smoothed or banded into a continuous region. In
+    // the plan's own measurements this is a genuine finding (an isolated,
+    // scattered set of feasible epochs, not a converging band).
+    let tickRailSvg = '';
+    for (const i of zeroViolatedIdx) {
+      const tx = xs[i];
+      tickRailSvg +=
+        `<line x1="${tx.toFixed(2)}" y1="${STATS_Y_TICK_TOP}" x2="${tx.toFixed(2)}" y2="${STATS_Y_TICK_BOT}" ` +
+        `stroke="var(--muted)" stroke-width="1.2" stroke-opacity="0.85">` +
+        `<title>${escHtml(`epoch ${epochs[i]}: 0 violated`)}</title></line>`;
+    }
+
+    // ---- Step 4: churn sparkline, from frameAt/EPOCHS (NOT the stats CSV).
+    const churn = computeChurn();
+    const churnXs = churn.map(c => xOf(c.epoch));
+    const churnYs = churn.map(c => STATS_Y_CHURN_BOT - Math.min(1, c.frac) * STATS_CHURN_H);
+    const churnPath = statsLinePath(churnXs, churnYs);
+    let churnDots = '';
+    for (let i = 0; i < churn.length; i++) {
+      churnDots +=
+        `<circle cx="${churnXs[i].toFixed(2)}" cy="${churnYs[i].toFixed(2)}" r="1.6" fill="var(--load)">` +
+        `<title>${escHtml(`epoch ${churn[i].epoch}: ${churn[i].raw} site${churn[i].raw === 1 ? '' : 's'} changed vs the previous dumped frame`)}</title></circle>`;
+    }
+
+    const axisLabelsSvg =
+      `<text x="${STATS_PAD.l}" y="${(STATS_VB_H - 6).toFixed(2)}" font-size="8" fill="var(--muted)">epoch ${epochs[0]}</text>` +
+      `<text x="${(STATS_PAD.l + STATS_PLOT_W).toFixed(2)}" y="${(STATS_VB_H - 6).toFixed(2)}" text-anchor="end" font-size="8" fill="var(--muted)">epoch ${epochs[epochs.length - 1]}</text>` +
+      `<text x="2" y="${(STATS_Y_TICK_TOP - 1).toFixed(2)}" font-size="7.5" fill="var(--muted)">0-viol.</text>` +
+      `<text x="2" y="${(STATS_Y_CHURN_TOP + 8).toFixed(2)}" font-size="7.5" fill="var(--muted)">churn</text>`;
+
+    const hoverGroupSvg = `<g id="stats-hover"></g>`;
+    const overlayRectSvg =
+      `<rect id="stats-hover-target" x="${STATS_PAD.l}" y="${STATS_PAD.t}" width="${STATS_PLOT_W}" ` +
+      `height="${(STATS_PLOT_BOTTOM - STATS_PAD.t).toFixed(2)}" fill="transparent" style="cursor:crosshair"/>`;
+
+    statsBody.innerHTML =
+      `<div class="stats-head num">` +
+        `epoch <strong>${state.epoch}</strong>: ` +
+        `${statsHeadlineFor(epochs, devices, oracle, violated, state.epoch)} &middot; ` +
+        `selected epoch ${selEpoch != null ? selEpoch : '&mdash;'} &middot; ` +
+        `min-loss epoch ${minLossIdx !== -1 ? epochs[minLossIdx] : '&mdash;'} &middot; ` +
+        `${zeroViolatedIdx.length} zero-violated epoch${zeroViolatedIdx.length === 1 ? '' : 's'}` +
+      `</div>` +
+      `<svg class="stats-chart" viewBox="0 0 ${STATS_VB_W} ${STATS_VB_H}" preserveAspectRatio="xMidYMid meet" ` +
+      `role="img" aria-label="Training statistics: violations, device count and churn across ${epochs.length} epochs">` +
+      violatedTickSvg + deviceTickSvg +
+      `<path d="${oracleBand}" fill="var(--muted)" fill-opacity="0.16" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3,2" stroke-opacity="0.6">` +
+        `<title>oracle minimum device count (band) -- the vertical gap to the device curve is what "how close to optimal" means here</title>` +
+      `</path>` +
+      `<path d="${violatedPath}" fill="none" stroke="var(--ink)" stroke-width="1.8"/>` +
+      `<path d="${devicePath}" fill="none" stroke="var(--load)" stroke-width="1.8"/>` +
+      tickRailSvg +
+      `<path d="${churnPath}" fill="none" stroke="var(--load)" stroke-width="1.1" stroke-opacity="0.55"/>` +
+      churnDots +
+      pinsSvg +
+      axisLabelsSvg +
+      overlayRectSvg +
+      hoverGroupSvg +
+      `</svg>` +
+      `<div class="stats-legend num">` +
+        `<strong>&#9679;</strong> selected checkpoint &middot; ` +
+        `<strong>&#9675;</strong> min-loss epoch &middot; ` +
+        `<strong>&#8739;</strong> 0-violated epochs &middot; ` +
+        `top rail = violated demands &middot; ` +
+        `bottom rail = devices (log scale), shaded band = oracle minimum &middot; ` +
+        `bottom line = site-set churn vs previous dumped frame` +
+      `</div>`;
+
+    const svgEl = statsBody.querySelector('.stats-chart');
+    const hoverGroup = statsBody.querySelector('#stats-hover');
+    const overlayRect = statsBody.querySelector('#stats-hover-target');
+    if (svgEl && hoverGroup && overlayRect) {
+      const ctx = { svgEl, hoverGroup, epochs, xOf, yOfV, yOfD, violated, devices, oracle };
+      overlayRect.addEventListener('pointermove', ev => onStatsHover(ev, ctx));
+      overlayRect.addEventListener('pointerleave', () => { hoverGroup.innerHTML = ''; });
+    }
+  }
+
+  // -------------------------------------------------------------------
   // Shell state + wiring. Later tasks (8-11) extend render(); they must
   // not rename `state`, `render`, or the data-layer symbols above.
   // -------------------------------------------------------------------
@@ -1317,6 +1787,7 @@
     renderMap();
     renderRibbons();
     renderStrip();
+    renderStats();
   }
 
   function initHeader() {
@@ -1375,8 +1846,28 @@
     });
   }
 
+  // Task 11: the MAIN scrubber (not just the stats panel) also flags the
+  // selected-checkpoint epoch specifically, so the animation's end state
+  // is clearly marked as the claimed result, not just wherever the slider
+  // happens to stop. Positioned once (static -- doesn't move as the user
+  // scrubs), by index along EPOCHS the same way the native thumb is.
+  function initSelectedMarker() {
+    const marker = document.getElementById('scrub-selected-marker');
+    if (!marker) return;
+    if (RUN.selected_epoch == null || !EPOCHS.length) { marker.hidden = true; return; }
+    const idx = nearestIndexTo(EPOCHS, RUN.selected_epoch);
+    const exact = EPOCHS[idx] === RUN.selected_epoch;
+    const pct = EPOCHS.length > 1 ? (idx / (EPOCHS.length - 1)) * 100 : 50;
+    marker.style.left = `${pct}%`;
+    marker.title = exact
+      ? `selected checkpoint: epoch ${RUN.selected_epoch}`
+      : `selected checkpoint: epoch ${RUN.selected_epoch} (nearest dumped frame: epoch ${EPOCHS[idx]})`;
+    marker.hidden = false;
+  }
+
   initHeader();
   runSelfCheck();
   initScrubber();
+  initSelectedMarker();
   render();
 </script>
