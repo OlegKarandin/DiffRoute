@@ -273,6 +273,42 @@
     cursor: pointer;
   }
 
+  /* ---- strip panel (Task 10) ------------------------------------------ */
+  #strip-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .strip-head {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  .strip-chart {
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 140px;
+  }
+
+  .strip-evo-label {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
+  .strip-evo {
+    flex: 0 0 auto;
+    width: 100%;
+    height: 40px;
+  }
+
   /* ---- scrubber ---------------------------------------------------------- */
   #scrubber {
     position: sticky;
@@ -353,7 +389,9 @@
 
     <section class="panel" id="strip-panel" aria-label="Physics strip">
       <div class="panel-head"><h2>Physics strip</h2></div>
-      <div class="panel-body placeholder-body">Per-lightpath GSNR margin ribbons render here.</div>
+      <div class="panel-body" id="strip-body">
+        <div class="placeholder-body">Focus a lightpath (click a ribbon, or pick one above the map) to see its per-segment GSNR staircase and how its margin evolved across training.</div>
+      </div>
     </section>
 
     <section class="panel" id="stats-panel" aria-label="Training statistics">
@@ -976,6 +1014,246 @@
   }
 
   // -------------------------------------------------------------------
+  // Physics strip (Task 10): per-segment GSNR staircase for the focused
+  // lightpath, reconstructed entirely from seg_gsnr_db/seg_km/cut_idx --
+  // no extra dumped field is needed. GSNR is a per-segment aggregate, not
+  // a continuous quantity, so the trace holds flat across a segment's km
+  // span and steps at boundaries; interpolating between two segment
+  // values would invent detail the physics doesn't have. Beside the
+  // staircase, a small evolution band shows how the focused demand's
+  // margin moved across every dumped epoch.
+  // -------------------------------------------------------------------
+
+  // chunkLevels(lp): the RUNNING chunk-noise GSNR, not the raw per-segment
+  // value -- within a chunk (the span between cuts) noise accumulates as
+  // sum_k 10^(-g_k/10) over the chunk's segments-so-far, converted back to
+  // dB. At a cut the accumulator resets (a regenerator rebuilds the
+  // signal), so the level jumps back UP to the next chunk's own first
+  // segment. This is the same fold worstChunkDb takes to its worst chunk;
+  // here every intermediate running value is kept, not just the max.
+  // Returns TWO points per segment -- its start and end km, both at that
+  // segment's level -- so stringing consecutive points together with
+  // straight lines already draws the staircase: a flat run is the two
+  // same-y points bounding one segment, and a step (down within a chunk,
+  // up at a cut) is the same-x jump from one segment's end to the next
+  // segment's start.
+  function chunkLevels(lp) {
+    const cuts = new Set(lp.cut_idx);
+    const points = [];
+    let x = 0;
+    let noise = 0; // linear noise accumulated so far within the current chunk
+    for (let s = 0; s < lp.seg_gsnr_db.length; s++) {
+      noise += Math.pow(10, -lp.seg_gsnr_db[s] / 10);
+      const level = -10 * Math.log10(noise);
+      const xEnd = x + lp.seg_km[s];
+      points.push({ x, y: level });
+      points.push({ x: xEnd, y: level });
+      x = xEnd;
+      if (cuts.has(s)) noise = 0; // regenerator: next segment starts a fresh chunk
+    }
+    return points;
+  }
+
+  function stairPathD(points, xOf, yOf) {
+    if (!points.length) return '';
+    let d = `M ${xOf(points[0].x).toFixed(2)} ${yOf(points[0].y).toFixed(2)}`;
+    for (let i = 1; i < points.length; i++) {
+      d += ` L ${xOf(points[i].x).toFixed(2)} ${yOf(points[i].y).toFixed(2)}`;
+    }
+    return d;
+  }
+
+  const STRIP_VB_W = 760, STRIP_VB_H = 190;
+  const STRIP_PAD = { l: 30, r: 14, t: 14, b: 26 };
+  const STRIP_PLOT_W = STRIP_VB_W - STRIP_PAD.l - STRIP_PAD.r;
+  const STRIP_PLOT_H = STRIP_VB_H - STRIP_PAD.t - STRIP_PAD.b;
+
+  const EVO_VB_W = 760, EVO_VB_H = 34;
+  const EVO_PAD = { l: 30, r: 14, t: 6, b: 4 };
+  const EVO_PLOT_W = EVO_VB_W - EVO_PAD.l - EVO_PAD.r;
+  const EVO_PLOT_H = EVO_VB_H - EVO_PAD.t - EVO_PAD.b;
+
+  function renderStrip() {
+    const stripBody = document.getElementById('strip-body');
+    if (!stripBody) return;
+    if (!state.focus || !EPOCHS.length) {
+      stripBody.innerHTML =
+        '<div class="placeholder-body">Focus a lightpath (click a ribbon, or pick one above the ' +
+        'map) to see its per-segment GSNR staircase and how its margin evolved across training.</div>';
+      return;
+    }
+
+    const demandId = state.focus.d;
+    const demand = DEMAND.get(demandId);
+    const frame = frameAt(state.epoch);
+    const lp = frame.lightpaths.get(demandId);
+    if (!lp) {
+      stripBody.innerHTML = `<div class="placeholder-body">demand ${demandId} has no lightpath at epoch ${state.epoch}</div>`;
+      return;
+    }
+
+    // Step 2: assert the recomputed worst chunk equals the dumped gsnr_db
+    // for the FOCUSED lightpath, every time this renders (which covers
+    // both "on load" -- the moment a lightpath is first focused -- and
+    // "whenever a lightpath is focused" thereafter, including a re-focus
+    // or a scrub to a different epoch). A mismatch means the server-side
+    // DP fold and the deployed rollout disagree; that must be loud, not a
+    // console line -- so it reuses the exact `.self-check-status.alert`
+    // banner pattern the header's load-time check already established,
+    // rather than a second, differently-styled failure mechanism.
+    const recomputed = worstChunkDb(lp.seg_gsnr_db, lp.cut_idx);
+    const mismatch = !Number.isFinite(recomputed) || Math.abs(recomputed - lp.gsnr_db) >= 1e-2;
+    if (mismatch) {
+      console.error(
+        `strip self-check: epoch ${state.epoch} demand ${demandId} — recomputed ` +
+        `${recomputed} dB vs dumped ${lp.gsnr_db} dB`
+      );
+    }
+    const bannerHtml = mismatch
+      ? `<p class="self-check-status alert">strip self-check FAILED for demand ${demandId} at epoch ` +
+        `${state.epoch}: recomputed worst chunk ${Number.isFinite(recomputed) ? recomputed.toFixed(3) : recomputed} ` +
+        `dB vs dumped ${lp.gsnr_db.toFixed(3)} dB &mdash; the DP fold and the deployed rollout disagree</p>`
+      : '';
+
+    // Step 4: baseline = the run's FIRST dumped epoch (the "untrained"
+    // state in the plan's own worked example) vs. the currently scrubbed
+    // epoch. Both share ONE y-domain, fitted below over both traces plus
+    // both reference lines -- never two independently-scaled axes.
+    const baseEpoch = EPOCHS[0];
+    const baseLp = baseEpoch !== state.epoch ? frameAt(baseEpoch).lightpaths.get(demandId) : null;
+
+    const curPoints = chunkLevels(lp);
+    const basePoints = baseLp ? chunkLevels(baseLp) : [];
+
+    const allY = curPoints.map(p => p.y).concat(basePoints.map(p => p.y));
+    allY.push(demand.threshold_db, demand.bar_db);
+    let yMin = Math.min(...allY), yMax = Math.max(...allY);
+    const yPad = Math.max(0.5, (yMax - yMin) * 0.12);
+    yMin -= yPad; yMax += yPad;
+    if (yMax - yMin < 1e-6) { yMin -= 1; yMax += 1; }
+
+    const xMax = Math.max(
+      curPoints.length ? curPoints[curPoints.length - 1].x : 0,
+      basePoints.length ? basePoints[basePoints.length - 1].x : 0,
+      1
+    );
+
+    const xOf = km => STRIP_PAD.l + (km / xMax) * STRIP_PLOT_W;
+    const yOf = db => STRIP_PAD.t + (1 - (db - yMin) / (yMax - yMin)) * STRIP_PLOT_H;
+
+    // Step 3: threshold_db and bar_db as two separate reference lines,
+    // with the band between them tinted -- the plan's own worked example
+    // clears the bare threshold by +0.75 dB but clears the bar by only
+    // +0.25 dB, and a single reference line would hide how thin that win
+    // is. The tint reuses `--orange` deliberately: colourOf() already
+    // calls exactly this zone (below the bar, at/above the threshold)
+    // "orange", so the band inherits the project's one colour rule
+    // instead of inventing a new hue.
+    const yThreshold = yOf(demand.threshold_db);
+    const yBar = yOf(demand.bar_db);
+    const bandTop = Math.min(yThreshold, yBar);
+    const bandHeight = Math.abs(yBar - yThreshold);
+    const axisBottom = STRIP_PAD.t + STRIP_PLOT_H;
+    let refSvg =
+      `<rect x="${STRIP_PAD.l}" y="${bandTop.toFixed(2)}" width="${STRIP_PLOT_W}" height="${bandHeight.toFixed(2)}" ` +
+      `fill="var(--orange)" fill-opacity="0.14"/>` +
+      `<line x1="${STRIP_PAD.l}" y1="${yThreshold.toFixed(2)}" x2="${STRIP_PAD.l + STRIP_PLOT_W}" y2="${yThreshold.toFixed(2)}" ` +
+      `stroke="var(--red)" stroke-width="1.3" stroke-dasharray="3,3">` +
+      `<title>${escHtml(`threshold ${demand.threshold_db.toFixed(2)} dB`)}</title></line>` +
+      `<line x1="${STRIP_PAD.l}" y1="${yBar.toFixed(2)}" x2="${STRIP_PAD.l + STRIP_PLOT_W}" y2="${yBar.toFixed(2)}" ` +
+      `stroke="var(--green)" stroke-width="1.3" stroke-dasharray="3,3">` +
+      `<title>${escHtml(`bar (threshold + margin) ${demand.bar_db.toFixed(2)} dB`)}</title></line>` +
+      `<text x="${(STRIP_PAD.l + STRIP_PLOT_W - 2).toFixed(2)}" y="${(yThreshold - 3).toFixed(2)}" text-anchor="end" font-size="9" fill="var(--red)">threshold</text>` +
+      `<text x="${(STRIP_PAD.l + STRIP_PLOT_W - 2).toFixed(2)}" y="${(yBar - 3).toFixed(2)}" text-anchor="end" font-size="9" fill="var(--green)">bar</text>` +
+      `<text x="2" y="${(STRIP_PAD.t + 8).toFixed(2)}" font-size="9" fill="var(--muted)">${yMax.toFixed(1)}</text>` +
+      `<text x="2" y="${axisBottom.toFixed(2)}" font-size="9" fill="var(--muted)">${yMin.toFixed(1)}</text>` +
+      `<text x="${(STRIP_PAD.l + STRIP_PLOT_W / 2).toFixed(2)}" y="${(STRIP_VB_H - 4).toFixed(2)}" text-anchor="middle" ` +
+      `font-size="9" fill="var(--muted)">accumulated km along route</text>`;
+
+    // Segment-boundary ticks along the x axis (Step 1's last sentence).
+    let tickSvg = '';
+    const seenX = new Set();
+    for (const p of curPoints) {
+      const key = p.x.toFixed(3);
+      if (seenX.has(key)) continue;
+      seenX.add(key);
+      const tx = xOf(p.x);
+      tickSvg += `<line x1="${tx.toFixed(2)}" y1="${axisBottom.toFixed(2)}" x2="${tx.toFixed(2)}" ` +
+        `y2="${(axisBottom + 4).toFixed(2)}" stroke="var(--muted)" stroke-width="1"/>`;
+    }
+
+    let baseSvg = '';
+    if (basePoints.length) {
+      baseSvg =
+        `<path d="${stairPathD(basePoints, xOf, yOf)}" fill="none" stroke="var(--muted)" stroke-width="1.4" ` +
+        `stroke-dasharray="5,3" stroke-opacity="0.85">` +
+        `<title>${escHtml(`epoch ${baseEpoch} (baseline): ${baseLp.gsnr_db.toFixed(2)} dB`)}</title></path>`;
+    }
+    const curColour = colourOf(lp.margin_db);
+    const curSvg =
+      `<path d="${stairPathD(curPoints, xOf, yOf)}" fill="none" stroke="var(--${curColour})" stroke-width="2.2">` +
+      `<title>${escHtml(`epoch ${state.epoch}: ${lp.gsnr_db.toFixed(2)} dB, margin ${lp.margin_db.toFixed(2)} dB`)}</title></path>`;
+
+    let legendSvg = `<g font-size="9" fill="var(--muted)">`;
+    if (basePoints.length) {
+      legendSvg +=
+        `<line x1="${STRIP_PAD.l}" y1="10" x2="${(STRIP_PAD.l + 16)}" y2="10" stroke="var(--muted)" ` +
+        `stroke-width="1.4" stroke-dasharray="5,3"/><text x="${(STRIP_PAD.l + 20)}" y="13">epoch ${baseEpoch}</text>`;
+    }
+    legendSvg +=
+      `<line x1="${(STRIP_PAD.l + 90)}" y1="10" x2="${(STRIP_PAD.l + 106)}" y2="10" stroke="var(--${curColour})" ` +
+      `stroke-width="2.2"/><text x="${(STRIP_PAD.l + 110)}" y="13">epoch ${state.epoch}</text></g>`;
+
+    const chartSvg =
+      `<svg class="strip-chart" viewBox="0 0 ${STRIP_VB_W} ${STRIP_VB_H}" preserveAspectRatio="xMidYMid meet" ` +
+      `role="img" aria-label="Per-segment GSNR staircase for demand ${demandId}">` +
+      refSvg + tickSvg + baseSvg + curSvg + legendSvg +
+      `</svg>`;
+
+    // Step 5: evolution band -- one thin vertical band per epoch, coloured
+    // by that epoch's margin for the focused demand (reusing colourOf),
+    // ticked with a small dot if that epoch had a cut. Clicking a band
+    // scrubs the WHOLE viewer via setEpochByIndex -- Task 7's own epoch
+    // state and scrubbing mechanism, never a second independent variable.
+    const bandW = EVO_PLOT_W / EPOCHS.length;
+    let evoSvg = '';
+    for (let i = 0; i < EPOCHS.length; i++) {
+      const ep = EPOCHS[i];
+      const elp = frameAt(ep).lightpaths.get(demandId);
+      const bx = EVO_PAD.l + i * bandW;
+      const colour = elp ? colourOf(elp.margin_db) : null;
+      const isCurrent = ep === state.epoch;
+      const tip = elp
+        ? `epoch ${ep}: margin ${elp.margin_db.toFixed(2)} dB${elp.cut_idx.length ? `, ${elp.cut_idx.length} cut${elp.cut_idx.length === 1 ? '' : 's'}` : ''} (click to scrub here)`
+        : `epoch ${ep}: no data (click to scrub here)`;
+      evoSvg +=
+        `<rect x="${bx.toFixed(2)}" y="${EVO_PAD.t}" width="${Math.max(0.6, bandW - 0.4).toFixed(2)}" ` +
+        `height="${EVO_PLOT_H}" fill="${colour ? `var(--${colour})` : 'var(--line)'}" ` +
+        `fill-opacity="${isCurrent ? 0.95 : 0.55}" stroke="${isCurrent ? 'var(--ink)' : 'none'}" ` +
+        `stroke-width="${isCurrent ? 1.2 : 0}" style="cursor:pointer" ` +
+        `onclick="event.stopPropagation(); setEpochByIndex(${i})"><title>${escHtml(tip)}</title></rect>`;
+      if (elp && elp.cut_idx.length) {
+        const cx = bx + bandW / 2;
+        evoSvg += `<circle cx="${cx.toFixed(2)}" cy="${(EVO_PAD.t - 2).toFixed(2)}" r="1.6" fill="var(--ink)" style="pointer-events:none"/>`;
+      }
+    }
+    const evoSvgWrap =
+      `<svg class="strip-evo" viewBox="0 0 ${EVO_VB_W} ${EVO_VB_H}" preserveAspectRatio="none" role="img" ` +
+      `aria-label="Margin evolution across epochs for demand ${demandId}">${evoSvg}</svg>`;
+
+    stripBody.innerHTML =
+      `<div class="strip-head num">` +
+        `demand ${demandId} (${demand.src}&rarr;${demand.dst}) &middot; epoch ${state.epoch}: ` +
+        `<strong style="color:var(--${curColour})">${lp.gsnr_db.toFixed(2)} dB</strong> ` +
+        `(margin ${lp.margin_db >= 0 ? '+' : ''}${lp.margin_db.toFixed(2)} dB)` +
+      `</div>` +
+      bannerHtml +
+      chartSvg +
+      `<div class="strip-evo-label num">margin across ${EPOCHS.length} epoch${EPOCHS.length === 1 ? '' : 's'} &mdash; click a band to scrub there</div>` +
+      evoSvgWrap;
+  }
+
+  // -------------------------------------------------------------------
   // Shell state + wiring. Later tasks (8-11) extend render(); they must
   // not rename `state`, `render`, or the data-layer symbols above.
   // -------------------------------------------------------------------
@@ -1024,6 +1302,8 @@
   // map-body's innerHTML wholesale each call (a fresh, empty #map-ribbons
   // / #map-focus-glyphs pair included), so renderRibbons() has to refill
   // whatever renderMap() just (re)created, not the other way round.
+  // renderStrip() (Task 10) is its own panel with its own DOM subtree, so
+  // it has no ordering dependency on the map/ribbons calls.
   function render() {
     const idx = epochIndex(state.epoch);
     epochLabel.innerHTML = EPOCHS.length
@@ -1031,6 +1311,7 @@
       : 'no frames';
     renderMap();
     renderRibbons();
+    renderStrip();
   }
 
   function initHeader() {
