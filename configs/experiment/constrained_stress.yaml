@@ -177,3 +177,13 @@ training:
 # hard_rollout), never the relaxation the gradient flows through. There is
 # no longer a switch: hard_rollout is also where oracle_gap — the stage's
 # acceptance metric, logged every epoch — is computed.
+
+# Phase 1d trajectory dump. OFF by default everywhere else; this is the
+# config the demo artifact is built from, so it opts in.
+# `every: 1` at 300 epochs is ~2 MB of JSON — comfortably inside the
+# Artifact's 16 MB cap with the file inlined, so subsampling is a fallback
+# rather than a requirement.
+viz:
+  dump_frames: true
+  every: 1
+  keyframe_every: 50

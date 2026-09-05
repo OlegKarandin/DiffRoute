@@ -19,6 +19,7 @@ Two groups:
 from __future__ import annotations
 
 import csv
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -321,11 +322,32 @@ def test_hard_rollout_returns_the_allocation_record_it_evaluated():
 _MODULATION_FORMATS_PATH = Path(__file__).parent.parent / "configs/modulation_formats.yaml"
 
 
+class _DummyEdge:
+    """Stand-in for topology.Edge — only the fields frozen_layout() and
+    FrameWriter's header need: src/dst/length_km."""
+
+    def __init__(self, src: int, dst: int, length_km: float) -> None:
+        self.src = src
+        self.dst = dst
+        self.length_km = length_km
+
+
 class _DummyTopology:
     """Stand-in for a loaded Topology. DiffONetPipeline is itself stubbed
-    below, so main() only ever passes this object straight through."""
+    below, so main() only ever passes this object straight through.
+
+    `undirected_edges` is a closed 5-cycle so frozen_layout() (used by
+    FrameWriter's header, when viz.dump_frames is on) sees a connected graph
+    with finite pairwise distances everywhere."""
     num_nodes = 5
     regen_candidate_nodes = [1, 3]
+    undirected_edges = [
+        _DummyEdge(0, 1, 100.0),
+        _DummyEdge(1, 2, 120.0),
+        _DummyEdge(2, 3, 90.0),
+        _DummyEdge(3, 4, 110.0),
+        _DummyEdge(4, 0, 130.0),
+    ]
 
 
 class _DummyAlloc:
@@ -356,6 +378,8 @@ class _DummyAlloc:
         self.site_view = self.alloc_by_node.max(dim=0).values
         self.seg_gsnr_db = torch.full((1, 2), 30.0)
         self.seg_noise = torch.full((1, 2), 1.0e-3)
+        # FrameWriter's per-segment "seg_km" field reads this directly.
+        self.seg_km_matrix = torch.full((1, 2), 50.0)
         self.num_segments = torch.tensor([2])
         self.boundary_node_ids = torch.tensor([[3]])
         self.demand_ids = [0]
@@ -412,6 +436,7 @@ def _write_config(
     lookahead: bool = True,
     constraint_overrides: dict | None = None,
     training_overrides: dict | None = None,
+    viz_overrides: dict | None = None,
 ) -> Path:
     config = {
         "topology": "unused",
@@ -462,6 +487,10 @@ def _write_config(
         config["constraint"].update(constraint_overrides)
     if training_overrides:
         config["training"].update(training_overrides)
+    # No pre-existing `viz` key to merge into, unlike constraint/training
+    # above -- a plain assignment is fine here.
+    if viz_overrides:
+        config["viz"] = viz_overrides
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.dump(config))
     return config_path
@@ -573,10 +602,22 @@ def _read_csv(path) -> list[list[str]]:
         return list(csv.reader(f))
 
 
-def _hard(violated, devices, sites, margin, *, oracle_devices=None):
-    """One scripted hard_rollout return value."""
+def _hard(violated, devices, sites, margin, *, oracle_devices=None, alloc=None,
+          gsnr_preds=None):
+    """One scripted hard_rollout return value.
+
+    `alloc`/`gsnr_preds` default to a real (if minimal) stand-in
+    AllocationOutputs and per-demand GSNR dict, so that when
+    viz.dump_frames=True the frame writer's append() -- which reads
+    hard["alloc"] and hard["gsnr_preds"] -- has something real to consume.
+    Every existing caller is unaffected: both are new, defaulted keys.
+    """
     if oracle_devices is None:
         oracle_devices = devices
+    if alloc is None:
+        alloc = _DummyAlloc(hard=True)
+    if gsnr_preds is None:
+        gsnr_preds = {did: torch.tensor(30.0) for did in alloc.demand_ids}
     mask = torch.zeros(_DummyTopology.num_nodes, dtype=torch.bool)
     mask[:sites] = True
     return {
@@ -589,6 +630,8 @@ def _hard(violated, devices, sites, margin, *, oracle_devices=None):
         "oracle_infeasible": 0,
         "site_mask": mask,
         "alloc_by_node": torch.zeros(1, _DummyTopology.num_nodes),
+        "alloc": alloc,
+        "gsnr_preds": gsnr_preds,
     }
 
 
@@ -1183,3 +1226,71 @@ def test_alloc_grad_clip_reaches_clip_grad_norm(tmp_path, monkeypatch):
 def test_negative_grad_clip_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="alloc_grad_clip"):
         _run_training(tmp_path, training_overrides={"alloc_grad_clip": -1.0})
+
+
+# ---------------------------------------------------------------------------
+# viz.dump_frames -- the frame-writer hook
+# ---------------------------------------------------------------------------
+
+def test_frame_dump_is_off_by_default(tmp_path, monkeypatch):
+    """No viz block, no file. Existing runs must be unaffected."""
+    ckpt = _run_training(tmp_path)
+    log_dir = tmp_path / "logs"
+    assert not (log_dir / "frames.json").exists()
+    assert not (log_dir / "frames.jsonl").exists()
+
+
+def test_frame_dump_writes_a_readable_document(tmp_path, monkeypatch):
+    ckpt = _run_training(
+        tmp_path, epochs=3,
+        viz_overrides={"dump_frames": True, "every": 1, "keyframe_every": 2},
+    )
+    log_dir = tmp_path / "logs"
+    doc = json.loads((log_dir / "frames.json").read_text())
+    assert [f["epoch"] for f in doc["frames"]] == [1, 2, 3]
+    assert len(doc["stats"]["rows"]) == 3
+    assert doc["run"]["epochs_e2e"] == 3
+
+
+def test_selected_epoch_matches_the_epoch_selection_actually_picked(
+    tmp_path, monkeypatch,
+):
+    """Spec section 6.9: the scrubber must mark the selected epoch, or the
+    animation ends on a visibly worse state than the result being claimed.
+    Drive hard_rollout so epoch 2 wins the lexicographic key outright."""
+    _script_hard_rollout(monkeypatch, [
+        _hard(1, 5, 3, -0.5),   # epoch 1: violated
+        _hard(0, 2, 2, 0.3),    # epoch 2: zero violated, fewest devices -> wins
+        _hard(0, 9, 4, 0.1),    # epoch 3: zero violated but more devices
+    ])
+    ckpt = _run_training(
+        tmp_path, epochs=3, monkeypatch=monkeypatch,
+        viz_overrides={"dump_frames": True},
+    )
+    log_dir = tmp_path / "logs"
+    doc = json.loads((log_dir / "frames.json").read_text())
+    assert doc["run"]["selected_epoch"] == 2 == ckpt["epoch"]
+
+
+def test_dumping_frames_does_not_change_the_training_trajectory(
+    tmp_path, monkeypatch,
+):
+    """The frame writer consumes no RNG, mutates no tensor and runs outside
+    the autograd graph. Byte-compare the training log to prove it."""
+    off_dir = tmp_path / "off"
+    on_dir = tmp_path / "on"
+    off_dir.mkdir()
+    on_dir.mkdir()
+    _run_training(off_dir, epochs=4)
+    _run_training(on_dir, epochs=4, viz_overrides={"dump_frames": True})
+    log_off = (off_dir / "logs" / "e2e_train_log.csv").read_bytes()
+    log_on = (on_dir / "logs" / "e2e_train_log.csv").read_bytes()
+    assert log_off == log_on
+
+
+def test_a_bad_every_value_fails_loudly(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="viz.every"):
+        _run_training(
+            tmp_path, epochs=2,
+            viz_overrides={"dump_frames": True, "every": 0},
+        )

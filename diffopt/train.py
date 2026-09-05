@@ -8,7 +8,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -549,6 +549,25 @@ def main() -> None:
     # selected one. It also allows re-running selection under a different
     # key without retraining.
     trajectory_path = log_dir / "placement_trajectory.csv"
+
+    # Trajectory frame dump (Phase 1d demo). Off by default: a run that does
+    # not opt in must produce a byte-identical e2e_train_log.csv to one built
+    # before this existed.
+    v_cfg = cfg.get("viz", {})
+    frame_writer = None
+    if v_cfg.get("dump_frames", False):
+        from diffopt.viz import FrameWriter
+
+        frame_writer = FrameWriter(
+            log_dir / "frames.json",
+            topology=topology,
+            demands=demands,
+            cfg={**cfg, "_config_path": str(args.config)},
+            modulation_config=mod_cfg,
+            every=int(v_cfg.get("every", 1)),
+            keyframe_every=int(v_cfg.get("keyframe_every", 50)),
+        )
+
     # Lexicographic selection on the DEPLOYED allocation: fewest violated
     # demands, then fewest DEVICES, then the most headroom.
     #
@@ -565,6 +584,9 @@ def main() -> None:
     # an epoch win by touching fewer nodes while buying more hardware —
     # 40 demands regenerating at node 7 need 40 devices, not 1.
     best_key = (math.inf, math.inf, math.inf)
+    # The selected epoch is otherwise recoverable only from inside the saved
+    # checkpoint dict; frames.json's `run.selected_epoch` needs it here.
+    best_epoch: Optional[int] = None
 
     with open(log_path, "w", newline="") as f, \
          open(trajectory_path, "w", newline="") as tf:
@@ -742,6 +764,12 @@ def main() -> None:
             ])
             tf.flush()
 
+            if frame_writer is not None:
+                # `hard` only — routes and cuts from hard["alloc"], margins
+                # from hard["gsnr_preds"], so every number in a frame is
+                # measured on the DEPLOYED allocation. Never the soft pass.
+                frame_writer.append(epoch, hard)
+
             if epoch % 10 == 0 or epoch == 1:
                 print(
                     f"Epoch {epoch:4d}/{epochs} | loss={loss.item():.4f} "
@@ -770,6 +798,7 @@ def main() -> None:
             )
             if selection_key < best_key:
                 best_key = selection_key
+                best_epoch = epoch
                 ckpt_path = checkpoint_dir / "best_e2e.pt"
                 torch.save(
                     {
@@ -797,6 +826,10 @@ def main() -> None:
                     f"devices={selection_key[1]}, "
                     f"worst_margin={-selection_key[2]:+.4f}dB)"
                 )
+
+    if frame_writer is not None:
+        frame_writer.close(best_epoch, log_path)
+        print(f"Frames: {frame_writer.path}")
 
     print(
         f"\nTraining complete. Best: violated={best_key[0]}, "
