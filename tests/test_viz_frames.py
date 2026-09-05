@@ -235,3 +235,26 @@ def test_a_crashed_run_leaves_a_readable_sidecar(tmp_path):
     lines = (tmp_path / "frames.jsonl").read_text().strip().splitlines()
     assert len(lines) == 2                      # header + one frame
     assert json.loads(lines[1])["epoch"] == 1
+
+
+# ---------------------------------------------------------------------------
+# scripts/dump_frames.py — pure helpers (conftest.py already puts scripts/
+# on sys.path)
+# ---------------------------------------------------------------------------
+
+def test_dump_frames_resolves_the_output_path_from_the_config():
+    from dump_frames import resolve_out_path  # noqa: E402
+
+    cfg = {"log_dir": "logs/constrained_stress"}
+    assert resolve_out_path(cfg, None) == Path("logs/constrained_stress/frames.json")
+    assert resolve_out_path(cfg, "x/y.json") == Path("x/y.json")
+
+
+def test_dump_frames_stamps_the_checkpoint_epoch_as_selected():
+    """A post-hoc dump has exactly one frame, and it IS the selected
+    checkpoint — so run.selected_epoch must name that epoch, not None."""
+    from dump_frames import selected_epoch_of  # noqa: E402
+
+    assert selected_epoch_of({"epoch": 201}) == 201
+    assert selected_epoch_of({}) is None
+    assert selected_epoch_of(None) is None
