@@ -309,6 +309,12 @@ def hard_rollout(
         # and would describe a different allocation, which is precisely the
         # mismatch scripts/evaluate_matrix.py used to have.
         "gsnr_preds": {did: g.detach().cpu() for did, g in gsnr_preds.items()},
+        # The hard AllocationOutputs this rollout evaluated. Already
+        # constructed above, so this is a reference, not a copy. The viz
+        # frame writer needs the deployed per-(demand, boundary) cuts in
+        # PATH ORDER; alloc_by_node (D, N) is accumulated and loses
+        # position along the path.
+        "alloc": alloc,
     }
 
 

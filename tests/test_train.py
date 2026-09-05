@@ -283,6 +283,37 @@ def test_hard_rollout_counts_violations_against_threshold_plus_margin():
     assert hard["hard_num_violated"] == expected
 
 
+def test_hard_rollout_returns_the_allocation_record_it_evaluated():
+    """The viz needs the deployed cuts in PATH ORDER. alloc_by_node (D, N)
+    is accumulated and positionless, so the record itself has to come back."""
+    from tests.test_pipeline import (
+        make_demands, make_hub_topology, make_mod_config, make_pipeline,
+    )
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+    mod_cfg = make_mod_config()
+
+    with torch.no_grad():
+        _, _, _, soft = pipeline(demands, tau=1.0)
+    hard = train_mod.hard_rollout(
+        pipeline, demands, soft, mod_cfg, margin_db=0.5,
+    )
+
+    alloc = hard["alloc"]
+    assert alloc.demand_ids == [d.id for d in demands]
+    assert alloc.segment_edge_ids  # the route survived the rollout
+    # The record is self-consistent with the aggregates beside it.
+    assert int(alloc.a.sum().item()) == hard["hard_num_devices"]
+    assert torch.equal(alloc.site_view > 0.5, hard["site_mask"])
+    # Hard decisions are exactly 0/1, so cut_idx is unambiguous.
+    assert torch.all((alloc.a == 0.0) | (alloc.a == 1.0))
+    for row in range(len(demands)):
+        n_bnd = int(alloc.num_segments[row]) - 1
+        cut = alloc.a[row, :n_bnd] > 0.5
+        assert torch.all(alloc.boundary_node_ids[row, :n_bnd][cut] >= 0)
+
+
 # ---------------------------------------------------------------------------
 # Stubbed harness for the epoch loop
 # ---------------------------------------------------------------------------
