@@ -160,28 +160,41 @@
     font-weight: 600;
   }
 
-  /* ---- panels ------------------------------------------------------------ */
+  /* ---- panels ------------------------------------------------------------
+   * A grid, not a stacked column: the map gets its own full-width row (the
+   * majority of the height) so it reads at a useful size, and strip/stats
+   * share the row below it side by side. Row heights are `minmax(0, Nfr)`
+   * against the fixed space #panels actually has (flex:1 1 auto inside a
+   * 100vh column), so all three panels are visible at once on an ordinary
+   * viewport with no page-level scrollbar; .panel-body's own overflow is
+   * the fallback for a window too small to fit even that.
+   * ------------------------------------------------------------------- */
   #panels {
     flex: 1 1 auto;
-    display: flex;
-    flex-direction: column;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: minmax(0, 2.6fr) minmax(0, 1fr);
+    grid-template-areas:
+      "map map"
+      "strip stats";
     gap: var(--space-4);
     padding: var(--space-4) var(--space-5);
-    overflow-y: auto;
   }
 
   .panel {
     display: flex;
     flex-direction: column;
     min-height: 0;
+    min-width: 0;
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: var(--radius);
   }
 
-  #map-panel { flex: 2 1 320px; }
-  #strip-panel { flex: 1 1 160px; }
-  #stats-panel { flex: 1 1 180px; }
+  #map-panel { grid-area: map; }
+  #strip-panel { grid-area: strip; }
+  #stats-panel { grid-area: stats; }
 
   .panel-head {
     display: flex;
@@ -256,12 +269,28 @@
     max-width: 32ch;
   }
 
+  .map-zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .map-zoom-controls .scrub-btn {
+    width: 22px;
+    height: 22px;
+    font-size: var(--text-sm);
+  }
+
   .map-svg {
     flex: 1 1 auto;
     width: 100%;
     height: 100%;
-    min-height: 220px;
+    min-height: 160px;
+    cursor: grab;
+    touch-action: none;
   }
+
+  .map-svg:active { cursor: grabbing; }
 
   .map-node text {
     font-family: var(--font-mono);
@@ -293,7 +322,7 @@
   .strip-chart {
     flex: 1 1 auto;
     width: 100%;
-    min-height: 140px;
+    min-height: 110px;
   }
 
   .strip-evo-label {
@@ -339,7 +368,7 @@
   .stats-chart {
     flex: 1 1 auto;
     width: 100%;
-    min-height: 240px;
+    min-height: 150px;
   }
 
   .stats-chart text {
@@ -580,19 +609,150 @@
   // Node radius ∝ 1/sqrt(num_nodes) over the unit-box layout (the plot
   // box IS that unit box, mapped into viewBox units); everything else
   // (regen ring, pips, ribbon/casing width for Task 9) derives from it.
+  //
+  // pipOrbit/siteR are NOT returned here -- they depend on a given node's
+  // own radius `r` (ordinary vs. regen candidate), so renderMap() derives
+  // them per node from pipHaloR/edgeUnit below (see the node loop).
   function markScale() {
     const n = Math.max(1, TOPO.num_nodes);
     const unit = Math.min(MAP_PLOT_W, MAP_PLOT_H) / Math.sqrt(n);
     const nodeR = Math.max(3, unit * 0.16);
     const regenR = nodeR * 1.45;
     const pipR = Math.max(1.3, nodeR * 0.30);
-    const pipHaloR = pipR * 1.9;
-    const pipOrbit = nodeR * 1.55;
+    const pipHaloR = pipR * 1.6;
     const ribbonW = nodeR * 0.5;               // consumed by Task 9
     const casingW = ribbonW + nodeR * 0.32;    // scales with ribbonW, per spec
     const edgeUnit = Math.max(0.35, nodeR * 0.10);
     const showLabels = TOPO.num_nodes <= 40;   // else: hover only, via <title>
-    return { nodeR, regenR, pipR, pipHaloR, pipOrbit, ribbonW, casingW, edgeUnit, showLabels };
+    return { nodeR, regenR, pipR, pipHaloR, ribbonW, casingW, edgeUnit, showLabels };
+  }
+
+  // -------------------------------------------------------------------
+  // Map zoom & pan: a pure VIEWPORT change, never touching the data,
+  // layout, or focus state. mapView holds the current viewBox in
+  // MAP_VB_W/H units; null means "full default extent". renderMap() reads
+  // it fresh every call (via mapViewOrDefault()) so zoom/pan survives a
+  // scrub or a focus change without a special case; wheel/drag update it
+  // and write straight to the live <svg>'s viewBox attribute, skipping a
+  // full render() for every wheel tick or pointer move.
+  // -------------------------------------------------------------------
+  const MAP_MIN_VIEW_W = MAP_VB_W / 12; // ~12x zoom-in cap
+  let mapView = null;         // {x, y, w, h} | null
+  let mapDragging = false;
+  let mapDragMoved = false;   // true once a drag has moved past the click threshold
+  let mapDragStart = null;    // {clientX, clientY, view}
+
+  function mapViewOrDefault() {
+    return mapView || { x: 0, y: 0, w: MAP_VB_W, h: MAP_VB_H };
+  }
+
+  function clampMapView(v) {
+    const w = Math.min(MAP_VB_W, Math.max(MAP_MIN_VIEW_W, v.w));
+    const h = w * (MAP_VB_H / MAP_VB_W);
+    const x = Math.min(MAP_VB_W - w, Math.max(0, v.x));
+    const y = Math.min(MAP_VB_H - h, Math.max(0, v.y));
+    return { x, y, w, h };
+  }
+
+  function applyMapViewBoxTo(svgEl) {
+    if (!svgEl) return;
+    const v = mapViewOrDefault();
+    svgEl.setAttribute('viewBox', `${v.x.toFixed(2)} ${v.y.toFixed(2)} ${v.w.toFixed(2)} ${v.h.toFixed(2)}`);
+  }
+
+  function resetMapView() {
+    mapView = null;
+    applyMapViewBoxTo(document.querySelector('.map-svg'));
+  }
+
+  // Zoom by `factor` (< 1 zooms in, > 1 zooms out) holding the point at
+  // SVG-space (px, py) fixed under the cursor -- standard "zoom to
+  // cursor", so the map doesn't drift while scrolling in on a detail.
+  // Snaps back to the exact default (mapView = null) once zoomed out past
+  // it, rather than asymptotically approaching but never quite reaching it.
+  function zoomMapAt(svgEl, px, py, factor) {
+    const v = mapViewOrDefault();
+    const rawW = v.w * factor;
+    if (rawW >= MAP_VB_W - 0.5) { mapView = null; applyMapViewBoxTo(svgEl); return; }
+    const w = Math.max(MAP_MIN_VIEW_W, rawW);
+    const h = w * (MAP_VB_H / MAP_VB_W);
+    const nx = px - (px - v.x) * (w / v.w);
+    const ny = py - (py - v.y) * (h / v.h);
+    mapView = clampMapView({ x: nx, y: ny, w, h });
+    applyMapViewBoxTo(svgEl);
+  }
+
+  // Button-driven zoom: toward the current view's own center, since there
+  // is no cursor position to zoom toward.
+  function zoomMapBy(factor) {
+    const v = mapViewOrDefault();
+    zoomMapAt(document.querySelector('.map-svg'), v.x + v.w / 2, v.y + v.h / 2, factor);
+  }
+
+  // The map's onclick (background click clears focus) fires after a
+  // pointerup even when that pointerup ended a drag -- browsers' built-in
+  // click synthesis has no idea this was a pan, not a click. Route the
+  // inline onclick through here so a genuine drag never also clears focus.
+  function handleMapBackgroundClick() {
+    if (mapDragMoved) { mapDragMoved = false; return; }
+    focusLightpath(null);
+  }
+
+  // Wheel-to-zoom and drag-to-pan, bound once to #map-body (which persists
+  // across renderMap() calls -- only its innerHTML, i.e. the <svg> inside,
+  // is rebuilt each time) rather than to the <svg> itself.
+  function initMapZoomPan() {
+    const mapBody = document.getElementById('map-body');
+    if (!mapBody) return;
+
+    mapBody.addEventListener('wheel', (e) => {
+      const svgEl = e.target.closest('.map-svg');
+      if (!svgEl) return;
+      e.preventDefault();
+      const p = clientToSvgPoint(svgEl, e.clientX, e.clientY);
+      if (!p) return;
+      zoomMapAt(svgEl, p.x, p.y, e.deltaY > 0 ? 1.15 : 1 / 1.15);
+    }, { passive: false });
+
+    mapBody.addEventListener('pointerdown', (e) => {
+      const svgEl = e.target.closest('.map-svg');
+      if (!svgEl || e.button !== 0) return;
+      mapDragging = true;
+      mapDragMoved = false;
+      mapDragStart = { clientX: e.clientX, clientY: e.clientY, view: mapViewOrDefault() };
+      svgEl.setPointerCapture(e.pointerId);
+    });
+
+    mapBody.addEventListener('pointermove', (e) => {
+      if (!mapDragging || !mapDragStart) return;
+      const svgEl = e.target.closest('.map-svg') || mapBody.querySelector('.map-svg');
+      if (!svgEl) return;
+      const dxClient = e.clientX - mapDragStart.clientX;
+      const dyClient = e.clientY - mapDragStart.clientY;
+      if (!mapDragMoved && Math.hypot(dxClient, dyClient) > 3) mapDragMoved = true;
+      if (!mapDragMoved) return;
+      const rect = svgEl.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const v = mapDragStart.view;
+      mapView = clampMapView({
+        x: v.x - dxClient * (v.w / rect.width),
+        y: v.y - dyClient * (v.h / rect.height),
+        w: v.w,
+        h: v.h,
+      });
+      applyMapViewBoxTo(svgEl);
+    });
+
+    function endDrag(e) {
+      if (!mapDragging) return;
+      mapDragging = false;
+      const svgEl = e.target && e.target.closest && e.target.closest('.map-svg');
+      if (svgEl && svgEl.releasePointerCapture) {
+        try { svgEl.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+      }
+    }
+    mapBody.addEventListener('pointerup', endDrag);
+    mapBody.addEventListener('pointercancel', endDrag);
   }
 
   // edgeLoad(frame): how many lightpaths use each edge id, over EVERY
@@ -719,6 +879,15 @@
       const site = frame.sites[String(i)];
       const count = site ? site.deployed : 0;
       const r = isRegen ? scale.regenR : scale.nodeR;
+      // Pip ring sits just outside THIS node's own circle (regen candidates
+      // are bigger, so their ring sits further out too) -- pipOrbit is
+      // sized so even the ring's own halo clears r, never overlapping the
+      // node's opaque face. siteR (the muted background disc) is in turn
+      // sized to fully contain the ring including that halo, so the pips
+      // read as one cluster attached to the node rather than floating
+      // debris outside a disc that was too small for them.
+      const pipOrbit = r + scale.pipHaloR + scale.edgeUnit;
+      const siteR = pipOrbit + scale.pipHaloR + scale.edgeUnit;
       const halo = haloIntensity(i);
       const label = `node ${i}${isRegen ? ' (regen candidate)' : ''}${count ? `, ${count} device${count === 1 ? '' : 's'}` : ''}${halo > 0 ? ', device count changed recently' : ''}`;
       // <title> first: some browsers only pick up the hover tooltip when
@@ -735,8 +904,10 @@
 
       if (count > 0) {
         // Device site: a filled disc behind the pips (and behind the
-        // node's own opaque circle, drawn next).
-        g += `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${(r * 1.35).toFixed(2)}" fill="var(--load)" fill-opacity="0.16"/>`;
+        // node's own opaque circle, drawn next) -- sized via siteR so it
+        // actually contains the pip ring drawn further below, not just the
+        // node's own face.
+        g += `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${siteR.toFixed(2)}" fill="var(--load)" fill-opacity="0.16"/>`;
       }
 
       // The node itself: always opaque, so it is never buried by an edge
@@ -757,8 +928,8 @@
         } else {
           for (let k = 0; k < count; k++) {
             const angle = (2 * Math.PI * k) / count - Math.PI / 2;
-            const px = cx + scale.pipOrbit * Math.cos(angle);
-            const py = cy + scale.pipOrbit * Math.sin(angle);
+            const px = cx + pipOrbit * Math.cos(angle);
+            const py = cy + pipOrbit * Math.sin(angle);
             // Faint halo first, so pips stay findable against a busy map.
             g += `<circle cx="${px.toFixed(2)}" cy="${py.toFixed(2)}" r="${scale.pipHaloR.toFixed(2)}" fill="var(--surface)" fill-opacity="0.85" stroke="var(--line)" stroke-width="${(scale.edgeUnit * 0.5).toFixed(2)}"/>`;
             g += `<circle cx="${px.toFixed(2)}" cy="${py.toFixed(2)}" r="${scale.pipR.toFixed(2)}" fill="var(--ink)"/>`;
@@ -793,12 +964,24 @@
         `<span class="num" style="color:var(--red)">${red}</span> below threshold &middot; ` +
         `<span class="num" style="color:var(--orange)">${orange}</span> in margin`;
 
+    const zoomControlsHtml =
+      `<div class="map-zoom-controls">` +
+        `<button type="button" class="scrub-btn" onclick="zoomMapBy(1/1.4)" aria-label="Zoom in">+</button>` +
+        `<button type="button" class="scrub-btn" onclick="zoomMapBy(1.4)" aria-label="Zoom out">&minus;</button>` +
+        `<button type="button" class="scrub-btn" onclick="resetMapView()" aria-label="Reset zoom" title="Reset zoom">&#8962;</button>` +
+      `</div>`;
+    const mv = mapViewOrDefault();
+
     mapBody.innerHTML =
       `<div class="map-counter" id="map-counter">` +
-        `<span class="map-counter-text">${counterHtml}</span>${focusPickerHtml()}` +
+        `<span class="map-counter-text">${counterHtml}</span>${focusPickerHtml()}${zoomControlsHtml}` +
       `</div>` +
-      `<svg class="map-svg" viewBox="0 0 ${MAP_VB_W} ${MAP_VB_H}" preserveAspectRatio="xMidYMid meet" role="img" ` +
-      `aria-label="Network map for epoch ${state.epoch}" onclick="focusLightpath(null)">` +
+      // viewBox reflects the CURRENT zoom/pan (mapView), not always the
+      // full extent, so scrubbing/focusing never resets a user's zoom --
+      // see the "Map zoom & pan" block above markScale() for how it's set.
+      `<svg class="map-svg" viewBox="${mv.x.toFixed(2)} ${mv.y.toFixed(2)} ${mv.w.toFixed(2)} ${mv.h.toFixed(2)}" ` +
+      `preserveAspectRatio="xMidYMid meet" role="img" ` +
+      `aria-label="Network map for epoch ${state.epoch}" onclick="handleMapBackgroundClick()">` +
       `<g id="map-edges">${edgesSvg}</g>` +
       `<g id="map-ribbons"></g>` +
       `<g id="map-nodes">${nodesSvg}</g>` +
@@ -1877,5 +2060,6 @@
   runSelfCheck();
   initScrubber();
   initSelectedMarker();
+  initMapZoomPan();
   render();
 </script>
