@@ -229,9 +229,31 @@
 
   .map-counter {
     flex: 0 0 auto;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-2);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--muted);
+  }
+
+  .map-focus-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .map-focus-picker select {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--ink);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 1px 4px;
+    max-width: 32ch;
   }
 
   .map-svg {
@@ -245,6 +267,10 @@
     font-family: var(--font-mono);
     pointer-events: none;
     user-select: none;
+  }
+
+  .map-ribbon {
+    cursor: pointer;
   }
 
   /* ---- scrubber ---------------------------------------------------------- */
@@ -352,6 +378,11 @@
   const RUN = DOC.run, TOPO = DOC.topology;
   const DEMAND = new Map(DOC.demands.map(d => [d.id, d]));
   const EPOCHS = DOC.frames.map(f => f.epoch);
+
+  // The one scenario that exists today (frames.py's NOMINAL). Focus mode
+  // keys on (d, s) rather than d alone -- see state.focus below -- so
+  // Stage IV can add a restoration route without a rewrite.
+  const NOMINAL = 'nominal';
 
   // Keyframe + delta reconstruction, mirroring diffopt/viz/frames.py's
   // replay_frames(). Cached, so scrubbing backwards is not O(n) each time.
@@ -463,6 +494,54 @@
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  // -------------------------------------------------------------------
+  // Halo decay (Task 9). A node whose device count changed since the
+  // last RENDERED epoch gets a fading glow ring instead of an instant
+  // pop -- load-bearing, not polish: the plan's own measurements found a
+  // period-2 limit cycle (epochs 9-21) where the allocation head's device
+  // count swings between ~1400 and 0 on alternating epochs, so nearly
+  // every regen candidate appears/vanishes every epoch. A raw instant
+  // redraw would strobe the whole candidate set; the glow persists across
+  // HALO_DECAY_EPOCHS renders so a churning node reads as "unstable", not
+  // as a flicker easy to blink past while scrubbing.
+  // -------------------------------------------------------------------
+  const HALO_DECAY_EPOCHS = 5;
+  let _haloPrevCounts = null;   // Float64Array | null -- previous render's per-node device count
+  const _haloAge = new Map();  // nodeId -> renders since its count last changed
+
+  function siteCounts(frame) {
+    const counts = new Float64Array(TOPO.num_nodes);
+    for (let i = 0; i < TOPO.num_nodes; i++) {
+      const site = frame.sites[String(i)];
+      counts[i] = site ? site.deployed : 0;
+    }
+    return counts;
+  }
+
+  function updateHaloState(frame) {
+    const counts = siteCounts(frame);
+    if (_haloPrevCounts) {
+      // Age every currently-glowing node by one render first...
+      for (const [node, age] of Array.from(_haloAge.entries())) {
+        const next = age + 1;
+        if (next >= HALO_DECAY_EPOCHS) _haloAge.delete(node);
+        else _haloAge.set(node, next);
+      }
+      // ...then re-ignite (age 0) anything whose count actually changed
+      // vs. the last frame this viewer rendered (not necessarily the
+      // adjacent epoch -- scrubbing can jump).
+      for (let i = 0; i < counts.length; i++) {
+        if (counts[i] !== _haloPrevCounts[i]) _haloAge.set(i, 0);
+      }
+    }
+    _haloPrevCounts = counts;
+  }
+
+  function haloIntensity(nodeId) {
+    if (!_haloAge.has(nodeId)) return 0;
+    return Math.max(0, 1 - _haloAge.get(nodeId) / HALO_DECAY_EPOCHS);
+  }
+
   function renderMap() {
     const mapBody = document.getElementById('map-body');
     if (!mapBody) return;
@@ -474,6 +553,7 @@
     const scale = markScale();
     const loads = edgeLoad(frame);
     const means = edgeMeanMargin(frame);
+    updateHaloState(frame);
 
     // ---- edges: neutral load channel, √-scaled width; idle = hairline.
     let edgesSvg = '';
@@ -504,10 +584,19 @@
       const site = frame.sites[String(i)];
       const count = site ? site.deployed : 0;
       const r = isRegen ? scale.regenR : scale.nodeR;
-      const label = `node ${i}${isRegen ? ' (regen candidate)' : ''}${count ? `, ${count} device${count === 1 ? '' : 's'}` : ''}`;
+      const halo = haloIntensity(i);
+      const label = `node ${i}${isRegen ? ' (regen candidate)' : ''}${count ? `, ${count} device${count === 1 ? '' : 's'}` : ''}${halo > 0 ? ', device count changed recently' : ''}`;
       // <title> first: some browsers only pick up the hover tooltip when
       // it is the group's first child.
       let g = `<g class="map-node"><title>${escHtml(label)}</title>`;
+
+      if (halo > 0) {
+        // Fading glow ring, drawn first so it sits behind everything else
+        // at this node -- see updateHaloState()/haloIntensity() above.
+        const haloR = r * (1.55 + 1.1 * halo);
+        g += `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${haloR.toFixed(2)}" fill="none" ` +
+          `stroke="var(--ink)" stroke-width="${(scale.edgeUnit * 1.7).toFixed(2)}" stroke-opacity="${(0.55 * halo).toFixed(2)}"/>`;
+      }
 
       if (count > 0) {
         // Device site: a filled disc behind the pips (and behind the
@@ -570,19 +659,327 @@
         `<span class="num" style="color:var(--orange)">${orange}</span> in margin`;
 
     mapBody.innerHTML =
-      `<div class="map-counter" id="map-counter">${counterHtml}</div>` +
-      `<svg class="map-svg" viewBox="0 0 ${MAP_VB_W} ${MAP_VB_H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Network map for epoch ${state.epoch}">` +
+      `<div class="map-counter" id="map-counter">` +
+        `<span class="map-counter-text">${counterHtml}</span>${focusPickerHtml()}` +
+      `</div>` +
+      `<svg class="map-svg" viewBox="0 0 ${MAP_VB_W} ${MAP_VB_H}" preserveAspectRatio="xMidYMid meet" role="img" ` +
+      `aria-label="Network map for epoch ${state.epoch}" onclick="focusLightpath(null)">` +
       `<g id="map-edges">${edgesSvg}</g>` +
       `<g id="map-ribbons"></g>` +
       `<g id="map-nodes">${nodesSvg}</g>` +
+      `<g id="map-focus-glyphs"></g>` +
       `</svg>`;
+  }
+
+  // ---- focus picker: a UI element for selecting ANY lightpath (Task 8's
+  // ribbon-free rendering only draws non-green ones on the map itself, but
+  // a green lightpath's history can still be worth inspecting). Rebuilt on
+  // every renderMap() call, so its `selected` option is re-derived from
+  // state.focus rather than drifting from it.
+  function focusPickerHtml() {
+    const opts = [`<option value=""${state.focus ? '' : ' selected'}>&mdash; none &mdash;</option>`];
+    for (const d of DOC.demands) {
+      const sel = state.focus && state.focus.d === d.id ? ' selected' : '';
+      opts.push(`<option value="${d.id}"${sel}>demand ${d.id} (${d.src}&rarr;${d.dst})</option>`);
+    }
+    return (
+      `<label class="map-focus-picker num">focus ` +
+      `<select id="focus-select" onclick="event.stopPropagation()" ` +
+      `onchange="focusLightpath(this.value === '' ? null : +this.value, true)">` +
+      opts.join('') +
+      `</select></label>`
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // Ribbons (Task 9): per-lightpath colour-coded routes, drawn inside the
+  // #map-ribbons group Task 8 left empty (edges -> ribbons -> nodes order
+  // is unchanged). Two building blocks feed everything below:
+  //   nodePathOf(lp)      -- lp's flattened segs walked into a node list.
+  //   ribbonSegments(...) -- that node list turned into one Catmull-Rom-
+  //                          derived cubic-Bezier fragment per hop.
+  // -------------------------------------------------------------------
+
+  // nodePathOf: mirrors pipeline.py's segment_path walk (read there for
+  // the exact logic) -- start at the demand's src, then for each edge id
+  // in flattened-segs order, the endpoint that is NOT the current node is
+  // the next node. Cached per (d, flattened edge ids): unchanged lightpath
+  // entries are the SAME object across many epochs (frames.py's delta
+  // encoding), and even across different objects the string key collapses
+  // repeats from scrubbing back and forth.
+  const _nodePathCache = new Map();
+  function nodePathOf(lp) {
+    const flat = lp.segs.length ? lp.segs.flat() : [];
+    const key = lp.d + ':' + flat.join(',');
+    const cached = _nodePathCache.get(key);
+    if (cached) return cached;
+    const demand = DEMAND.get(lp.d);
+    let current = demand.src;
+    const path = [current];
+    for (const eid of flat) {
+      const e = TOPO.edges[eid];
+      const exitNode = current === e.src ? e.dst : e.src;
+      path.push(exitNode);
+      current = exitNode;
+    }
+    _nodePathCache.set(key, path);
+    return path;
+  }
+
+  // ribbonSegments: one cubic-Bezier fragment (`M p1 C cp1, cp2, p2`) per
+  // hop, built from a uniform Catmull-Rom spline at the given tension.
+  // Tension 1.0 is a fully "loose" Catmull-Rom curve; 0.0 degenerates to
+  // straight lines between nodes. 0.55 (the default, and the only value
+  // this file uses) sits between the two: enough curve that two ribbons
+  // sharing a trunk visibly separate on entry/exit angle, not so much that
+  // the curve floats free of the straight-line edges it must stay
+  // traceable to. Each fragment is computed from the FULL point array
+  // (neighbours p0/p3 included) so that grouping fragments into per-
+  // segment sub-paths later (focus mode's per-segment tint) never breaks
+  // tangent continuity at a segment boundary.
+  function ribbonSegments(nodeIds, tension) {
+    if (tension === undefined) tension = 0.55;
+    const pts = nodeIds.map(nodeXY);
+    const frags = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i === 0 ? 0 : i - 1];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[i + 2 < pts.length ? i + 2 : pts.length - 1];
+      const cp1x = p1[0] + (p2[0] - p0[0]) * tension / 6;
+      const cp1y = p1[1] + (p2[1] - p0[1]) * tension / 6;
+      const cp2x = p2[0] - (p3[0] - p1[0]) * tension / 6;
+      const cp2y = p2[1] - (p3[1] - p1[1]) * tension / 6;
+      frags.push(
+        `M ${p1[0].toFixed(2)} ${p1[1].toFixed(2)} ` +
+        `C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ` +
+        `${p2[0].toFixed(2)} ${p2[1].toFixed(2)}`
+      );
+    }
+    return frags;
+  }
+
+  // Stitch fragments produced by ribbonSegments into one `d` string: keep
+  // the first fragment's `M`, drop every later fragment's `M` (the curve
+  // already continues from the previous `C`'s endpoint).
+  function stitchFragments(frags) {
+    if (!frags.length) return '';
+    let d = frags[0];
+    for (let i = 1; i < frags.length; i++) {
+      d += ' ' + frags[i].replace(/^M [-\d.]+ [-\d.]+ /, '');
+    }
+    return d;
+  }
+
+  function ribbonPath(nodeIds, tension) {
+    const frags = ribbonSegments(nodeIds, tension);
+    if (frags.length) return stitchFragments(frags);
+    if (nodeIds.length === 1) {
+      const [x, y] = nodeXY(nodeIds[0]);
+      return `M ${x.toFixed(2)} ${y.toFixed(2)}`;
+    }
+    return '';
+  }
+
+  // Step 3: only non-green lightpaths draw as ribbons (31/346 at the
+  // plan's own epoch-0 example) -- the rest stay implicit in Task 8's
+  // edge-load encoding. Draw order is worst-margin-last: sorting
+  // descending by margin means the reddest (most negative) lightpath is
+  // appended last to the SVG, so it paints on top and stays the most
+  // visible strand wherever ribbons cross.
+  function nonGreenDrawSet(frame) {
+    const list = [];
+    for (const lp of frame.lightpaths.values()) {
+      if (colourOf(lp.margin_db) !== 'green') list.push(lp);
+    }
+    list.sort((a, b) => b.margin_db - a.margin_db);
+    return list;
+  }
+
+  // Step 2: casing (background-colour stroke, wider) then the real
+  // colour-coded stroke on top -- z-axis separation, not an xy offset.
+  // Widths come straight from markScale()'s ribbonW/casingW (Task 8
+  // provisioned them for exactly this). Each ribbon is clickable to enter
+  // focus mode for that lightpath.
+  function renderBaseRibbons(frame, scale) {
+    let svg = '';
+    for (const lp of nonGreenDrawSet(frame)) {
+      const d = ribbonPath(nodePathOf(lp));
+      const colour = colourOf(lp.margin_db);
+      const demand = DEMAND.get(lp.d);
+      const tip = `demand ${lp.d}: node ${demand.src}→${demand.dst}, margin ${lp.margin_db.toFixed(2)} dB (click to focus)`;
+      svg +=
+        `<path d="${d}" fill="none" stroke="var(--surface)" stroke-width="${scale.casingW.toFixed(2)}" ` +
+        `stroke-opacity="0.9" stroke-linecap="round" stroke-linejoin="round"/>` +
+        `<path class="map-ribbon" d="${d}" fill="none" stroke="var(--${colour})" stroke-width="${scale.ribbonW.toFixed(2)}" ` +
+        `stroke-opacity="0.92" stroke-linecap="round" stroke-linejoin="round" ` +
+        `onclick="event.stopPropagation(); focusLightpath(${lp.d})"><title>${escHtml(tip)}</title></path>`;
+    }
+    return svg;
+  }
+
+  // Step 5 (focus mode), part 1: every OTHER flow (not just the non-green
+  // draw set -- a viewer needs context, and the focused path might itself
+  // be green) fades to a faint neutral wash. No casing here: at this
+  // opacity casing would just add clutter, not separation.
+  function renderFocusWash(frame, scale) {
+    let svg = '';
+    for (const lp of frame.lightpaths.values()) {
+      if (lp.d === state.focus.d) continue;
+      const d = ribbonPath(nodePathOf(lp));
+      svg += `<path d="${d}" fill="none" stroke="var(--muted)" stroke-width="${(scale.ribbonW * 0.7).toFixed(2)}" ` +
+        `stroke-opacity="0.14" stroke-linecap="round" stroke-linejoin="round"/>`;
+    }
+    return svg;
+  }
+
+  const FOCUS_GHOST_MAX = 6;
+  const FOCUS_GHOST_LOOKBACK = 80;
+
+  // Collect up to FOCUS_GHOST_MAX distinct HISTORICAL (route, cuts) pairs
+  // for one demand, most-recent-change first, scanning back at most
+  // FOCUS_GHOST_LOOKBACK epochs from the current one. Consecutive epochs
+  // whose route AND cuts both matched the next-more-recent entry collapse
+  // into a single ghost -- otherwise a long-unchanged state would draw
+  // (and cost) once per epoch for no visual difference. Keying on segs
+  // AND cut_idx together (not segs alone) matters: a cut can appear or
+  // disappear on an otherwise-unchanged route, and that history has to
+  // survive into the ghost list or the regen-marker "removed" glyph below
+  // would never see it.
+  function focusGhosts(demandId) {
+    const idx = epochIndex(state.epoch);
+    const currentLp = frameAt(state.epoch).lightpaths.get(demandId);
+    let lastKey = currentLp ? JSON.stringify([currentLp.segs, currentLp.cut_idx]) : null;
+    const ghosts = [];
+    for (let i = idx - 1; i >= 0 && i >= idx - FOCUS_GHOST_LOOKBACK && ghosts.length < FOCUS_GHOST_MAX; i--) {
+      const lp = frameAt(EPOCHS[i]).lightpaths.get(demandId);
+      if (!lp) continue;
+      const key = JSON.stringify([lp.segs, lp.cut_idx]);
+      if (key === lastKey) continue;
+      ghosts.push({ epoch: EPOCHS[i], lp });
+      lastKey = key;
+    }
+    return ghosts;
+  }
+
+  function diamondGlyph(cx, cy, r, filled, tip) {
+    const pts = `${cx.toFixed(2)},${(cy - r).toFixed(2)} ${(cx + r).toFixed(2)},${cy.toFixed(2)} ` +
+      `${cx.toFixed(2)},${(cy + r).toFixed(2)} ${(cx - r).toFixed(2)},${cy.toFixed(2)}`;
+    return `<polygon points="${pts}" fill="${filled ? 'var(--ink)' : 'none'}" fill-opacity="${filled ? 0.22 : 0}" ` +
+      `stroke="var(--ink)" stroke-width="1.6"><title>${escHtml(tip)}</title></polygon>`;
+  }
+
+  // Step 5, parts 2-5: the focused route itself.
+  //  - route ghosts: earlier distinct routes, thin, fading with age.
+  //  - per-segment tint: each of lp.segs coloured by ITS OWN margin
+  //    (seg_gsnr_db[s] against the demand's threshold), not the whole
+  //    path's worst-chunk colour, so the binding segment stands out.
+  //  - regen markers: a filled diamond at each of the CURRENT epoch's
+  //    cut_nodes; a node that was a cut in one of the collected ghosts but
+  //    is not a cut now draws hollow, so removal is visible too.
+  // Returns { ribbons, glyphs } -- glyphs go in a group drawn AFTER nodes
+  // (map-focus-glyphs) since a filled node circle would otherwise bury a
+  // glyph centred on it; ribbons stay in map-ribbons as usual.
+  function renderFocusRoute(frame, scale) {
+    const demandId = state.focus.d;
+    const lp = frame.lightpaths.get(demandId);
+    if (!lp) return { ribbons: '', glyphs: '' };
+    const demand = DEMAND.get(demandId);
+    const ghosts = focusGhosts(demandId);
+
+    let ribbons = '';
+    // Oldest ghost first, current route always last/topmost.
+    for (let i = ghosts.length - 1; i >= 0; i--) {
+      const age = i + 1; // 1 = most recent distinct historical route
+      const opacity = Math.max(0.05, 0.4 * (1 - age / (FOCUS_GHOST_MAX + 1)));
+      const d = ribbonPath(nodePathOf(ghosts[i].lp));
+      ribbons += `<path d="${d}" fill="none" stroke="var(--muted)" stroke-width="${(scale.ribbonW * 0.55).toFixed(2)}" ` +
+        `stroke-opacity="${opacity.toFixed(2)}" stroke-linecap="round" stroke-linejoin="round">` +
+        `<title>${escHtml(`epoch ${ghosts[i].epoch} route (ghost)`)}</title></path>`;
+    }
+
+    const fullNodeIds = nodePathOf(lp);
+    ribbons += `<path d="${ribbonPath(fullNodeIds)}" fill="none" stroke="var(--surface)" ` +
+      `stroke-width="${(scale.casingW * 1.15).toFixed(2)}" stroke-opacity="0.95" ` +
+      `stroke-linecap="round" stroke-linejoin="round"/>`;
+
+    const frags = ribbonSegments(fullNodeIds);
+    let edgeStart = 0;
+    for (let s = 0; s < lp.segs.length; s++) {
+      const segLen = lp.segs[s].length;
+      const segFrags = frags.slice(edgeStart, edgeStart + segLen);
+      edgeStart += segLen;
+      if (!segFrags.length) continue;
+      const segMargin = lp.seg_gsnr_db[s] - demand.threshold_db;
+      const colour = colourOf(segMargin);
+      ribbons += `<path class="map-ribbon" d="${stitchFragments(segFrags)}" fill="none" stroke="var(--${colour})" ` +
+        `stroke-width="${(scale.ribbonW * 1.35).toFixed(2)}" stroke-opacity="1" ` +
+        `stroke-linecap="round" stroke-linejoin="round" onclick="event.stopPropagation(); focusLightpath(${lp.d})">` +
+        `<title>${escHtml(`demand ${lp.d} segment ${s}: ${segMargin.toFixed(2)} dB margin`)}</title></path>`;
+    }
+
+    const currentCuts = new Set(lp.cut_nodes);
+    const historicalCuts = new Set();
+    for (const g of ghosts) for (const nd of g.lp.cut_nodes) historicalCuts.add(nd);
+    const glyphR = scale.nodeR * 1.7;
+    let glyphs = '';
+    for (const nd of currentCuts) {
+      const [gx, gy] = nodeXY(nd);
+      glyphs += diamondGlyph(gx, gy, glyphR, true, `demand ${lp.d}: regenerator at node ${nd} (current epoch)`);
+    }
+    for (const nd of historicalCuts) {
+      if (currentCuts.has(nd)) continue;
+      const [gx, gy] = nodeXY(nd);
+      glyphs += diamondGlyph(gx, gy, glyphR, false, `demand ${lp.d}: regenerator removed from node ${nd} (deployed in an earlier epoch)`);
+    }
+    return { ribbons, glyphs };
+  }
+
+  function renderRibbons() {
+    const ribbonsGroup = document.getElementById('map-ribbons');
+    const glyphGroup = document.getElementById('map-focus-glyphs');
+    if (!ribbonsGroup) return;
+    if (!EPOCHS.length || state.epoch === null) {
+      ribbonsGroup.innerHTML = '';
+      if (glyphGroup) glyphGroup.innerHTML = '';
+      return;
+    }
+    const frame = frameAt(state.epoch);
+    const scale = markScale();
+    let ribbons = '', glyphs = '';
+    if (state.focus && frame.lightpaths.has(state.focus.d)) {
+      ribbons += renderFocusWash(frame, scale);
+      const focused = renderFocusRoute(frame, scale);
+      ribbons += focused.ribbons;
+      glyphs += focused.glyphs;
+    } else {
+      ribbons += renderBaseRibbons(frame, scale);
+    }
+    ribbonsGroup.innerHTML = ribbons;
+    if (glyphGroup) glyphGroup.innerHTML = glyphs;
+  }
+
+  // Selecting a lightpath (ribbon click or the focus-select dropdown)
+  // enters focus mode; clicking the same ribbon again, picking "-- none
+  // --", clicking empty map background, or Escape all clear it. Keyed on
+  // (d, s) rather than d alone (spec's Stage IV seam) even though s is
+  // always NOMINAL today.
+  function focusLightpath(d, explicit) {
+    if (d === null || d === undefined || d === '') {
+      state.focus = null;
+    } else {
+      d = +d;
+      if (!explicit && state.focus && state.focus.d === d) state.focus = null;
+      else state.focus = { d, s: NOMINAL };
+    }
+    render();
   }
 
   // -------------------------------------------------------------------
   // Shell state + wiring. Later tasks (8-11) extend render(); they must
   // not rename `state`, `render`, or the data-layer symbols above.
   // -------------------------------------------------------------------
-  const state = { epoch: EPOCHS.length ? EPOCHS[EPOCHS.length - 1] : null };
+  const state = { epoch: EPOCHS.length ? EPOCHS[EPOCHS.length - 1] : null, focus: null };
 
   const STORAGE_KEY = 'diffonet-lightpath-viewer:epoch-idx';
 
@@ -623,12 +1020,17 @@
 
   // render(): this task's stub only updates the scrubber readout. Tasks
   // 8-11 extend this same function to draw the map, strip and stats.
+  // renderRibbons() MUST run after renderMap(): renderMap() rebuilds
+  // map-body's innerHTML wholesale each call (a fresh, empty #map-ribbons
+  // / #map-focus-glyphs pair included), so renderRibbons() has to refill
+  // whatever renderMap() just (re)created, not the other way round.
   function render() {
     const idx = epochIndex(state.epoch);
     epochLabel.innerHTML = EPOCHS.length
       ? `epoch <strong>${state.epoch}</strong> &middot; frame ${idx + 1}/${EPOCHS.length}`
       : 'no frames';
     renderMap();
+    renderRibbons();
   }
 
   function initHeader() {
@@ -683,6 +1085,7 @@
       if (e.target === scrubRange) return;
       if (e.key === 'ArrowLeft') { stepEpoch(-1); e.preventDefault(); }
       else if (e.key === 'ArrowRight') { stepEpoch(1); e.preventDefault(); }
+      else if (e.key === 'Escape' && state.focus) { focusLightpath(null); }
     });
   }
 
