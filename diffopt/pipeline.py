@@ -145,6 +145,18 @@ class AllocationOutputs:
     num_segments: torch.Tensor        # (D,) long
     boundary_node_ids: torch.Tensor   # (D, J-1) long, -1 where padded
     demand_ids: List[int]             # row index -> Demand.id
+    segment_edge_ids: Dict[int, List[List[int]]]
+                                      # demand_id -> ordered edge ids, grouped
+                                      # by transparent segment. forward()
+                                      # already builds this (`demand_segments`)
+                                      # and used to let it die as a local;
+                                      # re-deriving it downstream would mean
+                                      # resurrecting _reconstruct_path, deleted
+                                      # as a ~0.7 s/forward regression
+                                      # (open_followups.md #7b). Concatenating
+                                      # the groups gives the ordered edge list;
+                                      # the grouping aligns seg_gsnr_db[k] with
+                                      # a stretch of the route.
     ste_clamped_segments: int         # count of segments whose qot_gsnr fell
                                        # outside SegmentCombiner's [-5, 35] dB
                                        # clamp band this forward call
@@ -780,6 +792,7 @@ class DiffONetPipeline(nn.Module):
                 num_segments=num_segments,
                 boundary_node_ids=bnd_matrix,
                 demand_ids=[d.id for d in demands],
+                segment_edge_ids=demand_segments,
                 ste_clamped_segments=clamped,
                 proxy_qot_rank_corr=rank_corr,
                 waste_cost=waste_cost,
@@ -802,6 +815,7 @@ class DiffONetPipeline(nn.Module):
                 num_segments=torch.zeros(0, dtype=torch.long, device=device),
                 boundary_node_ids=torch.zeros(0, 0, dtype=torch.long, device=device),
                 demand_ids=[],
+                segment_edge_ids={},
                 ste_clamped_segments=clamped,
                 proxy_qot_rank_corr=rank_corr,
                 waste_cost=torch.zeros((), device=device),
@@ -853,6 +867,7 @@ class DiffONetPipeline(nn.Module):
                 num_segments=torch.zeros(0, dtype=torch.long, device=device),
                 boundary_node_ids=torch.zeros(0, 0, dtype=torch.long, device=device),
                 demand_ids=[],
+                segment_edge_ids={},
                 ste_clamped_segments=alloc.ste_clamped_segments,
                 proxy_qot_rank_corr=alloc.proxy_qot_rank_corr,
                 waste_cost=torch.zeros((), device=device),
@@ -899,6 +914,7 @@ class DiffONetPipeline(nn.Module):
             num_segments=alloc.num_segments,
             boundary_node_ids=alloc.boundary_node_ids,
             demand_ids=[d.id for d in demands],
+            segment_edge_ids=alloc.segment_edge_ids,
             ste_clamped_segments=alloc.ste_clamped_segments,
             proxy_qot_rank_corr=alloc.proxy_qot_rank_corr,
             waste_cost=waste_cost,

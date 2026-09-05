@@ -1479,3 +1479,81 @@ def test_alloc_ste_surrogate_vanishes_on_a_saturated_score():
         if p.grad is not None
     )
     assert total == 0.0                                             # backward gone
+
+
+# ---------------------------------------------------------------------------
+# Test 19+: segment_edge_ids
+# ---------------------------------------------------------------------------
+
+def test_segment_edge_ids_concatenates_into_a_real_src_to_dst_walk():
+    """The grouped edge ids must walk src->dst over real edges, and their
+    unordered image must be exactly path_indicator. This is the property that
+    lets the viewer draw a ribbon on the true fibre rather than a guess."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+    edges = list(topology.undirected_edges)
+
+    with torch.no_grad():
+        _, _, path_indicators, alloc = pipeline(demands, tau=1.0)
+
+    for d in demands:
+        groups = alloc.segment_edge_ids[d.id]
+        flat = [eid for g in groups for eid in g]
+        assert flat, f"demand {d.id} has no edges"
+
+        # Walk it: every hop must share a node with the previous one.
+        node = d.src
+        for eid in flat:
+            e = edges[eid]
+            assert node in (e.src, e.dst), (
+                f"demand {d.id}: edge {eid} ({e.src}-{e.dst}) does not "
+                f"continue the walk at node {node}"
+            )
+            node = e.dst if node == e.src else e.src
+        assert node == d.dst
+
+        # Unordered image == path_indicator.
+        indicator_ids = set(path_indicators[d.id].nonzero().flatten().tolist())
+        assert set(flat) == indicator_ids
+        assert len(flat) == len(set(flat)), "Dijkstra paths are simple"
+
+
+def test_segment_edge_ids_group_count_matches_num_segments():
+    """One group per transparent segment: the grouping is what aligns
+    seg_gsnr_db[k] with a stretch of the route."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+
+    with torch.no_grad():
+        _, _, _, alloc = pipeline(demands, tau=1.0)
+
+    for row, d in enumerate(demands):
+        assert len(alloc.segment_edge_ids[d.id]) == int(alloc.num_segments[row])
+
+
+def test_hard_rollout_from_soft_carries_segment_edge_ids_through():
+    """Routing and segmentation never depend on hard_alloc, so the hard
+    record must carry the SAME route object. Without this the deployed
+    record comes back with the field empty and every frame loses its map."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+
+    with torch.no_grad():
+        _, _, _, soft = pipeline(demands, tau=1.0)
+        _, hard = pipeline.hard_rollout_from_soft(demands, soft)
+
+    assert hard.segment_edge_ids == soft.segment_edge_ids
+    assert hard.segment_edge_ids  # not silently empty
+
+
+def test_segment_edge_ids_is_empty_for_no_demands():
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    with torch.no_grad():
+        _, _, _, alloc = pipeline([], tau=1.0)
+        _, hard = pipeline.hard_rollout_from_soft([], alloc)
+    assert alloc.segment_edge_ids == {}
+    assert hard.segment_edge_ids == {}

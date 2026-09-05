@@ -328,6 +328,8 @@ class _DummyAlloc:
         self.num_segments = torch.tensor([2])
         self.boundary_node_ids = torch.tensor([[3]])
         self.demand_ids = [0]
+        # One demand, two segments, one boundary at node 3 — so two groups.
+        self.segment_edge_ids = {0: [[0], [1]]}
         self.ste_clamped_segments = 0
         self.proxy_qot_rank_corr = 1.0
 
