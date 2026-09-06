@@ -50,7 +50,7 @@ class DijkstraSurrogate(torch.autograd.Function):
         path = torch.tensor(path_np, dtype=torch.float32, device=edge_weights.device)
 
         # Save tensors and scalars for backward
-        ctx.save_for_backward(edge_weights, edge_index, path)
+        ctx.save_for_backward(edge_weights)
         ctx._src = src
         ctx._dst = dst
         ctx._num_nodes = num_nodes
@@ -59,6 +59,11 @@ class DijkstraSurrogate(torch.autograd.Function):
         # repeats a .detach().cpu().numpy() per demand per step for a
         # tensor that is a registered buffer and never changes.
         ctx._ei_np = ei_np
+        # Backward also needs the same numpy edge_weights and path arrays;
+        # cache them for the same reason (avoid a redundant
+        # .detach().cpu().numpy() round-trip per demand per step).
+        ctx._w_np = w_np
+        ctx._path_np = path_np.astype(np.float64)
 
         # ordered_edges is a plain list, not a Tensor: autograd passes it
         # through untouched and calls backward() with None in its slot
@@ -68,14 +73,14 @@ class DijkstraSurrogate(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, _grad_ordered_edges=None):
-        edge_weights, edge_index, path = ctx.saved_tensors
+        (edge_weights,) = ctx.saved_tensors
         src = ctx._src
         dst = ctx._dst
         num_nodes = ctx._num_nodes
         lambda_ = ctx._lambda
 
         # Perturbed weights: c_target = w + lambda * grad_output
-        w_np = edge_weights.detach().cpu().numpy().astype(np.float64)
+        w_np = ctx._w_np
         g_np = grad_output.detach().cpu().numpy().astype(np.float64)
 
         # Vlastelica (ICLR 2020, Theorem 3.1): perturb by +λ*ŷ where ŷ = -∂L/∂z.
@@ -87,9 +92,9 @@ class DijkstraSurrogate(torch.autograd.Function):
         path_target_np = spfa(c_target, ctx._ei_np, src, dst, num_nodes)
         if path_target_np is None:
             # If perturbed graph has no path, use zero gradient
-            path_target_np = path.detach().cpu().numpy().astype(np.float64)
+            path_target_np = ctx._path_np
 
-        path_star = path.detach().cpu().numpy().astype(np.float64)
+        path_star = ctx._path_np
 
         # Surrogate gradient: -(1/lambda) * (path_star - path_target)
         grad_weights_np = -(1.0 / lambda_) * (path_star - path_target_np.astype(np.float64))
