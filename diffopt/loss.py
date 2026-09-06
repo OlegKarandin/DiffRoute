@@ -200,14 +200,20 @@ def compute_loss(
             [modulation_config.required_snr_threshold(demand.bitrate_gbps)
              for demand in demands],
             dtype=torch.float64,
+            device=device,
         )
-        # One materialization (one device sync) instead of ~3 per demand.
-        diag = torch.cat([
-            (shortfall.detach() > 0).to(torch.float64),
-            gsnr_stacked.detach().double().cpu() - thresholds,
-        ]).cpu()
-        n = len(demands)
-        violated_flags, margins = diag[:n], diag[n:]
+        # Two materializations (two device syncs, still O(1) not O(D) as in
+        # the old per-demand loop). Kept as separate `.cpu()` calls rather
+        # than concatenated into one tensor: `violated_flags` (boolean-as-
+        # float64) and `margins` (dB) are semantically unrelated quantities,
+        # and cat-ing them together previously hid a device mismatch (the
+        # first operand stayed on `device`, e.g. cuda, while the second was
+        # forced to cpu before the subtraction) that crashed `torch.cat` on
+        # any CUDA run. Doing the subtraction on-device first, then moving
+        # each result to cpu independently, keeps every tensor's device
+        # explicit and correct.
+        violated_flags = (shortfall.detach() > 0).to(torch.float64).cpu()
+        margins = (gsnr_stacked.detach().double() - thresholds).cpu()
         num_violated = int(violated_flags.sum().item())
         num_infeasible = int((margins < 0).sum().item())
         worst_margin_db = margins.min().item()
