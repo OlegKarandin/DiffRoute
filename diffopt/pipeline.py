@@ -164,9 +164,6 @@ class AllocationOutputs:
                                        # segments; drift toward 0 means the
                                        # STE gradient disagrees with the
                                        # forward value about segment ordering
-    waste_cost: torch.Tensor          # scalar, sum_{d,k} a_priced*relu(f4),
-                                       # .detach()ed from n_next — see
-                                       # AllocationHead.rollout
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +742,7 @@ class DiffONetPipeline(nn.Module):
             # other, i.e. a soft/hard divergence no test would catch.
             ctx = torch.no_grad() if hard_alloc else contextlib.nullcontext()
             with ctx:
-                a, a_physics, waste_cost = self.allocation_head.rollout(
+                a, a_physics = self.allocation_head.rollout(
                     seg_noise,
                     seg_km_matrix,
                     bar_db,
@@ -796,7 +793,6 @@ class DiffONetPipeline(nn.Module):
                 segment_edge_ids=demand_segments,
                 ste_clamped_segments=clamped,
                 proxy_qot_rank_corr=rank_corr,
-                waste_cost=waste_cost,
             )
         else:
             # No demands: every per-demand tensor is empty in its row
@@ -819,7 +815,6 @@ class DiffONetPipeline(nn.Module):
                 segment_edge_ids={},
                 ste_clamped_segments=clamped,
                 proxy_qot_rank_corr=rank_corr,
-                waste_cost=torch.zeros((), device=device),
             )
 
         return path_noise_costs, gsnr_preds, path_indicators, alloc_outputs
@@ -871,7 +866,6 @@ class DiffONetPipeline(nn.Module):
                 segment_edge_ids={},
                 ste_clamped_segments=alloc.ste_clamped_segments,
                 proxy_qot_rank_corr=alloc.proxy_qot_rank_corr,
-                waste_cost=torch.zeros((), device=device),
             )
             return {}, hard_outputs
 
@@ -880,7 +874,7 @@ class DiffONetPipeline(nn.Module):
         ).to(device)
 
         with torch.no_grad():
-            a, a_physics, waste_cost = self.allocation_head.rollout(
+            a, a_physics = self.allocation_head.rollout(
                 alloc.seg_noise, alloc.seg_km_matrix, bar_db, alloc.num_segments,
                 tau=tau, hard=True,
             )
@@ -918,6 +912,5 @@ class DiffONetPipeline(nn.Module):
             segment_edge_ids=alloc.segment_edge_ids,
             ste_clamped_segments=alloc.ste_clamped_segments,
             proxy_qot_rank_corr=alloc.proxy_qot_rank_corr,
-            waste_cost=waste_cost,
         )
         return gsnr_preds, hard_outputs

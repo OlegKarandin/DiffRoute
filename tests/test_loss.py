@@ -72,7 +72,6 @@ def test_metrics_dict_has_the_keys_train_py_logs(simple_loss_inputs):
         "num_violated",
         "worst_margin_db",
         "shortfalls",
-        "waste_cost",
     ):
         assert key in metrics, f"missing metrics key: {key}"
 
@@ -287,27 +286,6 @@ def test_no_regen_probs_parameter_survives(simple_loss_inputs):
     assert "regen_probs" not in params
     assert "lambda_regen" not in params
     assert "regen_count_penalty" not in params
-
-
-# ---------------------------------------------------------------------------
-# waste_cost — logged diagnostic only (open_followups.md item #8: the
-# lambda_waste weight was removed, since it improves the mean over-buy and
-# still loses on the metric that matters, the best feasible epoch).
-# ---------------------------------------------------------------------------
-
-def test_waste_cost_is_diagnostic_only_and_never_changes_the_total(simple_loss_inputs):
-    """waste_cost must be logged in metrics but must never move total,
-    whatever value it carries — it has no weight to multiply by anymore."""
-    no_waste_args, no_waste_metrics = compute_loss(**simple_loss_inputs)
-
-    with_waste, with_waste_metrics = compute_loss(
-        **simple_loss_inputs,
-        waste_cost=torch.tensor(123.456),
-    )
-
-    assert torch.equal(no_waste_args, with_waste)
-    assert no_waste_metrics["waste_cost"] == pytest.approx(0.0)
-    assert with_waste_metrics["waste_cost"] == pytest.approx(123.456)
 
 
 # ---------------------------------------------------------------------------

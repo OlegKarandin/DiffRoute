@@ -374,7 +374,6 @@ class _DummyAlloc:
         self.alloc_by_node = torch.zeros(1, n)
         self.alloc_by_node[0, 3] = a_value
         self.device_count = self.a.sum()
-        self.waste_cost = torch.zeros(())
         self.site_view = self.alloc_by_node.max(dim=0).values
         self.seg_gsnr_db = torch.full((1, 2), 30.0)
         self.seg_noise = torch.full((1, 2), 1.0e-3)
@@ -567,7 +566,6 @@ def _run_training(tmp_path, *, epochs: int = 1, scripted=None, monkeypatch=None,
             # to tell the two apart, and both are all-zeros in the real
             # feasible case.
             "constraint_g": torch.full((1,), -3.0),
-            "waste_cost": 0.0,
         }
         return loss, metrics
 
@@ -806,7 +804,7 @@ def test_log_csv_header_is_device_priced(tmp_path):
         "tau", "vlastelica_lambda", "lr_alloc",
         "alloc_score_mean", "alloc_score_min", "alloc_score_max",
         "lookahead",
-        "route_context", "waste_cost",
+        "route_context",
         "ste_clamped_segments", "proxy_qot_rank_corr",
         "alloc_dead_frac", "alloc_grad_norm",
     ]

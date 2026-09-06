@@ -40,7 +40,6 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # Feature layout, spec 2.1. Order is load-bearing: LOOKAHEAD_COLS indexes it,
@@ -146,7 +145,7 @@ class AllocationHead(nn.Module):
         *,
         tau: float = 1.0,
         hard: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk every demand's boundaries, vectorized across demands.
 
         Roughly J_max Python iterations per call (about 12 on
@@ -169,18 +168,9 @@ class AllocationHead(nn.Module):
                           the rollout is self-consistent physics. Spec 2.5.
 
         Returns:
-            (a_priced, a_physics, waste). a_priced/a_physics are both
-            (D, J-1): a_priced is what lambda_dev multiplies, a_physics is
-            what the combiner folds and what resets the carry. waste is a scalar,
-            sum_{d,k} a_priced[d,k] * relu(feature4[d,k]), masked by
-            cut_valid. Only the relu(feature4) COEFFICIENT is
-            gradient-detached, per this module's carry-as-observation
-            invariant (deviation 1 in the task-6 brief: an undetached
-            relu(feature4) would still carry gradient into n_next even
-            though the carry cd is already detached, rewarding routing onto
-            noisier next segments) — the priced allocation a_k that
-            multiplies it is NOT detached, and legitimately carries gradient
-            into n_next/routing via its own dependence on score.
+            (a_priced, a_physics). Both are (D, J-1): a_priced is what
+            lambda_dev multiplies, a_physics is what the combiner folds and
+            what resets the carry.
         """
         d, j = seg_noise.shape
         device = seg_noise.device
@@ -201,7 +191,6 @@ class AllocationHead(nn.Module):
         km_since = torch.zeros(d, dtype=dtype, device=device)
         km_done = torch.zeros(d, dtype=dtype, device=device)
         max_chunk = torch.zeros(d, dtype=dtype, device=device)
-        waste = torch.zeros((), dtype=dtype, device=device)
 
         priced_cols = []
         physics_cols = []
@@ -274,8 +263,6 @@ class AllocationHead(nn.Module):
                 a_k = torch.sigmoid(s / tau)
             a_k = a_k * cut_valid[:, k]
 
-            waste = waste + (a_k * F.relu(g_after - bar_db).detach()).sum()
-
             priced_cols.append(a_k)
             physics_cols.append(a_k)
             score_cols.append(s.detach())
@@ -292,10 +279,10 @@ class AllocationHead(nn.Module):
 
         if priced_cols:
             self.last_scores = torch.stack(score_cols, dim=1)
-            return torch.stack(priced_cols, dim=1), torch.stack(physics_cols, dim=1), waste
+            return torch.stack(priced_cols, dim=1), torch.stack(physics_cols, dim=1)
         empty = torch.zeros(d, 0, dtype=dtype, device=device)
         self.last_scores = empty
-        return empty, empty, torch.zeros((), dtype=dtype, device=device)
+        return empty, empty
 
 
 def total_device_cost(alloc_by_node: torch.Tensor) -> torch.Tensor:

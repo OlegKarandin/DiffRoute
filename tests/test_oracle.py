@@ -144,7 +144,7 @@ def test_greedy_weights_reproduce_the_oracle():
     nseg = torch.full((16,), 6, dtype=torch.long)
     seg_noise = 10.0 ** (-seg_db / 10.0)
 
-    a_head, _, _ = head.rollout(seg_noise, torch.zeros(16, 6), bar, nseg, hard=True)
+    a_head, _ = head.rollout(seg_noise, torch.zeros(16, 6), bar, nseg, hard=True)
     expected = oracle_allocation(seg_db, bar, nseg)
     assert torch.equal(a_head, expected.a)
 

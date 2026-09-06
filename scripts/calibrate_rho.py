@@ -187,7 +187,6 @@ def _trial_run(
             margin_db=c_cfg["margin_db"],
             lambda_dev=p_cfg["lambda_dev"],
             lambda_cost=p_cfg["lambda_cost"],
-            waste_cost=alloc.waste_cost,
             rho=rho,
         )
 

@@ -52,7 +52,7 @@ def test_carry_under_hard_decisions_is_the_true_chunk_noise():
     bar = torch.tensor([9.5])
     nseg = torch.tensor([3])
 
-    a, a_phys, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    a, a_phys = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
     assert torch.equal(a, torch.ones(1, 2))
     assert torch.equal(a, a_phys)
     # every boundary cut -> every chunk is a single segment
@@ -66,7 +66,7 @@ def test_no_cut_accumulates_the_whole_path():
         head.net[-1].bias.fill_(-50.0)           # score << 0 -> never cut
     seg_db = torch.tensor([[12.0, 9.0, 20.0]])
     seg_noise = db_to_linear_noise(seg_db)
-    a, _, _ = head.rollout(
+    a, _ = head.rollout(
         seg_noise, torch.ones(1, 3), torch.tensor([9.5]), torch.tensor([3]), hard=True
     )
     assert torch.equal(a, torch.zeros(1, 2))
@@ -88,7 +88,7 @@ def test_padding_and_masking_at_the_edges(k):
     head = AllocationHead()
     with torch.no_grad():
         head.net[-1].bias.fill_(50.0)            # always cut where allowed
-    a, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    a, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
 
     assert torch.isfinite(a).all()
     assert torch.equal(a[:, : max(k - 1, 0)], torch.ones(d, max(k - 1, 0)))
@@ -99,7 +99,7 @@ def test_single_segment_demand_has_no_decisions_and_no_nan():
     """K_d = 0: one segment, zero boundaries. The trailing chunk is not a
     decision (spec 2.1), so a is all-zero and nothing divides by zero."""
     head = AllocationHead()
-    a, _, _ = head.rollout(
+    a, _ = head.rollout(
         torch.tensor([[0.5, 0.0, 0.0]]),
         torch.tensor([[100.0, 0.0, 0.0]]),
         torch.tensor([9.5]),
@@ -175,7 +175,7 @@ def test_rollout_is_differentiable_in_seg_noise():
     with torch.no_grad():
         head.net[-1].weight.normal_(std=0.5)
     seg_noise = (torch.rand(3, 5) + 0.01).requires_grad_(True)
-    a, _, _ = head.rollout(
+    a, _ = head.rollout(
         seg_noise, torch.rand(3, 5) * 100,
         torch.full((3,), 9.5), torch.full((3,), 5, dtype=torch.long),
     )
@@ -217,7 +217,7 @@ def test_km_since_cut_resets_on_a_physics_cut():
     bar = torch.tensor([9.5])
     nseg = torch.tensor([3])
 
-    a, a_phys, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    a, a_phys = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
     assert torch.equal(a, torch.tensor([[1.0, 0.0]]))
     assert torch.equal(a, a_phys)
 
@@ -240,7 +240,7 @@ def test_first_segment_has_no_device_gradient_because_the_carry_is_detached():
     with torch.no_grad():
         head.net[-1].weight.normal_(std=0.5)
     seg_noise = (torch.rand(3, 5) + 0.01).requires_grad_(True)
-    a, _, _ = head.rollout(
+    a, _ = head.rollout(
         seg_noise, torch.rand(3, 5) * 100,
         torch.full((3,), 9.5), torch.full((3,), 5, dtype=torch.long),
     )
@@ -252,161 +252,6 @@ def test_first_segment_has_no_device_gradient_because_the_carry_is_detached():
     # ...and the fix must not have killed route-differentiability outright:
     # the later columns still reach the score via g_next / g_after's n_next.
     assert seg_noise.grad[:, 1:].abs().sum().item() > 0
-
-
-# ---------------------------------------------------------------------------
-# Waste surcharge (arm 4, spec 5.3) — task-6-brief.md section 9, tests 5-7
-# ---------------------------------------------------------------------------
-
-def test_waste_is_zero_when_every_cut_is_justified():
-    """§9 test 5. Hand-built case where every cut sits at feature4 <= 0
-    (i.e. every cut is genuinely needed to stay feasible): waste must be
-    exactly 0, since `relu(feature4) == 0` at every boundary that fires.
-
-    Reuses test_carry_under_hard_decisions_is_the_true_chunk_noise's own
-    construction (forced cuts everywhere via bias=50.0, seg_db=[12, 9, 20],
-    bar=9.5): hand-verified below that feature4 is negative at BOTH real
-    boundaries under that same input (-2.264 and -0.832 dB), so this is not
-    a new hand-built case, it is the existing one re-read for a property it
-    already happens to satisfy.
-    """
-    head = AllocationHead()
-    with torch.no_grad():
-        head.net[-1].bias.fill_(50.0)          # score >> 0 -> always cut
-    seg_db = torch.tensor([[12.0, 9.0, 20.0]])
-    seg_noise = db_to_linear_noise(seg_db)
-    seg_km = torch.tensor([[300.0, 400.0, 500.0]])
-    bar = torch.tensor([9.5])
-    nseg = torch.tensor([3])
-
-    a, a_phys, waste = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
-    assert torch.equal(a, torch.ones(1, 2))    # both boundaries did cut
-    assert waste.item() == 0.0                 # both cuts were justified
-
-
-def test_waste_equals_hand_computed_surcharge():
-    """§9 test 6. A hand-built (seg_noise, bar) pair whose waste value is
-    computed independently (float64 `math.log10`, not the module under
-    test) and asserted against.
-
-    JUDGMENT CALL (see task-6-report.md): the plan's own trajectory
-    (f4 = [+0.096, -0.209, +7.500, +5.739, +7.958]) cannot be reproduced
-    without knowing the exact seg_db draw the plan's author used, which is
-    not recoverable from the brief text alone -- reconstructing it would
-    require guessing a specific random seed or hand-tuned dB sequence. This
-    test instead uses a SELF-CONSISTENT hand-derived construction with the
-    same mechanism: reuses test_km_since_cut_resets_on_a_physics_cut's exact
-    weight surgery (identity first two layers, w[0, 5] = 1e6, threshold at
-    km_since/KM_SCALE == 0.15) so the cut PATTERN is driven entirely by
-    feature 5 and is provably independent of feature 4's value, then picks
-    seg_noise so that boundary 1 (which cuts) has feature4 < 0 (justified,
-    contributes 0) and boundary 3 (which also cuts) has feature4 > 0
-    (wasteful, contributes its own value) -- the same qualitative shape the
-    plan's own trajectory has, verified against a hand computation using
-    `math.log10` at full float64 precision, independent of this module.
-    """
-    head = AllocationHead()
-    with torch.no_grad():
-        w = torch.zeros(1, head.net[-1].weight.shape[1])
-        w[0, 5] = 1.0e6
-        head.net[-1].weight.copy_(w)
-        head.net[0].weight.zero_()
-        head.net[0].weight[:ALLOC_FEATURE_DIM, :].copy_(torch.eye(ALLOC_FEATURE_DIM))
-        head.net[0].bias.fill_(50.0)       # keep ReLU in its linear region
-        head.net[2].weight.zero_()
-        head.net[2].weight.copy_(torch.eye(head.net[2].weight.shape[0]))
-        head.net[2].bias.zero_()
-        offset = (-w @ torch.full((w.shape[1], 1), 50.0)).squeeze()
-        head.net[-1].bias.copy_(offset - 0.15 * w[0, 5])
-
-    # Hand-picked so the km_since surgery (independent of these values --
-    # only feature 5, i.e. seg_km, drives the decision) produces cuts at
-    # boundaries {1, 3}: a = [[0, 1, 0, 1, 0]]. Verified by hand (float64
-    # math.log10) that feature4[1] = -5.5206 (justified, cuts anyway because
-    # km_since forces it) and feature4[3] = +3.3400 (wasteful): waste should
-    # equal exactly feature4[3]'s relu, i.e. ~3.3400.
-    seg_noise = torch.tensor([[0.05, 0.30, 0.05, 0.001, 0.001, 0.01]])
-    seg_km = torch.full((1, 6), 100.0)
-    bar = torch.tensor([9.5])
-    nseg = torch.tensor([6])
-
-    a, a_phys, waste = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
-    assert torch.equal(a, torch.tensor([[0.0, 1.0, 0.0, 1.0, 0.0]]))
-    # Hand-computed via float64 math.log10, independently of this module:
-    #   f4[1] = -10*log10(0.35+0.05) - 9.5 = -5.52059991329048  -> relu = 0
-    #   f4[3] = -10*log10(0.051+0.001) - 9.5 = 3.33996656356849 -> relu = f4[3]
-    #   waste = 0 + 3.33996656356849 = 3.33996656356849
-    assert waste.item() == pytest.approx(3.33996656356849, abs=1e-3)
-
-    # Pad to J=8 with num_segments=6: boundaries 5 and 6 (0-indexed, both at
-    # or past the real 5 boundaries) must contribute EXACTLY 0, since
-    # cut_valid masks a_k there to 0 regardless of feature4's value (which
-    # is large-but-finite there, since n_next is padded to 0).
-    seg_noise8 = torch.cat([seg_noise, torch.zeros(1, 2)], dim=1)
-    seg_km8 = torch.cat([seg_km, torch.zeros(1, 2)], dim=1)
-    a8, a_phys8, waste8 = head.rollout(seg_noise8, seg_km8, bar, nseg, hard=True)
-    assert torch.equal(a8[:, :5], a)
-    assert torch.equal(a8[:, 5:], torch.zeros(1, 2))
-    assert waste8.item() == pytest.approx(waste.item(), abs=1e-6)
-
-    # num_segments = 1: zero real boundaries, but the loop still computes
-    # feature4 at boundary 0 with n_next padded to 0 -- large but finite,
-    # and zeroed by cut_valid (a_k == 0 there), not nan/inf.
-    head_1seg = AllocationHead()
-    a_1seg, _, waste_1seg = head_1seg.rollout(
-        torch.tensor([[0.5, 0.0, 0.0]]),
-        torch.tensor([[100.0, 0.0, 0.0]]),
-        torch.tensor([9.5]),
-        torch.tensor([1]),
-        hard=True,
-    )
-    assert torch.equal(a_1seg, torch.zeros(1, 2))
-    assert torch.isfinite(waste_1seg)
-
-
-def test_waste_gradient_pushes_a_wasteful_cut_down():
-    """§9 test 7. d(waste)/d(score) is strictly positive at a wasteful
-    (feature4 > 0) boundary and EXACTLY zero at a justified (feature4 < 0)
-    boundary, because `relu(feature4).detach()` is a frozen constant
-    multiplying a_k in the waste sum: a justified boundary's constant is
-    exactly 0, so its gradient contribution must be exactly 0 too, not
-    merely small.
-
-    JUDGMENT CALL (see task-6-report.md): probes this via `net[-1].bias`
-    under the DEFAULT (untrained) init rather than a hand-built weight
-    matrix, because default init has `net[-1].weight == 0` exactly, so
-    `score == net[-1].bias` for every feature vector with no chain rule
-    through the features at all -- `net[-1].bias.grad` after
-    `waste.backward()` IS `d(waste)/d(score)`, directly, for a single-
-    boundary rollout. Two separate single-demand, single-boundary rollouts
-    (fresh head + fresh graph each, so the two contributions are never
-    summed into the same backward pass) isolate the wasteful and the
-    justified case.
-    """
-    # Wasteful: tiny noise on both segments -> GSNR after the next segment
-    # is still far above a low bar -> feature4 >> 0 -> the cut (which the
-    # closed init makes at a ~ sigmoid(-3) ~ 0.047, an interior probability
-    # under a soft rollout) was not needed.
-    wasteful_head = AllocationHead()
-    _, _, waste_wasteful = wasteful_head.rollout(
-        torch.tensor([[0.001, 0.001]]), torch.tensor([[100.0, 100.0]]),
-        torch.tensor([5.0]), torch.tensor([2]), hard=False,
-    )
-    waste_wasteful.backward()
-    assert wasteful_head.net[-1].bias.grad is not None
-    assert wasteful_head.net[-1].bias.grad.item() > 0.0
-
-    # Justified: large noise on both segments against a high bar -> GSNR
-    # after the next segment would be below the bar without a cut ->
-    # feature4 << 0 -> the cut was genuinely needed.
-    justified_head = AllocationHead()
-    _, _, waste_justified = justified_head.rollout(
-        torch.tensor([[0.5, 0.5]]), torch.tensor([[100.0, 100.0]]),
-        torch.tensor([20.0]), torch.tensor([2]), hard=False,
-    )
-    waste_justified.backward()
-    assert justified_head.net[-1].bias.grad is not None
-    assert justified_head.net[-1].bias.grad.item() == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +288,8 @@ def test_alloc_ste_forward_equals_the_hard_decision():
         head.net[-1].bias.zero_()
     seg_noise, seg_km, bar, nseg = _four_segment_demand()
 
-    a_ste, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, tau=1.0)
-    a_hard, _, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    a_ste, _ = head.rollout(seg_noise, seg_km, bar, nseg, tau=1.0)
+    a_hard, _ = head.rollout(seg_noise, seg_km, bar, nseg, hard=True)
 
     assert set(a_ste.detach().unique().tolist()) <= {0.0, 1.0}
     assert torch.equal(a_ste.detach(), a_hard)
@@ -465,7 +310,7 @@ def test_alloc_ste_backward_slope_is_the_sigmoid_surrogate():
     tau = 0.7
     head = AllocationHead(alloc_ste=True)
     seg_noise = db_to_linear_noise(torch.tensor([[12.0, 9.0, 20.0]]))
-    a, _, _ = head.rollout(
+    a, _ = head.rollout(
         seg_noise, torch.tensor([[300.0, 400.0, 500.0]]),
         torch.tensor([9.5]), torch.tensor([3]), tau=tau,
     )
@@ -484,7 +329,7 @@ def test_alloc_ste_defaults_off_and_is_a_true_no_op():
     head = AllocationHead()
     assert head.alloc_ste is False
     seg_noise = db_to_linear_noise(torch.tensor([[12.0, 9.0, 20.0]]))
-    a, _, _ = head.rollout(
+    a, _ = head.rollout(
         seg_noise, torch.tensor([[300.0, 400.0, 500.0]]),
         torch.tensor([9.5]), torch.tensor([3]), tau=0.8,
     )
@@ -505,12 +350,11 @@ def test_alloc_ste_does_not_touch_the_hard_branch():
     ste.load_state_dict(plain.state_dict())
     seg_noise, seg_km, bar, nseg = _four_segment_demand()
 
-    a_plain, phys_plain, w_plain = plain.rollout(seg_noise, seg_km, bar, nseg, hard=True)
-    a_ste, phys_ste, w_ste = ste.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    a_plain, phys_plain = plain.rollout(seg_noise, seg_km, bar, nseg, hard=True)
+    a_ste, phys_ste = ste.rollout(seg_noise, seg_km, bar, nseg, hard=True)
 
     assert torch.equal(a_plain, a_ste)
     assert torch.equal(phys_plain, phys_ste)
-    assert torch.equal(w_plain, w_ste)
 
 
 def test_last_scores_records_the_walk_on_real_and_padded_columns():

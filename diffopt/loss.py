@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -23,7 +23,6 @@ def compute_loss(
     margin_db: float = 0.5,
     lambda_dev: float = 1.0,
     lambda_cost: float = 0.01,
-    waste_cost: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the constrained training loss.
 
@@ -102,14 +101,6 @@ def compute_loss(
                       scripts/calibrate_lambda_dev.py; do not hand-tune.
         lambda_cost:  Weight on the ASE-denominated path-noise regulariser. Not the
                       primary routing signal -- the STE in pipeline.forward supplies that.
-        waste_cost:   Scalar `AllocationOutputs.waste_cost` —
-                      sum_{d,k} a_priced[d,k] * relu(feature4[d,k]), live in
-                      the autograd graph but gradient-detached from
-                      n_next/routing per `AllocationHead.rollout`'s own
-                      docstring (only the priced allocation's own dependence
-                      on the score carries gradient). Logged as a diagnostic
-                      only — it carries no weight in the total loss. None
-                      (the default) logs 0.0.
         rho:          Augmented-Lagrangian penalty coefficient, and ALSO the
                       dual step: `update_duals` is called with `eta=rho`,
                       which is gradient ascent on the dual function with a
@@ -193,8 +184,6 @@ def compute_loss(
     # (bare sum() returns int 0, and .item() below would then raise).
     path_noise_loss = sum(path_noise_costs.values(), torch.zeros((), device=device))
 
-    waste_term = waste_cost if waste_cost is not None else torch.zeros((), device=device)
-
     total = (
         weighted_feasibility
         + lambda_dev * device_count
@@ -205,7 +194,6 @@ def compute_loss(
         "feasibility_loss": feasibility_loss.item(),
         "weighted_feasibility_loss": weighted_feasibility.item(),
         "path_noise_loss": path_noise_loss.item(),
-        "waste_cost": float(waste_term.item()),
         # The soft (mean-field) device count. NOT tau-invariant the way the
         # old num_regen_soft was — sigmoid(score/tau) moves with tau even on
         # frozen scores — so this is a within-epoch diagnostic only. The

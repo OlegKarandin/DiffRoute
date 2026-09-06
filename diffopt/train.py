@@ -609,7 +609,7 @@ def main() -> None:
             "tau", "vlastelica_lambda", "lr_alloc",
             "alloc_score_mean", "alloc_score_min", "alloc_score_max",
             "lookahead",
-            "route_context", "waste_cost",
+            "route_context",
             "ste_clamped_segments", "proxy_qot_rank_corr",
             "alloc_dead_frac", "alloc_grad_norm",
         ])
@@ -652,7 +652,6 @@ def main() -> None:
                 margin_db=c_cfg["margin_db"],
                 lambda_dev=p_cfg["lambda_dev"],
                 lambda_cost=p_cfg["lambda_cost"],
-                waste_cost=alloc.waste_cost,
                 rho=rho,
             )
 
@@ -747,7 +746,6 @@ def main() -> None:
                 f"{score_max:.6f}",
                 lookahead,
                 route_context,
-                f"{metrics['waste_cost']:.6f}",
                 alloc.ste_clamped_segments,
                 f"{alloc.proxy_qot_rank_corr:.4f}",
                 f"{dead_frac:.6f}",
