@@ -86,6 +86,21 @@ sections; nothing below has been reworded in the move.
 - `padding_mask` convention: `True` = real span, `False` = padding. This is the **opposite** of PyTorch `TransformerEncoder`'s `src_key_padding_mask` (the bridge inverts internally).
 - `max_spans = 60` is a hard architecture parameter; changing it requires regenerating all datasets and retraining.
 - No regenerator-related inputs in the model. The QoT model is deliberately unaware of placement.
+- **One QoT surrogate is reused across topologies.** `checkpoints/best_qot.pt`
+  (trained on `ind_132` via `base.yaml`) is also the `qot_checkpoint` for
+  `constrained_realistic.yaml`, `small_test.yaml`, `small_test_ind132.yaml`,
+  and `small_test_jp70.yaml` — safe because `SpanAttentionQoT` consumes
+  per-span physical features (length, fiber type, noise figure, span count,
+  loading), not topology identity.
+  The limit: cross-topology GSNR accuracy is unmeasured. Of those four, only
+  `small_test.yaml` (`topology: configs/topology/german_17.json`) and
+  `small_test_jp70.yaml` (`topology: configs/topology/jp_70.json`) are
+  actually cross-topology reuse; `constrained_realistic.yaml` and
+  `small_test_ind132.yaml` both carry `topology: configs/topology/ind_132.json`
+  — the SAME topology the checkpoint was trained on, just a different
+  traffic scenario, so those two are not a cross-topology test at all. The
+  two that genuinely are cross-topology are pipeline-mechanics smoke tests,
+  not accuracy benchmarks.
 
 ## GNPy bridge
 

@@ -75,6 +75,11 @@ pipeline:
 
 placement:
   lookahead: true
+  # STE: the training forward pass takes the DEPLOYED decision, so the
+  # relaxation and hard_rollout cannot disagree about who is feasible. See
+  # configs/experiment/constrained_stress.yaml's placement.alloc_ste comment
+  # for the measured phantom-violation failure mode this avoids.
+  alloc_ste: true
 
 # Fixed traffic matrix. Regenerates deterministically from
 # (topology, seed, scale, alpha) — nothing is committed; the checksum is
@@ -93,17 +98,22 @@ constraint:
   margin_db: 0.5          # delta, added to the bar
   dual_init: 0.0          # lambda_0 — cold start (spec section 3): every
                           # dual starts at 0 under the augmented penalty
-  # rho — the augmented penalty coefficient and the dual step. compute_loss
-  # requires rho > 0 unconditionally (open_followups.md item #8 removed the
-  # hinge penalty, which needed no rho); 0.0 here is a PLACEHOLDER that
-  # fails loudly rather than silently. MEASURE it with
+  # rho — the augmented penalty coefficient and the dual step —
+  # MEASURED 2026-09-06 by
   #   python -m scripts.calibrate_rho --config configs/experiment/constrained_realistic.yaml
-  # before running this config — see constrained_stress.yaml's rho comment
-  # for a worked example (rho: 0.310338 there, measured on that topology).
-  # This config is designed to stay slack (item #5): zero regenerators
-  # placed the entire run, so rho may end up not mattering much in
-  # practice, but it still gates compute_loss.
-  rho: 0.0
+  # device push 3.1706e+02, unit (linear, un-relu'd) feasibility push
+  # 4.2035e+03 -> lambda* = lambda_dev / s = 0.075429 -> rho = lambda* /
+  # 0.35 dB = 0.215511 (ceiling 10*lambda* = 0.754289, not binding).
+  # Confirmatory trial (20 epochs, augmented): violated max=0 final=0,
+  # last-10 violated max=0 zero_in=10/10, gap min=0 final=0, devices
+  # final=0 oracle=0, lambda_max=0.000. This config is designed to stay
+  # slack (item #5), which the confirmatory trial's own devices=0 result
+  # is consistent with. Re-run the script if the physics, the topology,
+  # lambda_dev or margin_db changes.
+  # CAVEAT: the calibration ceiling (CEILING_MULTIPLE = 10.0 in
+  # scripts/calibrate_rho.py) was derived under Adam and has not been
+  # re-derived under SGD — an open caveat, not a blocker.
+  rho: 0.215511
   dual_max: 1000.0        # lambda_max — a diagnostic cap, not tuned
 
 training:
@@ -112,20 +122,25 @@ training:
   # the total excursion is lr * epochs_e2e" — was about a single free logit
   # per node. The allocation head is an MLP over route-local features, so no
   # such excursion budget applies; this value is inherited, not re-derived.
-  lr_alloc: 2.0e-2         # was lr_regen
+  # MEASURED under SGD (not the 2.0e-2 the config used to carry, which was
+  # calibrated against Adam's normalised step and is ~40x too high for the
+  # SGD allocation optimizer). See constrained_stress.yaml's lr_alloc
+  # comment for the sweep this value came from.
+  lr_alloc: 0.0005         # was lr_regen
+  # Grad-norm cap on the allocation head. See constrained_stress.yaml's
+  # alloc_grad_clip comment.
+  alloc_grad_clip: 100.0
   epochs_e2e: 60
   vlastelica_lambda: 10.0
   vlastelica_lambda_min: 1.0
   vlastelica_lambda_decay: 0.995
   alloc_tau_start: 1.0
-  # tau_end was 0.1 and the anneal ended at epoch 40 -- the same pair that
-  # collapsed training on constrained_stress's 60-epoch run (irreversible
-  # float32 sigmoid underflow once scores drift past the tau=0.1 usable band
-  # of |s| < 0.5). Propagated here unchanged, since this config shares that
-  # config's exact epochs_e2e (60) and original anneal window (10/40). See
-  # docs/investigations/open_followups.md, "Stage II acceptance run", and
-  # .superpowers/sdd/2026-08-24-per-demand-allocation-head/task12-investigation.md
-  # (fix B).
-  alloc_tau_end: 0.3
+  # Pinned to alloc_tau_start, not annealed: under alloc_ste tau has no
+  # forward job left (the forward decision is the deployed one), so
+  # annealing it only sharpens the backward surrogate and starves every
+  # boundary whose score isn't already near 0 — train.py warns if an
+  # alloc_ste config leaves these two different. See constrained_stress.yaml's
+  # alloc_tau_end comment for the full reasoning.
+  alloc_tau_end: 1.0
   alloc_tau_anneal_start_epoch: 10
-  alloc_tau_anneal_end_epoch: 55   # companion to tau_end, same reasoning
+  alloc_tau_anneal_end_epoch: 55   # inert while tau_start == tau_end
