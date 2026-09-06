@@ -1171,6 +1171,38 @@
       `stroke="var(--ink)" stroke-width="1.6"><title>${escHtml(tip)}</title></polygon>`;
   }
 
+  // A ring + label around a focused demand's src/dst -- always `--load`
+  // (the "this is about the traffic path" hue, never the red/orange/green
+  // margin channel or the ink used for regen history), solid for src,
+  // dashed for dst so the two ends are distinguishable without reading
+  // the label. `baseR` is the node's own drawn radius at THIS node
+  // (regen candidates are bigger; renderFocusEndpoints looks that up).
+  function endpointGlyph(cx, cy, baseR, edgeUnit, kind, tip) {
+    const r = baseR + edgeUnit * 3;
+    return (
+      `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${r.toFixed(2)}" fill="none" stroke="var(--load)" ` +
+      `stroke-width="${(edgeUnit * 1.8).toFixed(2)}"${kind === 'dst' ? ' stroke-dasharray="4,3"' : ''}>` +
+      `<title>${escHtml(tip)}</title></circle>` +
+      `<text x="${cx.toFixed(2)}" y="${(cy - r - 4).toFixed(2)}" text-anchor="middle" font-family="var(--font-mono)" ` +
+      `font-size="10" font-weight="600" fill="var(--load)">${kind}</text>`
+    );
+  }
+
+  // Rings for the focused demand's own src/dst, regardless of `showLabels`
+  // -- there are only ever two of these on screen at once (one demand),
+  // so they never crowd the map the way per-node id labels would at scale.
+  function renderFocusEndpoints(demand, scale) {
+    const radiusOf = (nodeId) => REGEN_SET.has(nodeId) ? scale.regenR : scale.nodeR;
+    const [sx, sy] = nodeXY(demand.src);
+    const [dx, dy] = nodeXY(demand.dst);
+    return (
+      endpointGlyph(sx, sy, radiusOf(demand.src), scale.edgeUnit, 'src',
+        `demand ${demand.id} source: node ${demand.src}`) +
+      endpointGlyph(dx, dy, radiusOf(demand.dst), scale.edgeUnit, 'dst',
+        `demand ${demand.id} destination: node ${demand.dst}`)
+    );
+  }
+
   // Step 5, parts 2-5: the focused route itself.
   //  - route ghosts: earlier distinct routes, thin, fading with age.
   //  - per-segment tint: each of lp.segs coloured by ITS OWN margin
@@ -1224,7 +1256,7 @@
     const historicalCuts = new Set();
     for (const g of ghosts) for (const nd of g.lp.cut_nodes) historicalCuts.add(nd);
     const glyphR = scale.nodeR * 1.7;
-    let glyphs = '';
+    let glyphs = renderFocusEndpoints(demand, scale);
     for (const nd of currentCuts) {
       const [gx, gy] = nodeXY(nd);
       glyphs += diamondGlyph(gx, gy, glyphR, true, `demand ${lp.d}: regenerator at node ${nd} (current epoch)`);
