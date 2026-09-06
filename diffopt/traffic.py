@@ -166,8 +166,8 @@ def shortest_path_edges_by_km(
 ) -> Optional[List[int]]:
     """Edge ids of the minimum-kilometre path, in traversal order src -> dst.
 
-    Deliberately NOT routed by `EdgeWeightNet`: its routing changes during
-    training, which would make the traffic matrix depend on whichever
+    Deliberately NOT routed by the trainable router: its routing changes
+    during training, which would make the traffic matrix depend on whichever
     checkpoint happened to build it. Shortest-by-km is a fixed property of the
     topology.
 

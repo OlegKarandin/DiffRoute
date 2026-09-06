@@ -1,8 +1,8 @@
 """Does this topology actually need regenerators?
 
 Routes every demand on the shortest-by-km path (physical baseline, no
-dependence on EdgeWeightNet init — this deliberately does NOT use
-edge_weights_of/EdgeWeightNet at all), then evaluates each path in three
+dependence on edge_log_weight's init — this deliberately does NOT use
+edge_weights_of at all), then evaluates each path in three
 regimes and compares against the demand's real SNR threshold:
 
   p=0  fully TRANSPARENT   (no regenerator anywhere)  <- the honest question

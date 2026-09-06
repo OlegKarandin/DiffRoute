@@ -1,4 +1,4 @@
-"""Regression check: does EdgeWeightNet route close to the shortest-by-km
+"""Regression check: does the trained router route close to the shortest-by-km
 path?
 
 Pre-correction-#9, the edge-weight scale collapse made trained routes run
@@ -12,7 +12,8 @@ Loads a trained e2e checkpoint (default: checkpoints/e2e_ind132/best_e2e.pt)
 and, on the exact demand set the training run used for its final epoch
 (seed=epochs_e2e), compares:
 
-  - the path EdgeWeightNet + the trained routing head actually choose, vs.
+  - the path the trained router (edge_log_weight) and placement head
+    actually choose, vs.
   - the shortest-by-km path for the same (src, dst) pair.
 
 Also (re)writes logs/<log_dir>/demand_path_lengths_final_epoch.csv in the

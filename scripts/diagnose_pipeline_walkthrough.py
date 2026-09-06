@@ -24,7 +24,7 @@ demands = demands_for(ctx, seed=1)
 
 with torch.no_grad():
     # NORMALISED — this is the unit-mean-renormalised weight pipeline.forward
-    # actually routes on (correction #9), not EdgeWeightNet's raw Softplus
+    # actually routes on (correction #9), not edge_log_weight's raw Softplus
     # output. Before this script was migrated onto scripts/_common.py it
     # printed the raw output labelled "edge_weights", which described a
     # tensor the pipeline never used — if you're diffing against an older

@@ -110,7 +110,7 @@ constraint:
   dual_max: 1000.0        # lambda_max — a diagnostic cap, not tuned
 
 training:
-  lr_edge_net: 1.0e-3  # NOTE: EdgeWeightNet grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
+  lr_edge_net: 1.0e-3  # NOTE: edge_log_weight grad norm dropped ~40x after the STE fix (routing-informative gradient replaced a routing-uninformative one) — may need re-tuning for Phase 1d, not yet validated
   # The old lr_regen reasoning — "Adam moves a logit at most lr per epoch, so
   # the total excursion is lr * epochs_e2e" — was about a single free logit
   # per node. The allocation head is an MLP over route-local features, so no

@@ -329,7 +329,8 @@ def main() -> None:
     # AllocationHead's init is not, and an unseeded init otherwise varies
     # run to run and changes routing/placement enough to move num_infeasible
     # by an order of magnitude (measured 5/100 vs 98/100 at epoch 1 on
-    # ind_132 under the old EdgeWeightNet), making runs incomparable.
+    # ind_132 under an earlier routing parameterization), making runs
+    # incomparable.
     torch.manual_seed(cfg.get("seed", 42))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

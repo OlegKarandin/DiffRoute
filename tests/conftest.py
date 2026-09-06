@@ -1,7 +1,7 @@
 """Shared test configuration.
 
 Seeds every test: several pipeline tests assert on statistics of a randomly
-initialised EdgeWeightNet, and unseeded e2e runs have produced
+initialised AllocationHead, and unseeded e2e runs have produced
 irreproducible results before (docs/investigations/CHANGELOG.md#correction-1c-8).
 """
 import sys

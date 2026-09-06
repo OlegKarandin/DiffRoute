@@ -8,14 +8,14 @@ Two in-memory topologies:
 
   Hub:    0—1—3—4   and   0—2—3—4   (5 edges, node 3 has degree 3)
           Node 3 is the sole regen candidate.
-          Two paths 0→4 enable routing choice (EdgeWeightNet gradient test)
+          Two paths 0→4 enable routing choice (edge_log_weight gradient test)
           and a boundary at node 3 (regen_logits gradient test).
           The two routes are physically asymmetric (different span lengths
           on eids 0,2 vs eids 1,3; the shared final hop eid 4 is unchanged)
-          so that EdgeWeightNet does not output an identical weight for
-          every edge — a degenerate case where a graph-symmetric,
+          so that edge_log_weight does not end up identical for every
+          edge — a degenerate case where a graph-symmetric,
           equal-length-route topology can make the aggregate surrogate
-          gradient on EdgeWeightNet's parameters cancel to zero regardless
+          gradient on edge_log_weight cancel to zero regardless
           of the routing signal (see test_edge_weight_net_grad_differs_
           with_and_without_ste_proxy).
 """
@@ -81,10 +81,10 @@ def make_hub_topology() -> Topology:
 
     The two routes use different (but still ≥20 km, realistic) span
     lengths on their non-shared edges — 60 km via node 1 (eids 0,2) vs
-    100 km via node 2 (eids 1,3) — so EdgeWeightNet, which is a per-edge
-    function of static span features, does not produce an identical
-    weight for every edge. The shared final hop (eid 4) is left at the
-    original 80 km. This breaks a physical-symmetry degeneracy without
+    100 km via node 2 (eids 1,3) — so edge_log_weight, the free per-edge
+    parameter initialised length-proportionally, does not produce an
+    identical weight for every edge. The shared final hop (eid 4) is left
+    at the original 80 km. This breaks a physical-symmetry degeneracy without
     changing the graph structure (both routes remain 3 edges; node 3
     remains the sole degree-3 / regen-candidate node).
     """
@@ -170,7 +170,7 @@ def test_forward_pass_shapes():
 
 
 # ---------------------------------------------------------------------------
-# Test 2: EdgeWeightNet gradient flows via path_noise_loss
+# Test 2: edge_log_weight gradient flows via path_noise_loss
 # ---------------------------------------------------------------------------
 
 def test_gradient_flow_edge_weight_net():
@@ -398,13 +398,13 @@ def test_path_indicator_gradient_not_proportional_to_edge_weights():
 
 
 # ---------------------------------------------------------------------------
-# Test 9: EdgeWeightNet gradient actually depends on the STE proxy term
+# Test 9: edge_log_weight gradient actually depends on the STE proxy term
 # ---------------------------------------------------------------------------
 
 def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
     """Zeroing the _edge_ase_noise buffer collapses proxy_noise to a constant
     (independent of path_indicator), reproducing today's pre-fix behavior.
-    EdgeWeightNet's gradient must differ between the two cases, proving the
+    edge_log_weight's gradient must differ between the two cases, proving the
     proxy term (not just path_noise_loss) is contributing to the signal."""
     topo = make_hub_topology()
     always_infeasible_cfg = ModulationConfig(
@@ -435,7 +435,7 @@ def test_edge_weight_net_grad_differs_with_and_without_ste_proxy():
     grad_without = run(pipeline_without_ste)
 
     assert not torch.allclose(grad_with, grad_without, atol=1e-8), (
-        "EdgeWeightNet gradient identical with and without the STE proxy — "
+        "edge_log_weight gradient identical with and without the STE proxy — "
         "the proxy term is not contributing to the routing signal"
     )
 
@@ -757,10 +757,13 @@ def test_path_noise_cost_equals_ase_noise_along_route():
 
 
 # ---------------------------------------------------------------------------
-# Test 17: EdgeWeightNet's static topology inputs are standardised.
+# Test 17: the static topology edge-features buffer is standardised.
 # Unnormalised inputs (length spanning 19-597 km against regen_prob features
-# in [0,1]) gave the random init a backwards prior — corr(w, length_km) =
-# -0.463 on ind_132, i.e. longer edges priced cheaper.
+# in [0,1]) gave the old MLP-based router's random init a backwards prior —
+# corr(w, length_km) = -0.463 on ind_132, i.e. longer edges priced cheaper.
+# Routing no longer consumes this buffer (edge_log_weight is a free per-edge
+# parameter), but it is kept for diagnostics and this standardisation
+# invariant.
 # ---------------------------------------------------------------------------
 
 def test_topology_edge_features_are_standardised():

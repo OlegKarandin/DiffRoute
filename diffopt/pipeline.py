@@ -244,12 +244,12 @@ class DiffONetPipeline(nn.Module):
         self._num_nodes = topology.num_nodes
         self._regen_candidate_set: Set[int] = set(topology.regen_candidate_nodes)
 
-        # Spec decision 6. Under approach A the edge features are constant,
-        # so EdgeWeightNet(constant) is a fixed function of its own weights —
-        # a reparameterization of E numbers with 5 000-odd parameters and a
-        # curvature landscape nobody chose. The class is retained in
-        # diffopt/routing/edge_weight_net.py so this commit can be reverted
-        # on its own.
+        # Spec decision 6: routing uses a free per-edge parameter
+        # (edge_log_weight) rather than an MLP over edge features. Under
+        # approach A the edge features are constant, so an MLP over them
+        # would just be a fixed function of its own weights — a
+        # reparameterization of E numbers with 5 000-odd parameters and a
+        # curvature landscape nobody chose.
         #
         # Init at length-proportional weights, i.e. shortest-by-km routing:
         # the documented baseline, and what preflight_filter screens against.
@@ -264,10 +264,11 @@ class DiffONetPipeline(nn.Module):
         # Register topology-derived tensors as buffers so they move with the model
 
         # Standardise the static topology features once, here, rather than
-        # inside EdgeWeightNet — the statistics are topology-derived and the
-        # pipeline owns the topology, so EdgeWeightNet stays a
-        # topology-agnostic MLP on (E, 7) and diagnostics that construct it
-        # standalone keep working.
+        # in whatever consumes them — the statistics are topology-derived and
+        # the pipeline owns the topology. Routing itself no longer consumes
+        # these features (edge_log_weight is a free per-edge parameter, spec
+        # decision 6); the standardised buffer is kept for diagnostics and
+        # the standardisation invariant tests.
         #
         # Raw features are wildly unscaled: on ind_132 total_length_km spans
         # 19-597 while the two regen_prob columns appended in forward() live
@@ -300,10 +301,10 @@ class DiffONetPipeline(nn.Module):
         # `is_candidate` indicators, not the learned regenerator
         # probabilities they replace.
         #
-        # Before this, regen_probs fed EdgeWeightNet at both endpoints of
-        # every edge, so the router's input moved whenever the placement head
-        # moved and vice versa. That loop is why a non-candidate logit could
-        # pick up feasibility signal at all (train.py's num_regen_noncand
+        # Before this, regen_probs fed the router at both endpoints of every
+        # edge, so the router's input moved whenever the placement head moved
+        # and vice versa. That loop is why a non-candidate logit could pick
+        # up feasibility signal at all (train.py's num_regen_noncand
         # warning), and under per-demand allocation there is no per-node
         # probability to feed it anyway.
         #
@@ -511,8 +512,8 @@ class DiffONetPipeline(nn.Module):
             # It also restores a routing signal that survives feasibility:
             # once num_infeasible hits 0 the feasibility term contributes
             # gradient on 0/168 edges, so before this change shrink pressure
-            # was the ONLY signal reaching EdgeWeightNet for the back half of
-            # training.
+            # was the ONLY signal reaching edge_log_weight for the back half
+            # of training.
             #
             # ASE-only, not ASE+NLI: NLI depends on the spectrum position of
             # the channels, so it is not determined by the route. Charging the
