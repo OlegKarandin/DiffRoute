@@ -1038,6 +1038,130 @@ def test_segment_gsnr_cache_eviction_does_not_read_from_cleared_cache(monkeypatc
     assert all(gsnr_dict2[d.id] is not None for d in demands2), "All demands should have GSNR"
 
 
+# ---------------------------------------------------------------------------
+# Equivalence oracle for the A3 vectorisation (perf task 8): the step-6 STE
+# proxy computation used to loop per segment, building a fresh
+# torch.tensor(seg_edge_ids) + gather + .sum() + log10 EACH iteration
+# (~2,400 tiny autograd nodes/forward on ind_132/constrained_stress — see
+# docs/investigations/pipeline_profile_and_restoration_scaling.md). The loop
+# below is a verbatim copy of that OLD per-segment logic, kept here as a
+# manual reference oracle so `_ste_proxy_batched` can be checked against it
+# directly, rather than trusting that the padded-index/mask rewrite
+# preserved behaviour by inspection.
+# ---------------------------------------------------------------------------
+
+def test_ste_proxy_batched_matches_the_old_per_segment_loop():
+    """Randomized (seeded) multi-demand, multi-segment input with ragged
+    segment-list lengths BOTH within and across demands: demand 10 has two
+    segments (2 edges, then 1 edge), demand 20 has one 1-edge segment,
+    demand 30 has one 3-edge segment. A batch where every demand had exactly
+    one same-length segment would never exercise the padding/mask logic —
+    this one forces L_max=3 padding on every shorter segment."""
+    from diffopt.pipeline import _ste_proxy_batched
+
+    torch.manual_seed(777)
+
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    num_edges = len(topology.undirected_edges)  # 5
+
+    demands = [
+        Demand(id=10, src=0, dst=4, bitrate_gbps=400.0),
+        Demand(id=20, src=0, dst=3, bitrate_gbps=400.0),
+        Demand(id=30, src=1, dst=4, bitrate_gbps=400.0),
+    ]
+
+    # Flat (demand, segment) order matches how forward()'s routing loop
+    # would have produced `all_segments`/`segment_owner_demand_id`: demand
+    # 10's two segments first, then demand 20's one segment, then demand
+    # 30's one segment.
+    all_segments = [
+        [0, 2],       # demand 10, segment 0 (2 edges)
+        [4],          # demand 10, segment 1 (1 edge)
+        [1],          # demand 20, segment 0 (1 edge)
+        [1, 3, 4],    # demand 30, segment 0 (3 edges) -> sets L_max=3
+    ]
+    segment_owner_demand_id = [10, 10, 20, 30]
+
+    demand_path_indicators = {
+        d.id: torch.rand(num_edges, requires_grad=True) for d in demands
+    }
+    # Some values in-band, some outside [-5, 35] -- irrelevant to this
+    # function (the clamp is applied elsewhere), but realistic.
+    batched_qot_gsnr = torch.rand(len(all_segments)) * 40.0 - 5.0
+
+    proxy_eps = pipeline._proxy_eps
+    edge_ase_noise = pipeline._edge_ase_noise
+    device = edge_ase_noise.device
+
+    # --- Reference oracle: verbatim copy of the OLD per-segment loop ---
+    proxy_flat_ref = []
+    segment_gsnr_flat_ref = []
+    flat_idx = 0
+    for demand in demands:
+        path_indicator = demand_path_indicators[demand.id]
+        segments = [
+            seg for seg, did in zip(all_segments, segment_owner_demand_id)
+            if did == demand.id
+        ]
+        for seg_edge_ids in segments:
+            qot_gsnr = batched_qot_gsnr[flat_idx]
+            flat_idx += 1
+
+            seg_idx = torch.tensor(seg_edge_ids, dtype=torch.long, device=device)
+            proxy_noise = (path_indicator[seg_idx] * edge_ase_noise[seg_idx]).sum()
+            proxy_gsnr = -10.0 * torch.log10(proxy_noise + proxy_eps)
+
+            segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())
+            proxy_flat_ref.append(proxy_gsnr)
+            segment_gsnr_flat_ref.append(segment_gsnr)
+
+    proxy_ref = torch.stack(proxy_flat_ref)
+    segment_gsnr_ref = torch.stack(segment_gsnr_flat_ref)
+    segment_gsnr_ref.sum().backward()
+    grads_ref = {d.id: demand_path_indicators[d.id].grad.clone() for d in demands}
+    for d in demands:
+        demand_path_indicators[d.id].grad = None
+
+    # --- Vectorized implementation under test ---
+    proxy_vec, segment_gsnr_vec = _ste_proxy_batched(
+        all_segments,
+        segment_owner_demand_id,
+        demands,
+        demand_path_indicators,
+        edge_ase_noise,
+        batched_qot_gsnr,
+        proxy_eps,
+        device,
+    )
+
+    # Per-segment vectors: exact (both paths do the same float32 ops in the
+    # same order per segment; only the padded slots differ in HOW zero is
+    # reached, and the mask makes that exact, not approximate).
+    assert torch.equal(proxy_vec, proxy_ref)
+    assert torch.equal(segment_gsnr_vec, segment_gsnr_ref)
+
+    # Gradient equivalence: the STE's whole purpose is the backward path
+    # through path_indicator, so equivalence must hold there too, not just
+    # on the forward values.
+    segment_gsnr_vec.sum().backward()
+    for d in demands:
+        assert torch.equal(demand_path_indicators[d.id].grad, grads_ref[d.id])
+
+
+def test_ste_proxy_batched_handles_no_segments():
+    """forward() calls this even when `demands` is empty (or every demand's
+    route terminates with zero segments); it must not crash on an empty
+    batch."""
+    from diffopt.pipeline import _ste_proxy_batched
+
+    proxy_vec, segment_gsnr_vec = _ste_proxy_batched(
+        [], [], [], {}, torch.zeros(5), torch.zeros(0), 1e-12, torch.device("cpu"),
+    )
+    assert proxy_vec.shape == (0,)
+    assert segment_gsnr_vec.shape == (0,)
+
+
 def test_pipeline_gsnr_matches_a_per_demand_combiner_loop():
     """The batched fold's equivalence, checked at the level that matters:
     the pipeline's own output. Rebuilds each demand's segments from a fresh

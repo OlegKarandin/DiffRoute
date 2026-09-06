@@ -109,6 +109,97 @@ def _spearman(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a_c * b_c).sum().item() / denom.item()
 
 
+def _ste_proxy_batched(
+    all_segments: List[List[int]],
+    segment_owner_demand_id: List[int],
+    demands: List[Demand],
+    demand_path_indicators: Dict[int, torch.Tensor],
+    edge_ase_noise: torch.Tensor,
+    batched_qot_gsnr: torch.Tensor,
+    proxy_eps: float,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized STE (straight-through estimator) proxy GSNR for every
+    segment across every demand, in one batched call.
+
+    Perf note (A3): this replaces a Python loop that built a fresh
+    `torch.tensor(seg_edge_ids)` + gather + `.sum()` + `log10` PER SEGMENT
+    (~2,400 tiny autograd nodes/forward on ind_132/constrained_stress — see
+    docs/investigations/pipeline_profile_and_restoration_scaling.md) with one
+    padded `(S, L_max)` index/mask structure and a handful of batched tensor
+    ops.
+
+    `all_segments[i]` is segment i's list of edge ids and
+    `segment_owner_demand_id[i]` is the id of the demand that owns it; both
+    are built by `forward`'s per-demand routing loop in the SAME flat order
+    `batched_qot_gsnr` is already in (both traverse `demands` in list order,
+    then that demand's segments in order) — this function relies on that
+    ordering rather than re-deriving it.
+
+    `demand_path_indicators[demand.id]` is an `(E,)` float32 tensor WITH grad
+    (the routing decision being learned); `edge_ase_noise` is an `(E,)`
+    registered buffer with NO grad (static per-topology data). The gather
+    below must preserve gradient flow through the indicator side.
+
+    Returns `(proxy_gsnr, segment_gsnr)`, each a `(S,)` tensor in that same
+    flat order, where S = `len(all_segments)`.
+    """
+    if not all_segments:
+        empty = torch.zeros(0, device=device)
+        return empty, empty
+
+    l_max = max(len(seg) for seg in all_segments)
+    num_segs = len(all_segments)
+
+    # idx padded with 0 (an arbitrary, real edge id) in unused slots; mask
+    # is what actually makes that safe (see below) — the 0 padding value
+    # by itself does not matter.
+    idx = torch.zeros(num_segs, l_max, dtype=torch.long, device=device)
+    mask = torch.zeros(num_segs, l_max, dtype=torch.bool, device=device)
+    for i, seg in enumerate(all_segments):
+        n = len(seg)
+        if n:
+            idx[i, :n] = torch.tensor(seg, dtype=torch.long, device=device)
+            mask[i, :n] = True
+
+    # `demands`' enumerate order is the row order the pipeline's forward()
+    # later uses for `path_indicators`/`gsnr_matrix` bookkeeping too; stack
+    # the per-demand indicators in that same order and map each segment's
+    # owning demand id to its row.
+    demand_row_of_id = {demand.id: row for row, demand in enumerate(demands)}
+    stacked_indicators = torch.stack(
+        [demand_path_indicators[demand.id] for demand in demands]
+    )  # (D, E) — grad-carrying (routing decision)
+    seg_demand_row = torch.tensor(
+        [demand_row_of_id[did] for did in segment_owner_demand_id],
+        dtype=torch.long, device=device,
+    )
+
+    ase_gathered = edge_ase_noise[idx]  # (S, L_max) — no grad (static buffer)
+    indicator_gathered = stacked_indicators[
+        seg_demand_row.unsqueeze(1), idx
+    ]  # (S, L_max) — grad-carrying
+
+    # Padding is safe ONLY because of this mask multiply — a padded slot's
+    # `idx` is 0, a REAL edge with a real (indicator, ase) value, so mask=0
+    # (not the index choice) is what zeroes its contribution.
+    mask_f = mask.to(dtype=indicator_gathered.dtype)
+    proxy_noise = (indicator_gathered * ase_gathered * mask_f).sum(dim=1)  # (S,)
+
+    # `+ proxy_eps` applied AFTER the masked `.sum(dim=1)`, exactly once —
+    # adding it per-slot before masking, or masking before adding it, would
+    # let a fully-masked-off row hit log10(0) or would zero a legitimately
+    # added eps.
+    proxy_gsnr = -10.0 * torch.log10(proxy_noise + proxy_eps)  # (S,)
+
+    # STE blend: forward value = qot_gsnr exactly; gradient = proxy's. Note:
+    # the [GSNR_MIN, GSNR_MAX] clamp is deliberately NOT applied here — it
+    # is applied later, in segment_combiner.py's _safe_noise and the fold.
+    segment_gsnr = batched_qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())  # (S,)
+
+    return proxy_gsnr, segment_gsnr
+
+
 # ---------------------------------------------------------------------------
 # Allocation record
 # ---------------------------------------------------------------------------
@@ -627,6 +718,23 @@ class DiffONetPipeline(nn.Module):
             .sum().item()
         )
 
+        # STE proxy, batched over every segment across every demand (A3) —
+        # `all_segments`/`segment_owner_demand_id` are already in the same
+        # flat order as `batched_qot_gsnr` (both built by the routing loop
+        # above, traversing `demands` in list order then each demand's
+        # segments in order). See `_ste_proxy_batched`'s docstring for the
+        # padded-index/mask design and its perf note.
+        proxy_gsnr_vec, segment_gsnr_vec = _ste_proxy_batched(
+            all_segments,
+            segment_owner_demand_id,
+            demands,
+            demand_path_indicators,
+            self._edge_ase_noise,
+            batched_qot_gsnr,
+            self._proxy_eps,
+            device,
+        )
+
         # 6. Scatter the batched QoT output back per demand, blend with the
         # STE proxy per segment, then fold EVERY demand in one call.
         #
@@ -655,21 +763,16 @@ class DiffONetPipeline(nn.Module):
             seg_counts.append(len(segments))
 
             for col, seg_edge_ids in enumerate(segments):
-                qot_gsnr = batched_qot_gsnr[flat_idx]
+                # proxy_gsnr_vec/segment_gsnr_vec were computed above, batched
+                # over every segment in this same flat order — see
+                # _ste_proxy_batched. Note: if qot_gsnr falls outside
+                # SegmentCombiner's [-5, 35] dB clamp range, the STE gradient
+                # for this segment is zeroed by that clamp (segment_combiner.py's
+                # _safe_noise has zero gradient outside the clamped band).
+                segment_gsnr = segment_gsnr_vec[flat_idx]
+                proxy_gsnr = proxy_gsnr_vec[flat_idx]
                 flat_idx += 1
 
-                # Analytical proxy — linear in path_indicator, independent of
-                # edge_weights. Supplies the backward gradient direction.
-                seg_idx = torch.tensor(seg_edge_ids, dtype=torch.long, device=device)
-                proxy_noise = (path_indicator[seg_idx] * self._edge_ase_noise[seg_idx]).sum()
-                proxy_gsnr = -10.0 * torch.log10(proxy_noise + self._proxy_eps)
-
-                # STE blend: forward value = qot_gsnr exactly; gradient = proxy's.
-                # Note: if qot_gsnr falls outside SegmentCombiner's [-5, 35] dB
-                # clamp range, the STE gradient for this segment is zeroed by
-                # that clamp (segment_combiner.py's _safe_noise has zero
-                # gradient outside the clamped band).
-                segment_gsnr = qot_gsnr + (proxy_gsnr - proxy_gsnr.detach())
                 segment_gsnr_flat.append(segment_gsnr)
                 proxy_flat.append(proxy_gsnr)
                 seg_rows.append(row)
