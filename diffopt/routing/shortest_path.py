@@ -211,36 +211,3 @@ def dijkstra(
         return path_indicator
     ordered_edges.reverse()  # src -> dst order
     return path_indicator, ordered_edges
-
-
-def batched_dijkstra(
-    edge_weights: np.ndarray,
-    edge_index: np.ndarray,
-    demands: List[Tuple[int, int]],
-    num_nodes: int,
-) -> np.ndarray:
-    """
-    Run Dijkstra for each demand.
-
-    Parameters
-    ----------
-    edge_weights:
-        (E,) float array.
-    edge_index:
-        (2, E) int array.
-    demands:
-        List of (src, dst) pairs.
-    num_nodes:
-        Total number of nodes.
-
-    Returns
-    -------
-    (num_demands, E) binary float32 array.
-    """
-    results = []
-    for s, d in demands:
-        indicator = dijkstra(edge_weights, edge_index, s, d, num_nodes)
-        if indicator is None:
-            raise ValueError(f"No path found from node {s} to node {d}")
-        results.append(indicator)
-    return np.stack(results, axis=0)

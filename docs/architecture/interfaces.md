@@ -181,7 +181,7 @@ soft_max(a, b, temperature=0.5) -> Tensor
     # docs/investigations/CHANGELOG.md#correction-1c-8.
 ```
 
-## `dijkstra` / `spfa` / `batched_dijkstra` (`diffopt/routing/shortest_path.py`)
+## `dijkstra` / `spfa` (`diffopt/routing/shortest_path.py`)
 
 ```python
 dijkstra(
@@ -198,17 +198,6 @@ spfa(
 ```
 
 Both treat edges as undirected (each edge traversable in both directions). Return value indexes the original undirected edge IDs — the indicator is 1 if the edge was traversed in either direction.
-
-```python
-batched_dijkstra(
-    edge_weights: np.ndarray,          # (E,) float64
-    edge_index:   np.ndarray,          # (2, E) int
-    demands: List[Tuple[int, int]],    # (src, dst) pairs
-    num_nodes: int,
-) -> np.ndarray                        # (num_demands, E) float32 binary
-```
-
-Raises `ValueError` if any demand has no path.
 
 ## `surrogate_shortest_path` (`diffopt/routing/surrogate.py`)
 
