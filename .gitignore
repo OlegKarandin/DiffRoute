@@ -52,3 +52,7 @@ Thumbs.db
 .claude/
 docs/superpowers/
 .worktrees/
+
+# Build and extension outputs
+runs_ext/
+.superpowers/
