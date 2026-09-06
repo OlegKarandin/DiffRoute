@@ -174,7 +174,7 @@
     min-height: 0;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    grid-template-rows: minmax(0, 2.6fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1.5fr) minmax(0, 1fr);
     grid-template-areas:
       "map map"
       "strip stats";
@@ -790,19 +790,14 @@
   }
 
   // -------------------------------------------------------------------
-  // Halo decay (Task 9). A node whose device count changed since the
-  // last RENDERED epoch gets a fading glow ring instead of an instant
-  // pop -- load-bearing, not polish: the plan's own measurements found a
-  // period-2 limit cycle (epochs 9-21) where the allocation head's device
-  // count swings between ~1400 and 0 on alternating epochs, so nearly
-  // every regen candidate appears/vanishes every epoch. A raw instant
-  // redraw would strobe the whole candidate set; the glow persists across
-  // HALO_DECAY_EPOCHS renders so a churning node reads as "unstable", not
-  // as a flicker easy to blink past while scrubbing.
+  // Site-count change marker. A node whose device count changed since the
+  // last RENDERED epoch gets its own circle recoloured for this one
+  // render -- green if it just gained a device, red if it just lost one --
+  // rather than a separate glow ring. Colour carries the direction of the
+  // change directly, so no separate halo/decay animation is needed to
+  // make churn legible while scrubbing.
   // -------------------------------------------------------------------
-  const HALO_DECAY_EPOCHS = 5;
-  let _haloPrevCounts = null;   // Float64Array | null -- previous render's per-node device count
-  const _haloAge = new Map();  // nodeId -> renders since its count last changed
+  let _prevSiteCounts = null; // Float64Array | null -- previous render's per-node device count
 
   function siteCounts(frame) {
     const counts = new Float64Array(TOPO.num_nodes);
@@ -813,28 +808,21 @@
     return counts;
   }
 
-  function updateHaloState(frame) {
+  // Returns, for THIS render only, 'added' | 'removed' | null per node id,
+  // against the last frame this viewer actually rendered (not necessarily
+  // the adjacent epoch -- scrubbing can jump). Updates the stored previous
+  // counts as a side effect; call exactly once per render.
+  function updateSiteChangeState(frame) {
     const counts = siteCounts(frame);
-    if (_haloPrevCounts) {
-      // Age every currently-glowing node by one render first...
-      for (const [node, age] of Array.from(_haloAge.entries())) {
-        const next = age + 1;
-        if (next >= HALO_DECAY_EPOCHS) _haloAge.delete(node);
-        else _haloAge.set(node, next);
-      }
-      // ...then re-ignite (age 0) anything whose count actually changed
-      // vs. the last frame this viewer rendered (not necessarily the
-      // adjacent epoch -- scrubbing can jump).
+    const change = new Array(TOPO.num_nodes).fill(null);
+    if (_prevSiteCounts) {
       for (let i = 0; i < counts.length; i++) {
-        if (counts[i] !== _haloPrevCounts[i]) _haloAge.set(i, 0);
+        if (counts[i] > _prevSiteCounts[i]) change[i] = 'added';
+        else if (counts[i] < _prevSiteCounts[i]) change[i] = 'removed';
       }
     }
-    _haloPrevCounts = counts;
-  }
-
-  function haloIntensity(nodeId) {
-    if (!_haloAge.has(nodeId)) return 0;
-    return Math.max(0, 1 - _haloAge.get(nodeId) / HALO_DECAY_EPOCHS);
+    _prevSiteCounts = counts;
+    return change;
   }
 
   function renderMap() {
@@ -848,9 +836,13 @@
     const scale = markScale();
     const loads = edgeLoad(frame);
     const means = edgeMeanMargin(frame);
-    updateHaloState(frame);
+    const siteChange = updateSiteChangeState(frame);
 
-    // ---- edges: neutral load channel, √-scaled width; idle = hairline.
+    // ---- edges: a single neutral colour, √-scaled width carries the load
+    // signal on its own; idle = hairline. Margin status lives entirely on
+    // the ribbons (Task 9) -- blending a second colour channel in here
+    // (mean margin, tinted against --load) read as an unexplained extra
+    // hue with no visible legend, so the mean is kept in the tooltip only.
     let edgesSvg = '';
     for (const e of TOPO.edges) {
       const [x1, y1] = nodeXY(e.src);
@@ -858,20 +850,20 @@
       const load = loads[e.id];
       const w = load > 0 ? scale.edgeUnit * Math.sqrt(load) : scale.edgeUnit * 0.22;
       const mean = means[e.id];
-      const stroke = Number.isFinite(mean)
-        ? `color-mix(in srgb, var(--load) 55%, var(--${colourOf(mean)}) 45%)`
-        : 'var(--line)';
       const tip = Number.isFinite(mean)
         ? `edge ${e.id}: node ${e.src}–${e.dst}, ${load} lightpath${load === 1 ? '' : 's'}, mean margin ${mean.toFixed(2)} dB`
         : `edge ${e.id}: node ${e.src}–${e.dst}, idle`;
       edgesSvg +=
         `<line x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" ` +
-        `stroke="${stroke}" stroke-width="${w.toFixed(2)}" stroke-opacity="${load > 0 ? 0.85 : 0.5}" ` +
+        `stroke="var(--muted)" stroke-width="${w.toFixed(2)}" stroke-opacity="${load > 0 ? 0.85 : 0.4}" ` +
         `stroke-linecap="round"><title>${escHtml(tip)}</title></line>`;
     }
 
-    // ---- nodes: opaque, drawn last. Ordinary / regen candidate / device
-    // site are three independent facts about a node, layered together.
+    // ---- nodes: opaque, drawn last, ONE circle each. When a node hosts
+    // devices its own circle grows (to `siteR`) to actually contain its
+    // pip ring, rather than a small node circle sitting inside a separate,
+    // larger halo disc -- two nested circles read as the pips floating
+    // outside a boundary that wasn't really theirs.
     let nodesSvg = '';
     for (let i = 0; i < TOPO.num_nodes; i++) {
       const [cx, cy] = nodeXY(i);
@@ -879,43 +871,35 @@
       const site = frame.sites[String(i)];
       const count = site ? site.deployed : 0;
       const r = isRegen ? scale.regenR : scale.nodeR;
-      // Pip ring sits just outside THIS node's own circle (regen candidates
-      // are bigger, so their ring sits further out too) -- pipOrbit is
-      // sized so even the ring's own halo clears r, never overlapping the
-      // node's opaque face. siteR (the muted background disc) is in turn
-      // sized to fully contain the ring including that halo, so the pips
-      // read as one cluster attached to the node rather than floating
-      // debris outside a disc that was too small for them.
+      // Pip ring sits just outside THIS node's own base radius r (regen
+      // candidates are bigger, so their ring sits further out too) --
+      // pipOrbit is sized so even the ring's own halo clears r, never
+      // overlapping where the plain node circle would be. siteR is the
+      // node's OWN drawn radius once it hosts devices: big enough to fully
+      // contain the ring including that halo, so the pips sit inside one
+      // visible circle instead of orbiting outside it.
       const pipOrbit = r + scale.pipHaloR + scale.edgeUnit;
       const siteR = pipOrbit + scale.pipHaloR + scale.edgeUnit;
-      const halo = haloIntensity(i);
-      const label = `node ${i}${isRegen ? ' (regen candidate)' : ''}${count ? `, ${count} device${count === 1 ? '' : 's'}` : ''}${halo > 0 ? ', device count changed recently' : ''}`;
+      const drawR = count > 0 ? siteR : r;
+      const change = siteChange[i]; // 'added' | 'removed' | null
+      const label = `node ${i}${isRegen ? ' (regen candidate)' : ''}${count ? `, ${count} device${count === 1 ? '' : 's'}` : ''}${change ? `, regenerator ${change} this epoch` : ''}`;
       // <title> first: some browsers only pick up the hover tooltip when
       // it is the group's first child.
       let g = `<g class="map-node"><title>${escHtml(label)}</title>`;
 
-      if (halo > 0) {
-        // Fading glow ring, drawn first so it sits behind everything else
-        // at this node -- see updateHaloState()/haloIntensity() above.
-        const haloR = r * (1.55 + 1.1 * halo);
-        g += `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${haloR.toFixed(2)}" fill="none" ` +
-          `stroke="var(--ink)" stroke-width="${(scale.edgeUnit * 1.7).toFixed(2)}" stroke-opacity="${(0.55 * halo).toFixed(2)}"/>`;
-      }
-
-      if (count > 0) {
-        // Device site: a filled disc behind the pips (and behind the
-        // node's own opaque circle, drawn next) -- sized via siteR so it
-        // actually contains the pip ring drawn further below, not just the
-        // node's own face.
-        g += `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${siteR.toFixed(2)}" fill="var(--load)" fill-opacity="0.16"/>`;
-      }
-
       // The node itself: always opaque, so it is never buried by an edge
-      // or ribbon. Regen candidates get a larger circle + heavier stroke.
+      // or ribbon. Regen candidates get a heavier stroke; a node whose
+      // device count just changed gets that stroke recoloured green
+      // (gained a device) or red (lost one) for this render only, taking
+      // over from the isRegen colouring as the more urgent signal.
+      const stroke = change === 'added' ? 'var(--green)'
+        : change === 'removed' ? 'var(--red)'
+        : (isRegen ? 'var(--ink)' : 'var(--muted)');
+      const strokeW = change ? scale.edgeUnit * 2.6
+        : (isRegen ? scale.edgeUnit * 2.4 : scale.edgeUnit * 1.1);
       g +=
-        `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${r.toFixed(2)}" fill="var(--surface)" ` +
-        `stroke="${isRegen ? 'var(--ink)' : 'var(--muted)'}" ` +
-        `stroke-width="${(isRegen ? scale.edgeUnit * 2.4 : scale.edgeUnit * 1.1).toFixed(2)}"/>`;
+        `<circle cx="${cx.toFixed(2)}" cy="${cy.toFixed(2)}" r="${drawR.toFixed(2)}" fill="var(--surface)" ` +
+        `stroke="${stroke}" stroke-width="${strokeW.toFixed(2)}"/>`;
 
       if (count > 0) {
         if (count > 8) {
@@ -939,7 +923,7 @@
 
       if (scale.showLabels) {
         g +=
-          `<text x="${cx.toFixed(2)}" y="${(cy - r - 4).toFixed(2)}" text-anchor="middle" ` +
+          `<text x="${cx.toFixed(2)}" y="${(cy - drawR - 4).toFixed(2)}" text-anchor="middle" ` +
           `font-size="${Math.max(9, Math.min(15, scale.nodeR * 0.55)).toFixed(2)}" fill="var(--muted)">${i}</text>`;
       }
       g += '</g>';
