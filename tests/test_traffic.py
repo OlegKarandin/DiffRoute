@@ -9,16 +9,22 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 
+from diffopt.demands import Demand
+from diffopt.modulation import ModulationConfig
+from diffopt.qot.segment_combiner import SegmentCombiner
 from diffopt.traffic import (
     SCENARIO_ALPHA,
     build_traffic_matrix,
+    preflight_filter,
     scenario_alpha,
+    shortest_path_edges_by_km,
     traffic_matrix_checksum,
 )
 from diffopt.topology import load_topology
 
-from tests.test_pipeline import make_hub_topology
+from tests.test_pipeline import make_hub_topology, make_linear_topology
 
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -160,15 +166,6 @@ print(traffic_matrix_checksum(build_traffic_matrix(t, seed=0, scale=1.0e6, alpha
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-
-import torch
-
-from diffopt.demands import Demand
-from diffopt.modulation import ModulationConfig
-from diffopt.qot.segment_combiner import SegmentCombiner
-from diffopt.traffic import preflight_filter, shortest_path_edges_by_km
-
-from tests.test_pipeline import make_linear_topology
 
 
 class _ConstantQoT(torch.nn.Module):

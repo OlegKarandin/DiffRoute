@@ -165,7 +165,7 @@ def test_margin_is_against_the_bare_threshold_and_the_bar_is_above_it(tmp_path):
     by_id = {d["id"]: d for d in doc["demands"]}
     assert by_id[0]["threshold_db"] == pytest.approx(15.1)   # 800G
     assert by_id[0]["bar_db"] == pytest.approx(15.6)
-    lp = next(l for l in doc["frames"][0]["lightpaths"] if l["d"] == 0)
+    lp = next(lightpath for lightpath in doc["frames"][0]["lightpaths"] if lightpath["d"] == 0)
     assert lp["margin_db"] == pytest.approx(lp["gsnr_db"] - 15.1, abs=1e-3)
 
 
@@ -173,7 +173,7 @@ def test_cut_idx_and_cut_nodes_agree(tmp_path):
     """cut_idx is load-bearing, cut_nodes is display convenience — but they
     must describe the same cuts."""
     doc = _write(tmp_path, [_hard(d0_cut=True)], keyframe_every=1)
-    lp = next(l for l in doc["frames"][0]["lightpaths"] if l["d"] == 0)
+    lp = next(lightpath for lightpath in doc["frames"][0]["lightpaths"] if lightpath["d"] == 0)
     assert lp["cut_idx"] == [0]
     assert lp["cut_nodes"] == [3]
     assert len(lp["segs"]) == len(lp["seg_gsnr_db"]) == len(lp["seg_km"]) == 3

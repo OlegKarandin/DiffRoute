@@ -1,7 +1,6 @@
 """PyTorch Dataset for segment-level QoT data."""
 from __future__ import annotations
 
-from pathlib import Path
 
 import numpy as np
 import pandas as pd

@@ -1014,7 +1014,6 @@ def test_segment_gsnr_cache_eviction_does_not_read_from_cleared_cache(monkeypatc
     with torch.no_grad():
         paths1, gsnr_dict1, _, _ = pipeline(demands, tau=1.0)
 
-    cache_size_after_first = len(pipeline._segment_gsnr_cache)
     # At this point cache has <= 2 entries (or was cleared if it hit the limit).
 
     # Second forward with different demand may add more segments, potentially

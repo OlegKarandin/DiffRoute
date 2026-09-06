@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 

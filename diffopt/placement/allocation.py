@@ -42,7 +42,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffopt.qot.segment_combiner import GSNR_MAX, GSNR_MIN, db_to_linear_noise
 
 # Feature layout, spec 2.1. Order is load-bearing: LOOKAHEAD_COLS indexes it,
 # and tests/test_allocation_head.py hand-builds rows against it.

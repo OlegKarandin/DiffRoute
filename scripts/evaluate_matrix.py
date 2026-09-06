@@ -112,7 +112,7 @@ def main() -> None:
         margin_db=c_cfg["margin_db"],
     )
     sites = sorted(hard["site_mask"].nonzero(as_tuple=True)[0].tolist())
-    print(f"\nDeployed allocation (hard rollout):")
+    print("\nDeployed allocation (hard rollout):")
     print(f"  devices: {hard['hard_num_devices']}   "
           f"oracle minimum: {hard['oracle_devices']}   "
           f"gap: {hard['oracle_gap']}")

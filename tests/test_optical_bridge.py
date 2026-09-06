@@ -31,7 +31,6 @@ from pathlib import Path
 import pytest
 
 from multilayer_optical_network.gnpy_adapter.adapter import compute_qot
-from multilayer_optical_network.gnpy_adapter.loading import Channel, LoadingState
 from multilayer_optical_network.model.assets import (
     Amplifier,
     Direction,

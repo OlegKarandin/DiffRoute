@@ -1,11 +1,10 @@
 """Tests for topology builder and topology loading."""
 import json
-import math
 import pytest
 from pathlib import Path
 
-from diffopt.topology_builder import split_link_into_spans, build_topology_json
-from diffopt.topology import Topology, Edge, load_topology, FIBER_TYPE_INDEX
+from diffopt.topology_builder import split_link_into_spans
+from diffopt.topology import Topology, load_topology, FIBER_TYPE_INDEX
 
 from multilayer_optical_network.model.optical_network import OpticalNetworkModel
 from multilayer_optical_network.model.optical_topology_import import populate_optical

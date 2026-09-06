@@ -1234,14 +1234,14 @@ def test_negative_grad_clip_is_rejected(tmp_path):
 
 def test_frame_dump_is_off_by_default(tmp_path, monkeypatch):
     """No viz block, no file. Existing runs must be unaffected."""
-    ckpt = _run_training(tmp_path)
+    _run_training(tmp_path)
     log_dir = tmp_path / "logs"
     assert not (log_dir / "frames.json").exists()
     assert not (log_dir / "frames.jsonl").exists()
 
 
 def test_frame_dump_writes_a_readable_document(tmp_path, monkeypatch):
-    ckpt = _run_training(
+    _run_training(
         tmp_path, epochs=3,
         viz_overrides={"dump_frames": True, "every": 1, "keyframe_every": 2},
     )

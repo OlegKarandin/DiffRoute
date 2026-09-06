@@ -86,7 +86,6 @@ def test_num_infeasible_counts_only_below_threshold_demands(simple_loss_inputs):
 # Constrained objective: per-demand duals + margin inside the hinge
 # ---------------------------------------------------------------------------
 
-from diffopt.loss import update_duals
 
 
 def test_margin_keeps_the_penalty_active_above_threshold():

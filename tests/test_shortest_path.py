@@ -31,7 +31,6 @@ refuse to answer, which is what these tests check `spfa` actually does
 (and `dijkstra` actually does not).
 """
 import numpy as np
-import pytest
 
 from diffopt.routing.shortest_path import dijkstra, spfa
 

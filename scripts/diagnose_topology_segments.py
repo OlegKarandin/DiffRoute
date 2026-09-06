@@ -72,7 +72,7 @@ for topo_name in ["german_17", "ind_132"]:
           f"median={float(torch.tensor(seg_len).median()):.0f}")
     print(f"  segment GSNR dB: median={float(g.median()):6.2f}  p5={float(torch.quantile(g,0.05)):.2f}")
     print(f"  segment NOISE  : median={med_noise:.5f}")
-    print(f"  What the OLD absolute floor (t*ln2) would have done on this topology:")
+    print("  What the OLD absolute floor (t*ln2) would have done on this topology:")
     for t in [0.5, 0.01]:
         floor = t * math.log(2)
         frac = float((noise < floor).float().mean())

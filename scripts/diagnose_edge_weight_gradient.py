@@ -162,17 +162,17 @@ def main() -> None:
         if p1 is not None and p2 is not None and np.array_equal(p1, p2):
             identical += 1
     print(f"  routes identical under w vs 0.5*w: {identical}/{len(demands)} demands")
-    print(f"  => feasibility_loss and device_count are UNCHANGED by the rescale (Dijkstra's")
-    print(f"     argmin is scale-invariant). Post-fix, path_noise_loss no longer reads")
-    print(f"     edge_weights at all -- it reads the fixed edge_ase_noise buffer -- so it")
-    print(f"     is UNCHANGED by this rescale too, not merely 'scales by exactly 0.5' as")
-    print(f"     pre-fix path_cost_loss did.")
-    print(f"  => Pre-fix this made 'shrink all weights' a FREE descent direction with no")
-    print(f"     counter-pressure anywhere in the loss. Post-fix, pipeline.forward")
-    print(f"     renormalises edge_weights to unit mean with a live divisor before")
-    print(f"     routing, removing the scale degree of freedom from the loss entirely --")
-    print(f"     this check now just confirms Dijkstra's pre-existing scale-invariance,")
-    print(f"     it is not evidence of a collapse-enabling free direction anymore.\n")
+    print("  => feasibility_loss and device_count are UNCHANGED by the rescale (Dijkstra's")
+    print("     argmin is scale-invariant). Post-fix, path_noise_loss no longer reads")
+    print("     edge_weights at all -- it reads the fixed edge_ase_noise buffer -- so it")
+    print("     is UNCHANGED by this rescale too, not merely 'scales by exactly 0.5' as")
+    print("     pre-fix path_cost_loss did.")
+    print("  => Pre-fix this made 'shrink all weights' a FREE descent direction with no")
+    print("     counter-pressure anywhere in the loss. Post-fix, pipeline.forward")
+    print("     renormalises edge_weights to unit mean with a live divisor before")
+    print("     routing, removing the scale degree of freedom from the loss entirely --")
+    print("     this check now just confirms Dijkstra's pre-existing scale-invariance,")
+    print("     it is not evidence of a collapse-enabling free direction anymore.\n")
 
     # =====================================================================
     # B/C/F. Gradient decomposition at both operating points
@@ -314,8 +314,8 @@ def main() -> None:
               f"max = {pert.max():.4e}")
         ratio = (pert.max() / wv.median()).item() if wv.median() > 0 else float("inf")
         print(f"     max perturbation / median weight = {ratio:.3e}")
-        print(f"     (pre-fix this read 7.9e6 at epoch 60; with weights pinned to")
-        print(f"      unit mean it should now read O(1-10), a genuine perturbation)\n")
+        print("     (pre-fix this read 7.9e6 at epoch 60; with weights pinned to")
+        print("      unit mean it should now read O(1-10), a genuine perturbation)\n")
 
     # =====================================================================
     # E. Barrier routing
@@ -332,9 +332,12 @@ def main() -> None:
             continue
         et = np.flatnonzero(pi_t > 0.5)
         es = np.flatnonzero(pi_s > 0.5)
-        tr_max.append(w_trained[et].max()); sp_max.append(w_trained[es].max())
-        tr_km.append(lens[et].sum());       sp_km.append(lens[es].sum())
-        tr_hops.append(len(et));            sp_hops.append(len(es))
+        tr_max.append(w_trained[et].max())
+        sp_max.append(w_trained[es].max())
+        tr_km.append(lens[et].sum())
+        sp_km.append(lens[es].sum())
+        tr_hops.append(len(et))
+        sp_hops.append(len(es))
     tr_max, sp_max = np.array(tr_max), np.array(sp_max)
     print(f"  mean km          trained={np.mean(tr_km):8.1f}   shortest={np.mean(sp_km):8.1f}"
           f"   ratio={np.mean(tr_km)/np.mean(sp_km):.3f}x")

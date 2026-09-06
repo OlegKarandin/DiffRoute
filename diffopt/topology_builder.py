@@ -96,7 +96,6 @@ def build_topology_json(
 
 
 if __name__ == "__main__":
-    import sys
     base = Path(__file__).parent.parent
 
     build_topology_json(

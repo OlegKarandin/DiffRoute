@@ -38,7 +38,8 @@ with torch.no_grad():
                                         pipe._num_nodes, lambda_=vlastelica_lambda)
         s, b = segment_path(o, d.src, cands, edges, d.dst)
         if 3 <= len(s) <= 4 and len(o) >= 5:
-            pick = (d, pi, o, s, b); break
+            pick = (d, pi, o, s, b)
+            break
     d, pi, ordered, segs, bnodes = pick
 
     print(f"DEMAND {d.id}: node {d.src} -> node {d.dst}, {d.bitrate_gbps} Gbps")
@@ -48,7 +49,7 @@ with torch.no_grad():
     print(f"STAGE 4a  ordered edge IDs (from Dijkstra's own prev-chain): {ordered}")
 
     node = d.src
-    print(f"\n  node walk (regen candidates = degree>=3, marked *):")
+    print("\n  node walk (regen candidates = degree>=3, marked *):")
     print(f"    start  node {node}{'*' if node in cands else ''}")
     for eid in ordered:
         e = edges[eid]
@@ -81,7 +82,7 @@ with torch.no_grad():
     _, gsnr_preds, _, alloc = pipe([d], tau=1.0, lambda_=vlastelica_lambda)
     n_bnd = len(bnodes)
     bp = [alloc.a[0, k] for k in range(n_bnd)]
-    print(f"\nSTAGE 4e/6  AllocationHead.rollout -> a[demand, boundary]")
+    print("\nSTAGE 4e/6  AllocationHead.rollout -> a[demand, boundary]")
     print(f"    boundary nodes {bnodes}")
     print(f"    a             {[f'{p.item():.3f}' for p in bp]}")
     print(f"    device_count (sum over demands and boundaries) = "
@@ -101,8 +102,8 @@ with torch.no_grad():
     print(f"\nSTAGE 4f  SegmentCombiner(segment_gsnrs, boundary_probs={[f'{p:.2f}' for p in bp]})")
     out = pipe.segment_combiner(gs, bp)
     print(f"    -> path GSNR = {out.item():6.2f} dB")
-    print(f"\n  span features fed to QoT are 5 cols: "
-          f"[span_len, fiber_idx, amp_nf, load_frac, accum_dist]")
+    print("\n  span features fed to QoT are 5 cols: "
+          "[span_len, fiber_idx, amp_nf, load_frac, accum_dist]")
     sf, pm = pipe._extract_span_features(segs[-1], ctx.device)
     ns = int(pm.sum())
     print(f"  e.g. last segment's {ns} real spans (of {pipe.max_spans} padded rows):")

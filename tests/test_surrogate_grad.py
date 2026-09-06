@@ -14,8 +14,6 @@ Unit tests for the Vlastelica surrogate gradient through Dijkstra.
     S-B-T: edges e1, e3
 """
 
-import numpy as np
-import pytest
 import torch
 
 from diffopt.routing.surrogate import surrogate_shortest_path
