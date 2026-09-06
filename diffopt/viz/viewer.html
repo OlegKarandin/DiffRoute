@@ -292,6 +292,13 @@
 
   .map-svg:active { cursor: grabbing; }
 
+  .map-legend {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
   .map-node text {
     font-family: var(--font-mono);
     pointer-events: none;
@@ -516,6 +523,7 @@
   </main>
 
   <footer id="scrubber">
+    <button class="scrub-btn" id="scrub-play" aria-label="Play" onclick="togglePlay()">&#9654;</button>
     <button class="scrub-btn" id="scrub-prev" aria-label="Previous epoch (Left arrow)">&#8249;</button>
     <div class="scrub-track-wrap">
       <input type="range" id="scrub-range" min="0" step="1" value="0" aria-label="Epoch scrubber">
@@ -617,7 +625,7 @@
     const n = Math.max(1, TOPO.num_nodes);
     const unit = Math.min(MAP_PLOT_W, MAP_PLOT_H) / Math.sqrt(n);
     const nodeR = Math.max(3, unit * 0.16);
-    const regenR = nodeR * 1.45;
+    const regenR = nodeR * 1.25;
     const pipR = Math.max(1.3, nodeR * 0.30);
     const pipHaloR = pipR * 1.6;
     const ribbonW = nodeR * 0.5;               // consumed by Task 9
@@ -955,6 +963,7 @@
         `<button type="button" class="scrub-btn" onclick="resetMapView()" aria-label="Reset zoom" title="Reset zoom">&#8962;</button>` +
       `</div>`;
     const mv = mapViewOrDefault();
+    const focusActive = !!(state.focus && frame.lightpaths.has(state.focus.d));
 
     mapBody.innerHTML =
       `<div class="map-counter" id="map-counter">` +
@@ -970,7 +979,33 @@
       `<g id="map-ribbons"></g>` +
       `<g id="map-nodes">${nodesSvg}</g>` +
       `<g id="map-focus-glyphs"></g>` +
-      `</svg>`;
+      `</svg>` +
+      `<div class="map-legend">${mapLegendHtml(focusActive)}</div>`;
+  }
+
+  // Two distinct legends -- general browsing and focus mode show different
+  // marks, so a single combined legend would explain glyphs that aren't
+  // even on screen. Swapped automatically by renderMap() based on whether
+  // a focused lightpath is actually present in the current frame.
+  function mapLegendHtml(focusActive) {
+    if (focusActive) {
+      return (
+        `<span style="color:var(--red)">&#9644;</span>/` +
+        `<span style="color:var(--orange)">&#9644;</span>/` +
+        `<span style="color:var(--green)">&#9644;</span> focused route, coloured by accumulated chunk margin &middot; ` +
+        `<strong>&#9670;</strong> regenerator here &middot; <strong>&#9671;</strong> regenerator removed since &middot; ` +
+        `<span style="color:var(--load)">&#9711;</span> src (solid ring) / dst (dashed ring) &middot; ` +
+        `faint grey = other lightpaths &middot; thin fading grey = this route in an earlier epoch`
+      );
+    }
+    return (
+      `line width = load, hairline = idle &middot; ` +
+      `node outline: grey = ordinary, black = regen candidate &middot; ` +
+      `<span style="color:var(--green)">green</span>/<span style="color:var(--red)">red</span> outline = ` +
+      `regenerator added/removed this epoch &middot; ` +
+      `dots = devices at a site &middot; ` +
+      `<span style="color:var(--red)">red</span>/<span style="color:var(--orange)">orange</span> path = below/near threshold`
+    );
   }
 
   // ---- focus picker: a UI element for selecting ANY lightpath (Task 8's
@@ -1993,6 +2028,46 @@
     setEpochByIndex(epochIndex(state.epoch) + delta);
   }
 
+  // -------------------------------------------------------------------
+  // Play/pause: auto-advance the scrubber at a fixed interval so the
+  // routing/regeneration trade-off can be watched play out, not just
+  // stepped through one click at a time. Stops on its own at the last
+  // epoch; any manual scrub input (drag, prev/next, arrow keys) also
+  // stops it, via the stopPlay() calls in initScrubber(), so it never
+  // fights the user's own input.
+  // -------------------------------------------------------------------
+  const PLAY_INTERVAL_MS = 350;
+  let playTimer = null;
+
+  function isPlaying() { return playTimer !== null; }
+
+  function updatePlayButton() {
+    const btn = document.getElementById('scrub-play');
+    if (!btn) return;
+    btn.textContent = isPlaying() ? '⏸' : '▶';
+    btn.setAttribute('aria-label', isPlaying() ? 'Pause' : 'Play');
+  }
+
+  function stopPlay() {
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    updatePlayButton();
+  }
+
+  function startPlay() {
+    if (playTimer || !EPOCHS.length) return;
+    // Already at the end: replay from the start rather than doing nothing.
+    if (epochIndex(state.epoch) >= EPOCHS.length - 1) setEpochByIndex(0);
+    playTimer = setInterval(() => {
+      if (epochIndex(state.epoch) >= EPOCHS.length - 1) { stopPlay(); return; }
+      stepEpoch(1);
+    }, PLAY_INTERVAL_MS);
+    updatePlayButton();
+  }
+
+  function togglePlay() {
+    if (isPlaying()) stopPlay(); else startPlay();
+  }
+
   // render(): this task's stub only updates the scrubber readout. Tasks
   // 8-11 extend this same function to draw the map, strip and stats.
   // renderRibbons() MUST run after renderMap(): renderMap() rebuilds
@@ -2053,17 +2128,18 @@
     scrubRange.value = String(startIdx);
     if (EPOCHS.length) state.epoch = EPOCHS[startIdx];
 
-    scrubRange.addEventListener('input', () => setEpochByIndex(+scrubRange.value));
-    document.getElementById('scrub-prev').addEventListener('click', () => stepEpoch(-1));
-    document.getElementById('scrub-next').addEventListener('click', () => stepEpoch(1));
+    scrubRange.addEventListener('input', () => { stopPlay(); setEpochByIndex(+scrubRange.value); });
+    document.getElementById('scrub-prev').addEventListener('click', () => { stopPlay(); stepEpoch(-1); });
+    document.getElementById('scrub-next').addEventListener('click', () => { stopPlay(); stepEpoch(1); });
 
     // Global arrow-key stepping. Skip while the range input itself has
     // focus: it already steps by one on ArrowLeft/ArrowRight natively and
     // fires its own 'input' event, so handling it here too would double-step.
     document.addEventListener('keydown', (e) => {
       if (e.target === scrubRange) return;
-      if (e.key === 'ArrowLeft') { stepEpoch(-1); e.preventDefault(); }
-      else if (e.key === 'ArrowRight') { stepEpoch(1); e.preventDefault(); }
+      if (e.key === 'ArrowLeft') { stopPlay(); stepEpoch(-1); e.preventDefault(); }
+      else if (e.key === 'ArrowRight') { stopPlay(); stepEpoch(1); e.preventDefault(); }
+      else if (e.key === ' ') { togglePlay(); e.preventDefault(); }
       else if (e.key === 'Escape' && state.focus) { focusLightpath(null); }
     });
   }
