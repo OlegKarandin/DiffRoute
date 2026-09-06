@@ -2,10 +2,12 @@
 import math
 
 import torch
+import torch.nn.functional as F
 import pytest
 
 from diffopt.demands import Demand
 from diffopt.loss import compute_loss, update_duals
+from diffopt.modulation import ModulationConfig
 
 from tests.test_pipeline import make_mod_config
 
@@ -79,6 +81,163 @@ def test_metrics_dict_has_the_keys_train_py_logs(simple_loss_inputs):
 def test_num_infeasible_counts_only_below_threshold_demands(simple_loss_inputs):
     _, metrics = compute_loss(**simple_loss_inputs)
     assert metrics["num_infeasible"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Equivalence oracle for the A4 vectorisation (perf task 7): compute_loss used
+# to loop `for demand in demands:` in Python, doing ~3 device syncs per
+# demand. The loop below is a verbatim copy of that OLD per-demand logic,
+# kept here as a manual reference oracle so the vectorized compute_loss can
+# be checked against it directly, rather than trusting that a refactor
+# preserved behaviour by inspection.
+# ---------------------------------------------------------------------------
+
+
+def test_vectorized_compute_loss_matches_the_old_per_demand_loop():
+    """demand-list order is deliberately NOT demand.id order here (ids
+    [4, 0, 5, 2, 1, 3] against list positions [0..5]), to exercise the
+    index-mismatch trap: `shortfalls`/`constraint_g` are scattered by
+    `demand.id`, while `bar_db_for_demands` and the stacked GSNR predictions
+    are in demand-list order. Getting the scatter wrong here would pass on
+    the existing tests (which all happen to use contiguous, list-order ids)
+    but fail here."""
+    torch.manual_seed(12345)
+
+    mod_cfg = ModulationConfig(
+        channel_spacing_ghz=100.0,
+        symbol_rate_gbaud=64.0,
+        num_channels_cband=48,
+        cut_channel_index=24,
+        formats=[
+            {"bitrate_gbps": 100, "snr_threshold_db": 10.0},
+            {"bitrate_gbps": 200, "snr_threshold_db": 14.0},
+            {"bitrate_gbps": 300, "snr_threshold_db": 18.0},
+            {"bitrate_gbps": 400, "snr_threshold_db": 22.0},
+            {"bitrate_gbps": 500, "snr_threshold_db": 26.0},
+        ],
+    )
+    bitrate_options = mod_cfg.bitrate_options
+
+    num_demands = 6
+    id_order = [4, 0, 5, 2, 1, 3]  # list position i -> demand.id id_order[i]
+    bitrates = [bitrate_options[i % len(bitrate_options)] for i in range(num_demands)]
+    demands = [
+        Demand(id=id_order[i], src=i, dst=(i + 1) % num_demands,
+               bitrate_gbps=float(bitrates[i]))
+        for i in range(num_demands)
+    ]
+
+    # GSNR predictions scattered around each demand's own threshold, so the
+    # random draw produces a realistic mix of violated/feasible/margin-only
+    # demands. Two independent leaf-tensor copies (same values) so the
+    # reference loop's backward() and the vectorized call's backward() don't
+    # accumulate into the same .grad.
+    raw_values = {}
+    for d in demands:
+        threshold = mod_cfg.required_snr_threshold(d.bitrate_gbps)
+        raw_values[d.id] = threshold + torch.randn(()).item() * 3.0
+    gsnr_preds_ref = {i: torch.tensor(v, requires_grad=True) for i, v in raw_values.items()}
+    gsnr_preds_vec = {i: torch.tensor(v, requires_grad=True) for i, v in raw_values.items()}
+
+    path_noise_costs = {d.id: torch.rand(()) * 2.0 for d in demands}
+    duals = torch.rand(num_demands) * 5.0
+    device_count = torch.tensor(4.0)
+    rho = 3.7
+    margin_db = 0.35
+    lambda_dev = 0.2
+    lambda_cost = 0.05
+
+    # --- Reference oracle: verbatim copy of the OLD per-demand loop ---
+    device = duals.device
+    weighted_feasibility_ref = torch.zeros((), device=device)
+    feasibility_loss_ref = torch.zeros((), device=device)
+    shortfalls_ref = torch.zeros(duals.shape[0], device=device)
+    constraint_g_ref = torch.zeros(duals.shape[0], device=device)
+    num_infeasible_ref = 0
+    num_violated_ref = 0
+    worst_margin_db_ref = math.inf
+
+    for demand in demands:
+        threshold = mod_cfg.required_snr_threshold(demand.bitrate_gbps)
+        bar_t = torch.tensor(threshold + margin_db, device=device, dtype=torch.float32)
+
+        g = bar_t - gsnr_preds_ref[demand.id]
+        shortfall = F.relu(g)
+
+        z = F.relu(duals[demand.id] + rho * g)
+        weighted_feasibility_ref = weighted_feasibility_ref + (
+            (z * z - duals[demand.id] ** 2) / (2.0 * rho)
+        )
+
+        feasibility_loss_ref = feasibility_loss_ref + shortfall
+
+        shortfall_value = shortfall.item()
+        shortfalls_ref[demand.id] = shortfall_value
+        constraint_g_ref[demand.id] = g.item()
+        if shortfall_value > 0:
+            num_violated_ref += 1
+
+        margin = gsnr_preds_ref[demand.id].item() - threshold
+        if margin < 0:
+            num_infeasible_ref += 1
+        worst_margin_db_ref = min(worst_margin_db_ref, margin)
+
+    path_noise_loss_ref = sum(path_noise_costs.values(), torch.zeros((), device=device))
+    total_ref = (
+        weighted_feasibility_ref
+        + lambda_dev * device_count
+        + lambda_cost * path_noise_loss_ref
+    )
+    total_ref.backward()
+
+    # --- Vectorized implementation under test ---
+    total, metrics = compute_loss(
+        gsnr_preds=gsnr_preds_vec,
+        path_noise_costs=path_noise_costs,
+        demands=demands,
+        device_count=device_count,
+        modulation_config=mod_cfg,
+        duals=duals,
+        rho=rho,
+        margin_db=margin_db,
+        lambda_dev=lambda_dev,
+        lambda_cost=lambda_cost,
+    )
+    total.backward()
+
+    # Integer counters: exact.
+    assert metrics["num_violated"] == num_violated_ref
+    assert metrics["num_infeasible"] == num_infeasible_ref
+
+    # Per-demand output vectors, indexed by demand.id: exact.
+    assert torch.equal(metrics["shortfalls"], shortfalls_ref)
+    assert torch.equal(metrics["constraint_g"], constraint_g_ref)
+    assert not metrics["shortfalls"].requires_grad
+    assert not metrics["constraint_g"].requires_grad
+
+    # Exact, not approx: both paths compute this bare-threshold margin at
+    # float64 precision (the old loop via `.item()` widening, the vectorized
+    # version explicitly), and min() is order-independent, so there is no
+    # summation-order noise to tolerate here.
+    assert metrics["worst_margin_db"] == worst_margin_db_ref
+
+    # Scalar reductions: float32 tolerance (summation-order noise between the
+    # accumulating loop and the batched .sum() is expected, not a bug — same
+    # rel=1e-6 convention as test_device_count_is_priced_by_lambda_dev above).
+    assert metrics["weighted_feasibility_loss"] == pytest.approx(
+        weighted_feasibility_ref.item(), rel=1e-6
+    )
+    assert metrics["feasibility_loss"] == pytest.approx(
+        feasibility_loss_ref.item(), rel=1e-6
+    )
+    assert total.item() == pytest.approx(total_ref.item(), rel=1e-6)
+
+    # Gradient still flows through the batched stack/gather, per demand.
+    for d in demands:
+        assert gsnr_preds_vec[d.id].grad is not None
+        assert gsnr_preds_vec[d.id].grad.item() == pytest.approx(
+            gsnr_preds_ref[d.id].grad.item(), rel=1e-6
+        )
 
 
 # ---------------------------------------------------------------------------

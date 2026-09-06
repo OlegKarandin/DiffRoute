@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from diffopt.demands import Demand
-from diffopt.modulation import ModulationConfig
+from diffopt.modulation import ModulationConfig, bar_db_for_demands
 
 
 def compute_loss(
@@ -129,7 +129,8 @@ def compute_loss(
         )
 
     # Start as zero tensors (not float 0) so the graph is valid even when
-    # all demands are feasible and no shortfall terms are added.
+    # all demands are feasible and no shortfall terms are added, and so an
+    # empty demand list still produces a valid tensor graph below.
     weighted_feasibility = torch.zeros((), device=device)
     feasibility_loss = torch.zeros((), device=device)
     # Detached diagnostic — deliberately not part of the graph.
@@ -138,46 +139,78 @@ def compute_loss(
     # what `update_duals` consumes (falling on slack is the point).
     constraint_g = torch.zeros(duals.shape[0], device=device)
 
-    num_infeasible = 0
-    num_violated = 0
-    worst_margin_db = math.inf
-
-    for demand in demands:
-        threshold = modulation_config.required_snr_threshold(demand.bitrate_gbps)
-        # The bar the constraint enforces is threshold + margin.
-        bar_t = torch.tensor(threshold + margin_db, device=device, dtype=torch.float32)
+    if not demands:
+        # No vectorized "min of an empty tensor" gives this for free
+        # (torch.tensor([]).min() raises) — explicit branch, per
+        # test_empty_demand_list_does_not_crash.
+        num_infeasible = 0
+        num_violated = 0
+        worst_margin_db = math.nan
+    else:
+        # `bar` and the stacked GSNR predictions are in DEMAND-LIST order.
+        # `shortfalls`/`constraint_g` above are sized by `duals.shape[0]`
+        # and indexed by `demand.id` — the two orderings coincide today only
+        # because diffopt/traffic.py renumbers ids contiguously in list
+        # order; do not assume that in general, hence the explicit
+        # `ids`-indexed scatter below rather than positional assignment.
+        bar = bar_db_for_demands(demands, modulation_config, margin_db).to(device)
+        # Live tensors, not `.item()`'d — gradient still flows through the
+        # stack.
+        gsnr_stacked = torch.stack([gsnr_preds[demand.id] for demand in demands])
+        ids = torch.tensor([demand.id for demand in demands], device=device)
 
         # SIGNED and live in the graph. The relu is taken separately below
         # for the one consumer that genuinely wants a one-sided quantity —
         # the logged `feasibility_loss` — because the augmented term needs
         # `g` itself: carrying force while g < 0 is its entire purpose.
-        g = bar_t - gsnr_preds[demand.id]
+        g = bar - gsnr_stacked
         shortfall = F.relu(g)
 
-        z = F.relu(duals[demand.id] + rho * g)
-        weighted_feasibility = weighted_feasibility + (
-            (z * z - duals[demand.id] ** 2) / (2.0 * rho)
-        )
-
+        duals_gathered = duals[ids]
+        z = F.relu(duals_gathered + rho * g)
         # Unweighted sum kept so the logged feasibility_loss column stays
         # comparable across epochs while the duals are deliberately
         # non-stationary.
-        feasibility_loss = feasibility_loss + shortfall
+        weighted_feasibility = ((z * z - duals_gathered ** 2) / (2.0 * rho)).sum()
+        feasibility_loss = shortfall.sum()
 
-        shortfall_value = shortfall.item()
-        shortfalls[demand.id] = shortfall_value
-        constraint_g[demand.id] = g.item()
-        if shortfall_value > 0:
-            num_violated += 1
+        # Scatter explicitly by `demand.id`, NOT by list position: `ids` is
+        # in demand-list order, but the two output tensors are indexed by
+        # id, and the two orderings need not coincide (see the ids comment
+        # above).
+        shortfalls[ids] = shortfall.detach()
+        constraint_g[ids] = g.detach()
 
-        # num_infeasible is measured against the BARE threshold, so it stays
-        # directly comparable to every pre-change number in the investigation
-        # record. num_violated is the stricter, margin-inclusive count the
-        # duals actually act on.
-        margin = gsnr_preds[demand.id].item() - threshold
-        if margin < 0:
-            num_infeasible += 1
-        worst_margin_db = min(worst_margin_db, margin)
+        # num_infeasible is measured against the BARE threshold (not `bar`,
+        # which already includes margin_db), so it stays directly comparable
+        # to every pre-change number in the investigation record.
+        # num_violated is the stricter, margin-inclusive count the duals
+        # actually act on — these two counters are deliberately measured
+        # against different thresholds, computed independently here.
+        #
+        # float64, not float32: the old loop computed
+        # `gsnr_preds[demand.id].item() - threshold` as a subtraction of two
+        # Python floats (float64) — `.item()` on a float32 tensor widens
+        # exactly, with no rounding, so that subtraction ran at float64
+        # precision. Doing the same subtraction in float32 tensor ops would
+        # add its own rounding on top of the expected summation-order noise,
+        # so this one materialization is done at float64 to match exactly
+        # rather than merely approximately.
+        thresholds = torch.tensor(
+            [modulation_config.required_snr_threshold(demand.bitrate_gbps)
+             for demand in demands],
+            dtype=torch.float64,
+        )
+        # One materialization (one device sync) instead of ~3 per demand.
+        diag = torch.cat([
+            (shortfall.detach() > 0).to(torch.float64),
+            gsnr_stacked.detach().double().cpu() - thresholds,
+        ]).cpu()
+        n = len(demands)
+        violated_flags, margins = diag[:n], diag[n:]
+        num_violated = int(violated_flags.sum().item())
+        num_infeasible = int((margins < 0).sum().item())
+        worst_margin_db = margins.min().item()
 
     # sum() over dict values — each is a scalar tensor live in the autograd graph.
     # Seed with a zero tensor so an empty demand list still yields a tensor
@@ -202,7 +235,7 @@ def compute_loss(
         "device_count": float(device_count.item()),
         "num_infeasible": num_infeasible,
         "num_violated": num_violated,
-        "worst_margin_db": worst_margin_db if demands else math.nan,
+        "worst_margin_db": worst_margin_db,
         "shortfalls": shortfalls,
         "constraint_g": constraint_g,
     }
