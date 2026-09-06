@@ -1238,18 +1238,33 @@
       `stroke-linecap="round" stroke-linejoin="round"/>`;
 
     const frags = ribbonSegments(fullNodeIds);
+    const cutSet = new Set(lp.cut_idx);
     let edgeStart = 0;
+    let chunkNoise = 0; // linear noise accumulated so far within the CURRENT
+                         // chunk -- mirrors chunkLevels()/worstChunkDb()
+                         // exactly (docs/architecture/invariants.md, "Physics
+                         // layer": noise adds WITHIN a chunk, never across a
+                         // cut). A segment's OWN raw seg_gsnr_db can look
+                         // fine while the chunk it's part of has already
+                         // accumulated enough noise to fail -- that's exactly
+                         // the demo's own worked example (two ~16.6 dB
+                         // segments combine to a 13.2 dB chunk) -- so the
+                         // colour here is the running fold, not the raw value.
     for (let s = 0; s < lp.segs.length; s++) {
       const segLen = lp.segs[s].length;
       const segFrags = frags.slice(edgeStart, edgeStart + segLen);
       edgeStart += segLen;
-      if (!segFrags.length) continue;
-      const segMargin = lp.seg_gsnr_db[s] - demand.threshold_db;
-      const colour = colourOf(segMargin);
-      ribbons += `<path class="map-ribbon" d="${stitchFragments(segFrags)}" fill="none" stroke="var(--${colour})" ` +
-        `stroke-width="${(scale.ribbonW * 1.35).toFixed(2)}" stroke-opacity="1" ` +
-        `stroke-linecap="round" stroke-linejoin="round" onclick="event.stopPropagation(); focusLightpath(${lp.d})">` +
-        `<title>${escHtml(`demand ${lp.d} segment ${s}: ${segMargin.toFixed(2)} dB margin`)}</title></path>`;
+      chunkNoise += Math.pow(10, -lp.seg_gsnr_db[s] / 10);
+      const runningGsnr = -10 * Math.log10(chunkNoise);
+      if (segFrags.length) {
+        const segMargin = runningGsnr - demand.threshold_db;
+        const colour = colourOf(segMargin);
+        ribbons += `<path class="map-ribbon" d="${stitchFragments(segFrags)}" fill="none" stroke="var(--${colour})" ` +
+          `stroke-width="${(scale.ribbonW * 1.35).toFixed(2)}" stroke-opacity="1" ` +
+          `stroke-linecap="round" stroke-linejoin="round" onclick="event.stopPropagation(); focusLightpath(${lp.d})">` +
+          `<title>${escHtml(`demand ${lp.d} segment ${s}: ${segMargin.toFixed(2)} dB margin (accumulated within this chunk)`)}</title></path>`;
+      }
+      if (cutSet.has(s)) chunkNoise = 0; // regenerator: next segment starts a fresh chunk
     }
 
     const currentCuts = new Set(lp.cut_nodes);
