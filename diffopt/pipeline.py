@@ -745,10 +745,7 @@ class DiffONetPipeline(nn.Module):
         path_noise_costs: Dict[int, torch.Tensor] = {}
         gsnr_preds: Dict[int, torch.Tensor] = {}
         path_indicators: Dict[int, torch.Tensor] = {}
-        flat_idx = 0
 
-        segment_gsnr_flat: List[torch.Tensor] = []
-        proxy_flat: List[torch.Tensor] = []
         seg_rows: List[int] = []
         seg_cols: List[int] = []
         seg_km_flat: List[float] = []
@@ -769,12 +766,6 @@ class DiffONetPipeline(nn.Module):
                 # SegmentCombiner's [-5, 35] dB clamp range, the STE gradient
                 # for this segment is zeroed by that clamp (segment_combiner.py's
                 # _safe_noise has zero gradient outside the clamped band).
-                segment_gsnr = segment_gsnr_vec[flat_idx]
-                proxy_gsnr = proxy_gsnr_vec[flat_idx]
-                flat_idx += 1
-
-                segment_gsnr_flat.append(segment_gsnr)
-                proxy_flat.append(proxy_gsnr)
                 seg_rows.append(row)
                 seg_cols.append(col)
                 seg_km_flat.append(
@@ -795,8 +786,8 @@ class DiffONetPipeline(nn.Module):
         # worse; a correlation drifting toward 0 means the backward pass
         # is pointing somewhere the forward pass does not go.
         rank_corr = _spearman(
-            torch.stack(proxy_flat).detach(), batched_qot_gsnr
-        ) if len(proxy_flat) > 1 else float("nan")
+            proxy_gsnr_vec.detach(), batched_qot_gsnr
+        ) if proxy_gsnr_vec.shape[0] > 1 else float("nan")
 
         if demands:
             num_demands = len(demands)
@@ -804,12 +795,12 @@ class DiffONetPipeline(nn.Module):
             long_ = dict(dtype=torch.long, device=device)
 
             # index_put on a zeros tensor rather than in-place assignment:
-            # out-of-place keeps the autograd path to segment_gsnr_flat
+            # out-of-place keeps the autograd path to segment_gsnr_vec
             # explicit, and the (row, col) pairs are unique so
             # accumulate=False is right.
             gsnr_matrix = torch.zeros(num_demands, j_max, device=device).index_put(
                 (torch.tensor(seg_rows, **long_), torch.tensor(seg_cols, **long_)),
-                torch.stack(segment_gsnr_flat),
+                segment_gsnr_vec,
             )
 
             # Per-segment linear noise for the allocation carry.
