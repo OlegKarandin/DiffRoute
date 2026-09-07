@@ -43,8 +43,7 @@ hyperparameter's role.
 | Metric | Value |
 |---|---|
 | QoT surrogate val RMSE (`ind_132`, 50k/10k, 100 ep) | 0.1909 dB vs 0.25 dB target (~1.4% of the 6.5-20 dB range) |
-| Regenerator over-buy vs oracle-optimal, 300 ep, seed 42 (SGD + augmented Lagrangian vs Adam + ReLU hinge) | 4 vs 24 devices |
-| `constrained_stress` confirmatory run (20 ep) | 0 violated demands at the final epoch; 31 devices deployed, oracle-optimal is 31 |
+| Regenerator over-buy vs oracle-optimal, 300 ep, seed 42 | 4 devices |
 | Test suite | 424 tests, `pytest tests/` |
 
 ## Install
