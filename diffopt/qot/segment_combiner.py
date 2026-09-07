@@ -48,7 +48,7 @@ Two structural properties this buys, which earlier folds only approximated:
   differences scale as O(1/t) while log-probability differences are O(1), so
   probability got swamped and the fold collapsed toward the no-regen value
   regardless of p. That failure mode is now structurally impossible, not
-  merely tested against. See docs/investigations/regen_over_provisioning.md.
+  merely tested against.
 * "Regen helps" is provable rather than temperature-dependent: cutting a
   boundary splits one chunk into two no-larger pieces, so E[max] can never
   rise. The shared-temperature fold this replaced overshot a true max by a
@@ -93,8 +93,7 @@ import torch.nn as nn
 # because autograd's `mul` backward saves the non-differentiable operand, so
 # the actual retained total (u/cut accumulators plus fits, across all J-1
 # iterations) is roughly double the stated (D, R, J) estimate. At real
-# topology path lengths — 16-19 segments (ind_132's
-# km-shortest paths — see docs/investigations/fold_formula_scalability.md)
+# topology path lengths — 16-19 segments (ind_132's km-shortest paths)
 # — 2*N^4 is a few hundred KB, so a few hundred demands' worth totals well
 # under 100 MB: not a problem in practice. But before raising
 # MAX_EXACT_FOLD_SEGMENTS, redo this estimate — the O(N^4) retained-graph
@@ -145,8 +144,7 @@ def soft_max(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.5) -> torc
     temperature (0.01) overshoots by `0.01 * ln2 = 0.0069`. The error then
     exceeds the signal, `soft_max(a, b)` climbs above `a + b`, and the
     combiner reports that regenerating makes a path *worse* — inverting the
-    sign of every gradient reaching `regen_logits`. See
-    docs/investigations/regen_placement_not_concentrating.md.
+    sign of every gradient reaching `regen_logits`.
 
     Normalising by `m = max(a, b)` (detached, so it only rescales and never
     contributes gradient) makes the overshoot `m * t * delta` — proportional
@@ -268,10 +266,7 @@ class SegmentCombiner(nn.Module):
     "regenerating helps" physics invariant to survive — at t=0.5 the
     approximation's floor swamped real per-segment noise and made every
     multi-segment path look worse than not regenerating at all. The exact
-    fold removes the knob and the invariant with it; see
-    docs/investigations/CHANGELOG.md's Phase 1c corrections for the measured
-    numbers, and docs/investigations/regen_over_provisioning.md for the
-    replacement's derivation.
+    fold removes the knob and the invariant with it.
     """
 
     def forward(
@@ -322,8 +317,7 @@ class SegmentCombiner(nn.Module):
             # tractable path for very long chains (this file's own
             # float64-precision test uses thousands of segments, all p=0). A
             # genuinely separate code path from the fractional case below,
-            # not a special-cased tolerance on the same formula -- see
-            # docs/investigations/regen_over_provisioning.md.
+            # not a special-cased tolerance on the same formula.
             #
             # Reading each p via .item() to make this Python control-flow
             # decision gives this branch an exact-zero gradient w.r.t. p,
@@ -357,9 +351,9 @@ class SegmentCombiner(nn.Module):
                 raise ValueError(
                     f"SegmentCombiner's exact fractional-probability fold is "
                     f"O(N^4) and is capped at {MAX_EXACT_FOLD_SEGMENTS} "
-                    f"segments; this path has {num_segments} (real topology "
-                    f"paths measure well under the cap, see "
-                    f"docs/investigations/fold_formula_scalability.md). If "
+                    f"segments; this path has {num_segments} (real ind_132 "
+                    f"km-shortest paths measure 16-19 segments, well under "
+                    f"the cap). If "
                     f"this is a real path, something upstream changed; if "
                     f"intentional, raise the cap deliberately and check the "
                     f"memory cost first."
@@ -433,8 +427,7 @@ class SegmentCombiner(nn.Module):
                 f"segments; this batch pads to {j}. The cap applies to the "
                 f"BATCH maximum, because every demand is padded up to the "
                 f"longest one — no single demand need be that long. Real "
-                f"topology paths measure 16-19 segments, see "
-                f"docs/investigations/fold_formula_scalability.md."
+                f"topology paths measure 16-19 segments."
             )
 
         device = segment_gsnrs_db.device

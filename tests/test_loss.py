@@ -63,7 +63,7 @@ def test_empty_demand_list_does_not_crash():
 
 
 def test_metrics_dict_has_the_keys_train_py_logs(simple_loss_inputs):
-    """train.py and every milestone claim in docs/investigations/CHANGELOG.md read these keys."""
+    """train.py and every published milestone claim read these keys."""
     _, metrics = compute_loss(**simple_loss_inputs)
     for key in (
         "feasibility_loss",

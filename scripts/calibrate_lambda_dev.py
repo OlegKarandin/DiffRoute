@@ -28,7 +28,7 @@ Two independent checks, and if they conflict CHECK 2 WINS:
 Check 1's own force-ratio measurement below still uses the ORIGINAL
 one-sided hinge-shaped quantity `sum_d dual_d * relu(bar_d - gsnr_d)` as its
 proxy for "the feasibility push" — a quantity `compute_loss` itself no
-longer computes (open_followups.md item #8 removed the hinge penalty). This
+longer computes (the hinge penalty was removed 2026-09). This
 is the SAME known limitation `calibrate_rho.py`'s docstring already flags:
 that quantity is unmeasurable at the state that actually matters, an
 allocation where every demand is already feasible. Only check 2, which

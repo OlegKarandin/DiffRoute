@@ -8,13 +8,13 @@ differentiates w.r.t. `pipeline.edge_log_weight` and converts to
 d/d(raw weight) by the chain rule (dw/dtheta = sigmoid(theta)) rather than
 hanging a register_forward_hook on a module that no longer exists.
 
-Follow-up #2 in docs/investigations/open_followups.md measured the symptom
+An earlier investigation measured the symptom
 (86% of ind_132's 168 edges below 1e-6, corr(weight, length_km) = -0.17,
 routes 2.1-2.4x longer than shortest-by-km) and proposed a mechanism it
 explicitly flagged as unconfirmed: that `path_cost_loss`'s gradient
 dominates the STE-routed feasibility gradient on the edges that collapse.
 
-This script began as that doc's stated "Next step" — the `edge_weights`
+This script began as that investigation's stated "Next step" — the `edge_weights`
 analogue of `diagnose_alloc_gradient.py` — to characterize the collapse.
 The fix has since landed (unit-mean renormalisation with a live divisor,
 redenominating `path_cost_loss` in the fixed `edge_ase_noise` buffer instead

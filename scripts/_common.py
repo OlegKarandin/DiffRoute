@@ -13,8 +13,8 @@ copies had quietly drifted apart:
     net is constructed. Several scripts used `torch.manual_seed(0)` (a net
     training never saw) or no seed at all.
   - edge_weights: `pipeline.forward` renormalises the raw Softplus of
-    `edge_log_weight` to unit mean before routing on it
-    (docs/investigations/CHANGELOG.md#correction-1c-9). That renormalisation
+    `edge_log_weight` to unit mean before routing on it. That
+    renormalisation
     was reproduced in only 2 of the 6 places scripts recomputed edge_weights
     outside the real forward() call; one script printed the raw output
     labelled `edge_weights`.

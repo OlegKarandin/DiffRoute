@@ -1,6 +1,6 @@
 """
 Direct tests for spfa — the reason Dijkstra was replaced in the Vlastelica
-backward pass (docs/investigations/CHANGELOG.md#correction-1b-2): perturbed weights
+backward pass: perturbed weights
 c + lambda*grad can be negative, and Dijkstra hangs or is wrong on those.
 
 Real signature (read from diffopt/routing/shortest_path.py; the brief's
@@ -203,7 +203,7 @@ def test_cached_structure_does_not_freeze_the_weights():
 
 
 # ---------------------------------------------------------------------------
-# return_order — open_followups.md #7b / Finding 1: Dijkstra's own
+# return_order — Dijkstra's own
 # prev-chain already has the src->dst edge order, so a caller should not
 # need a second graph walk to recover it from the unordered indicator.
 # ---------------------------------------------------------------------------
@@ -240,8 +240,7 @@ def test_return_order_true_matches_a_manual_walk_of_the_indicator():
     src->dst walk a caller would get by manually tracing the indicator's
     active edges from src — which is what the deleted
     diffopt.pipeline._reconstruct_path used to do as a second graph walk
-    (verified equivalent on all 346 real ind_132 demands per
-    pipeline_profile_and_restoration_scaling.md, Finding 1)."""
+    (verified equivalent on all 346 real ind_132 demands)."""
     edge_index = _edges([(0, 1), (0, 2), (1, 3), (2, 3)])
     weights = np.array([1.0, 9.0, 1.0, 9.0])
 

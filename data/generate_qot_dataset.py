@@ -277,9 +277,8 @@ def compute_duplication_stats(train_df: pd.DataFrame, val_df: pd.DataFrame) -> d
     A small topology's segment/channel-loading space is finite (bounded by
     node/edge count x 48 quantized loading levels) — at high enough sample
     counts, duplication is an expected, real property of that bounded
-    space, not necessarily a bug (see docs/investigations/CHANGELOG.md's
-    Phase 1a milestone note for the investigation that established this for
-    german_17). But it's
+    space, not necessarily a bug — established on german_17 during Phase
+    1a. But it's
     invisible unless measured, and it directly affects how a `val_rmse`
     number should be interpreted (a val row that also appears in train
     isn't testing generalization to anything new). This makes it visible

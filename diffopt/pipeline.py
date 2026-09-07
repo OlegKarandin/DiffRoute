@@ -124,10 +124,9 @@ def _ste_proxy_batched(
 
     Perf note (A3): this replaces a Python loop that built a fresh
     `torch.tensor(seg_edge_ids)` + gather + `.sum()` + `log10` PER SEGMENT
-    (~2,400 tiny autograd nodes/forward on ind_132/constrained_stress — see
-    docs/investigations/pipeline_profile_and_restoration_scaling.md) with one
-    padded `(S, L_max)` index/mask structure and a handful of batched tensor
-    ops.
+    (~2,400 tiny autograd nodes/forward on ind_132/constrained_stress) with
+    one padded `(S, L_max)` index/mask structure and a handful of batched
+    tensor ops.
 
     `all_segments[i]` is segment i's list of edge ids and
     `segment_owner_demand_id[i]` is the id of the demand that owns it; both
@@ -243,9 +242,9 @@ class AllocationOutputs:
                                       # and used to let it die as a local;
                                       # re-deriving it downstream would mean
                                       # resurrecting _reconstruct_path, deleted
-                                      # as a ~0.7 s/forward regression
-                                      # (open_followups.md #7b). Concatenating
-                                      # the groups gives the ordered edge list;
+                                      # as a ~0.7 s/forward regression.
+                                      # Concatenating the groups gives the
+                                      # ordered edge list;
                                       # the grouping aligns seg_gsnr_db[k] with
                                       # a stretch of the route.
     ste_clamped_segments: int         # count of segments whose qot_gsnr fell
@@ -362,8 +361,7 @@ class DiffONetPipeline(nn.Module):
         # 19-597 while the two regen_prob columns appended in forward() live
         # in [0, 1], so first-layer pre-activations were dominated by raw
         # kilometres and the random init priced longer edges CHEAPER
-        # (corr(w, length_km) = -0.463). See
-        # docs/investigations/edge_weight_scale_collapse.md.
+        # (corr(w, length_km) = -0.463).
         #
         # unbiased=False so a single-edge topology gives std 0 rather than
         # NaN; clamp_min then maps any constant column (e.g. fiber_type_idx
@@ -551,8 +549,7 @@ class DiffONetPipeline(nn.Module):
         #
         # Detaching would delete that subtraction and leave the collapse
         # degeneracy fully intact, merely rescaled — weights fell ~8.2e7x on
-        # ind_132 while Spearman rank-corr with init stayed at +0.999. See
-        # docs/investigations/edge_weight_scale_collapse.md.
+        # ind_132 while Spearman rank-corr with init stayed at +0.999.
         #
         # NOTE: this is the OPPOSITE choice from the `soft_max` helper's
         # scale normalisation in qot/segment_combiner.py, which detaches on
@@ -565,7 +562,7 @@ class DiffONetPipeline(nn.Module):
         # 4. Route and segment every demand first (no QoT calls yet), so all
         # segments across all demands can be sent through the QoT model in
         # one batched call instead of one call per segment (~920 calls/epoch
-        # at batch size 1 — see docs/investigations/open_followups.md #1).
+        # at batch size 1, measured on ind_132/constrained_stress).
         demand_path_noise_costs: Dict[int, torch.Tensor] = {}
         demand_path_indicators: Dict[int, torch.Tensor] = {}
         demand_segments: Dict[int, List[List[int]]] = {}
@@ -576,9 +573,9 @@ class DiffONetPipeline(nn.Module):
         for demand in demands:
             # 4a. Surrogate Dijkstra → (E,) binary path indicator, plus the
             # src->dst ordered edge list Dijkstra's own prev-chain already
-            # has (open_followups.md #7b / Finding 1 — this used to be
-            # rederived by _reconstruct_path re-walking the unordered
-            # indicator, ~0.7 s/forward on ind_132/constrained_stress).
+            # has (this used to be rederived by _reconstruct_path re-walking
+            # the unordered indicator, ~0.7 s/forward on
+            # ind_132/constrained_stress).
             path_indicator, ordered_edges = surrogate_shortest_path(
                 edge_weights,
                 self._edge_index,
@@ -594,8 +591,7 @@ class DiffONetPipeline(nn.Module):
             # term is degree-0 in edge_weights by construction: weights enter
             # only through Dijkstra's scale-invariant argmin. Using
             # edge_weights here instead made the term degree-1 and created an
-            # unopposed shrink direction — see
-            # docs/investigations/edge_weight_scale_collapse.md.
+            # unopposed shrink direction.
             #
             # It also restores a routing signal that survives feasibility:
             # once num_infeasible hits 0 the feasibility term contributes
@@ -630,7 +626,7 @@ class DiffONetPipeline(nn.Module):
         # memoised, padded only to this batch's true max span count (not the
         # architectural max_spans=60) — real segments run <=12 spans, median
         # ~7, so padding to 60 wastes ~98% of attention compute on masked
-        # positions (docs/investigations/open_followups.md #1). Safe because
+        # positions. Safe because
         # TransformerEncoder's src_key_padding_mask excludes padded
         # positions from attention and the mean-pool divides only by
         # real-span count, so a narrower shared width changes nothing but
@@ -933,9 +929,7 @@ class DiffONetPipeline(nn.Module):
         reusing `alloc.seg_gsnr_db`/`seg_noise`/`seg_km_matrix`/
         `num_segments`/`boundary_node_ids` is exact, not approximate.
         Verified bit-identical against a fresh forward(hard_alloc=True) pass
-        on all 346 real demands; see
-        docs/investigations/pipeline_profile_and_restoration_scaling.md,
-        Finding 2 / item A2.
+        on all 346 real demands.
 
         Runs entirely under torch.no_grad() — hard decisions carry no useful
         gradient (spec 2.5), so there is nothing to build a graph for.

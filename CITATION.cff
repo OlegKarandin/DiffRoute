@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "DiffONet: Differentiable Joint Routing and Regenerator Placement for WDM Optical Networks"
+type: software
+authors:
+  - family-names: Karandin
+    given-names: Oleg
+repository-code: "https://github.com/OlegKarandin/DiffRoute"
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: "Zero-cost upgrade to a multi-fiber network with partial lane-change capabilities"
+  authors:
+    - family-names: Karandin
+      given-names: Oleg
+    - family-names: Musumeci
+      given-names: Francesco
+    - family-names: Charlet
+      given-names: Gabriel
+    - family-names: Pointurier
+      given-names: Yvan
+    - family-names: Tornatore
+      given-names: Massimo
+  journal: "Journal of Optical Communications and Networking"
+  volume: 16
+  issue: 11
+  start: H18
+  end: H26
+  year: 2024

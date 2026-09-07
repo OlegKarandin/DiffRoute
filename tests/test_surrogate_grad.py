@@ -49,7 +49,7 @@ def test_correct_path_selection():
 
 
 def test_ordered_edges_is_src_to_dst_traversal_order():
-    """`ordered_edges` (open_followups.md #7b) must be e0, e2 in that order —
+    """`ordered_edges` must be e0, e2 in that order —
     the S->A->T walk, not just the same two edges in any order."""
     weights = make_weights(1.0, 2.0, 1.0, 2.0)
     _, ordered_edges = surrogate_shortest_path(weights, EDGE_INDEX, S, T, NUM_NODES)

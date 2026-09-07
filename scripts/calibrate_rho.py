@@ -46,9 +46,9 @@ its own resting value. At the default band target it is not binding
 A confirmatory trial (previously "check 2") then runs the candidate rho for
 real epochs under the augmented penalty and reports whether
 `hard_num_violated == 0` holds over the final `TAIL_EPOCHS`. This USED TO be
-a comparison against hinge mode; the hinge penalty was removed
-(open_followups.md item #8, since Finding 7 measured augmented winning past
-~150 epochs at the shipped 300-epoch budget), so there is no longer a second
+a comparison against hinge mode; the hinge penalty was removed 2026-09
+(augmented was measured winning past ~150 epochs at the shipped 300-epoch
+budget), so there is no longer a second
 arm to compare against or a tiebreak to win — the trial is a confirmation of
 the candidate, not a gate between two systems.
 
@@ -257,9 +257,9 @@ def main() -> None:
     # deployed rollout about who is feasible: measured at an allocation with
     # oracle_gap == 0 and hard_num_violated == 0, the soft pass called 10 of
     # 346 demands violated, and those phantoms carried 8.58e4 of 8.58e4 of
-    # the hinge force (hinge itself has since been removed — see
-    # open_followups.md item #8 — but the STE's own defect is penalty-
-    # agnostic). Applied here rather than required of the config file, so
+    # the hinge force (hinge itself has since been removed, but the STE's
+    # own defect is penalty-agnostic). Applied here rather than required of
+    # the config file, so
     # the committed configs stay unmodified.
     if args.ste:
         cfg.setdefault("placement", {}).update({"alloc_ste": True})

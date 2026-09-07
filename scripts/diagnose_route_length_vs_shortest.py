@@ -2,7 +2,7 @@
 path?
 
 Pre-correction-#9, the edge-weight scale collapse made trained routes run
-~2.1x longer than shortest-by-km (docs/investigations/edge_weight_scale_collapse.md).
+~2.1x longer than shortest-by-km.
 The fix (unit-mean weight renormalisation + ASE-denominated path-noise loss)
 brought that down to ~1.03x on a 60-epoch small_test_ind132 retrain. This
 script re-measures the ratio against whatever checkpoint is passed, so it
@@ -72,7 +72,7 @@ with torch.no_grad():
     # not on any per-call forward output, so recomputing it directly here
     # -- with return_order=True -- gets the trained routes' src->dst edge
     # order in one Dijkstra call instead of a forward pass plus a second
-    # graph walk to recover the ordering (open_followups.md #7b).
+    # graph walk to recover the ordering.
     raw_edge_weights = F.softplus(pipe.edge_log_weight)
     trained_weights = (raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)).numpy()
 

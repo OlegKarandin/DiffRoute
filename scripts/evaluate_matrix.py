@@ -102,7 +102,7 @@ def main() -> None:
     # checkpoint selection uses. `gsnr_preds` below comes out of the hard
     # rollout itself — the soft pass below is only run for its
     # routes/segments/GSNRs (hard_rollout reuses them rather than
-    # re-routing; open_followups.md #7b), and its own (soft) allocation is
+    # re-routing), and its own (soft) allocation is
     # discarded, never mixed into the counts printed here.
     _, vlastelica_lambda = schedule_at(cfg, cfg["training"]["epochs_e2e"])
     with torch.no_grad():

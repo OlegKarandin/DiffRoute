@@ -51,7 +51,7 @@ _CAL = _BASE_CFG_FOR_CAL["pipeline"]["lambda_dev"]
 
 # Old arms tested `placement.gate` and `gate_dropout_p`, both deleted; a
 # later per-demand `alloc_dropout_p` arm was measured actively harmful under
-# this head (open_followups.md item #8) and removed too. The two axes that
+# this head and removed too. The two axes that
 # matter now:
 #
 #   lambda_dev   the calibration is a measurement with a band, not a point.
@@ -73,16 +73,16 @@ ARMS = [
     # Measured at an allocation with oracle_gap == 0, the un-STE'd soft pass
     # called 10 of 346 demands violated -- all 10 feasible when deployed -- and
     # those phantoms carried 100% of the feasibility force, 9.7x the combined
-    # lambda_dev + lambda_waste shed (lambda_waste has since been removed —
-    # see open_followups.md item #8). alloc_tau_end is pinned to
+    # lambda_dev + lambda_waste shed (lambda_waste has since been
+    # removed). alloc_tau_end is pinned to
     # alloc_tau_start because under the STE tau only scales the backward
     # surrogate; train.py warns if an alloc_ste config leaves it annealing.
     {"name": "alloc_ste", "overrides": {"placement": {"alloc_ste": True},
                                         "training":  {"alloc_tau_end": 1.0}}},
 ]
 # The augmented-vs-hinge axis (formerly the "al_ste" / "al_baseline" arms)
-# was removed 2026-09 along with the hinge penalty itself (open_followups.md
-# item #8): every arm above already runs under the augmented penalty via
+# was removed 2026-09 along with the hinge penalty itself: every arm above
+# already runs under the augmented penalty via
 # constrained_stress.yaml's own constraint.rho, so an arm that only turned
 # the penalty on would be a duplicate of the one it's compared against.
 
@@ -229,7 +229,7 @@ def score(config_path: Path) -> dict:
     # docstring for why this is preferred over recomputing a schedule at a
     # guessed epoch.
     # A soft pass just to get routes/segments/GSNRs -- hard_rollout reuses
-    # them rather than re-routing (open_followups.md #7b); its own soft
+    # them rather than re-routing; its own soft
     # allocation is discarded.
     with torch.no_grad():
         _, _, _, soft_alloc = ctx.pipeline(demands, lambda_=ckpt["vlastelica_lambda"])

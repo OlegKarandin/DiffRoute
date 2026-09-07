@@ -32,12 +32,22 @@ CHUNK SCORING CONVENTION. A chunk's noise is the SUM of its segments' QoT
 linear noises, each segment scored with accum_dist_km restarting at 0 —
 identical to what SegmentCombiner folds and what hard_rollout evaluates.
 The spec's text asks for one QoT call on the concatenated chunk instead;
-that convention differs by up to 1.16 dB (regen_placement_not_concentrating.md
-lines 385-410) because NLI depends on accumulated dispersion while ASE does
-not. Using it here would make oracle_gap measure a physics disagreement
-between certifier and evaluator rather than the head's competence. The
-deviation and the follow-up that resolves it are recorded in
-docs/investigations/open_followups.md.
+measured against `QoT(whole path)` on the 99 real `ind_132` paths that are
+multi-segment AND fit in one QoT call, the per-segment convention used here
+costs a mean absolute 1.16 dB (mean -0.46, range -3.51 .. +1.93), because
+NLI depends on accumulated dispersion while ASE does not. Using the
+concatenated convention here would make oracle_gap measure a physics
+disagreement between certifier and evaluator rather than the head's
+competence.
+
+The deviation is deliberate and stays until the QoT model itself can be
+asked a different question. The physically consistent alternative — carry
+accum_dist_km across boundaries instead of resetting it — measures 4.5x
+WORSE (mean abs 5.27 dB) precisely because it is out of distribution: every
+QoT training sample is a standalone transparent segment starting at
+accum_dist_km = 0 (see docs/architecture/invariants.md). Resolving it
+therefore means regenerating the QoT dataset with nonzero starting
+dispersion and retraining, not swapping the convention here.
 """
 from __future__ import annotations
 

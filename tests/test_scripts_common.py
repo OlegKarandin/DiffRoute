@@ -5,8 +5,7 @@ The single most important guarantee this module makes is
 edge weights `pipeline.forward` actually routes on. Correction #9's
 unit-mean renormalisation was applied in only 2 of 6 places that
 recomputed edge_weights outside the real forward() call before this
-module existed — see docs/investigations/CHANGELOG.md#correction-1c-9 and
-docs/investigations/edge_weight_scale_collapse.md.
+module existed.
 """
 from __future__ import annotations
 

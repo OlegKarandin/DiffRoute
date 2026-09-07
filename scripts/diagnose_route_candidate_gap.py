@@ -161,9 +161,7 @@ def learned_node_path(ctx: DiagContext, demand) -> List[int]:
     Routing depends only on edge_log_weight, not on hard vs. soft
     decisions, so a fresh Dijkstra call at the pipeline's current (unit-
     mean-renormalised) weights IS the routing the hard rollout evaluated,
-    not a re-derivation of it (docs/investigations/
-    pipeline_profile_and_restoration_scaling.md, Finding 2 /
-    open_followups.md #7b).
+    not a re-derivation of it.
     """
     raw_edge_weights = F.softplus(ctx.pipeline.edge_log_weight)
     edge_weights = (

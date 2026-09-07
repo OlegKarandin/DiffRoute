@@ -73,6 +73,7 @@ pipeline:
 
 placement:
   lookahead: true
+  route_context: true
   # STE: the training forward pass takes the DEPLOYED decision, so the
   # relaxation and hard_rollout cannot disagree about who is feasible. See
   # configs/experiment/constrained_stress.yaml's placement.alloc_ste comment

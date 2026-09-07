@@ -11,11 +11,10 @@ Test IDs:
   7. Numerical stability: extreme GSNR values, no NaN/Inf
   8. Accumulation precision: float64 internal, float32 return
   9. GSNR clamp: inputs outside [-5, 35] dB behave as clamped
-  10-13. Multi-segment chunking (docs/investigations/regen_over_provisioning.md):
+  10-13. Multi-segment chunking:
       max-over-chunks physics, chunk completion before re-accumulation,
       zero marginal value of a redundant regenerator, exact sum at p=0
-  14. Fractional p vs a hand-derived expectation (round-2 regression guard,
-      docs/investigations/regen_over_provisioning.md)
+  14. Fractional p vs a hand-derived expectation (round-2 regression guard)
   15. Gradient regression: wrong-sign gradient when a boundary probability
       saturates to exactly 1.0 alongside a fractional boundary (final-review
       fix wave Fix 1)
@@ -168,8 +167,7 @@ def test_gradient_wrt_regen_prob_at_production_noise_scale():
     is ABSOLUTE in linear noise units and did not shrink with the operands.
     At temperature=0.01 that overshoot is 0.00693 — larger than the noise
     itself — so the folded value exceeded `a + b` and the combiner reported
-    that regenerating makes the path *worse*. See
-    docs/investigations/regen_placement_not_concentrating.md. The fold is an
+    that regenerating makes the path *worse*. The fold is an
     exact max now, so no such scale-dependent floor exists; this test keeps
     watching the operating point where the old one broke.
 
@@ -221,8 +219,7 @@ def test_three_segments_two_boundaries():
     With 2 boundaries each with probability p, compare against brute-force
     enumeration of 4 binary configs weighted by (p^k * (1-p)^(2-k)), each
     config's noise computed as the TRUE max over the chunks that
-    configuration's cuts produce (docs/investigations/
-    regen_over_provisioning.md) — i.e. partition at every regen=1 boundary,
+    configuration's cuts produce — i.e. partition at every regen=1 boundary,
     sum noise within each resulting chunk, then take the max chunk. That is
     NOT the same as a single accumulator that takes a max at a cut boundary
     and keeps adding to it afterwards (config (1,0) here — cut at boundary
@@ -264,7 +261,7 @@ def test_three_segments_two_boundaries():
 
 
 def test_fractional_p_matches_hand_derived_expectation():
-    """Round-2 regression guard, docs/investigations/regen_over_provisioning.md:
+    """Round-2 regression guard:
     a first attempt at generalizing soft_max to N-way chunking put each
     chunk's realization probability INSIDE a shared-temperature exponential.
     Since chunk noise differences scaled as O(1/t) (~50-100 at the
@@ -384,8 +381,7 @@ def test_gsnr_inputs_are_clamped_to_the_documented_range():
 
 
 # ---------------------------------------------------------------------------
-# Tests 10-13: multi-segment chunking — docs/investigations/
-# regen_over_provisioning.md. A regenerator rebuilds the signal, so the
+# Tests 10-13: multi-segment chunking. A regenerator rebuilds the signal, so the
 # path splits into independent CHUNKS at regenerated boundaries, and
 # end-to-end noise is the max over chunks (not a running accumulator that a
 # max is occasionally applied to, which is only correct when every
@@ -414,8 +410,7 @@ def test_multi_segment_chunks_equal_max_over_chunks():
     1.771 dB error) because the accumulator kept adding to a stale running
     max instead of restarting a fresh chunk at each regenerated boundary.
     The tolerance used to be loosened to 0.05 dB to absorb the soft-max
-    overshoot on this fixture's tied chunks (~0.03 dB, see
-    docs/investigations/regen_over_provisioning.md); the fold takes an exact
+    overshoot on this fixture's tied chunks (~0.03 dB); the fold takes an exact
     max now, ties included, so the answer is exact.
 
     The fold is exact, so the only residual here is the float32 return cast:
@@ -470,7 +465,7 @@ def test_chunk_completes_before_next_accumulates():
 
 def test_redundant_regenerator_has_zero_marginal_value():
     """This is the property that encodes *why* the pre-fix fold caused
-    over-provisioning (docs/investigations/regen_over_provisioning.md):
+    over-provisioning:
     under correct chunk-max physics, adding a regenerator on top of one
     that already makes the max-chunk no bigger is worth exactly 0 dB, so
     any positive lambda_regen evicts a redundant node immediately. The
@@ -502,8 +497,8 @@ def test_zero_regen_probability_is_exact_sum():
     "nothing happened yet" zero sentinel.
 
     This guards the `any_regen`-style sentinel problem the original
-    two-state design in docs/investigations/regen_over_provisioning.md
-    called out explicitly: any construction where such a zero is blended
+    two-state design called out explicitly: any construction where such a
+    zero is blended
     through a soft_max at loose temperature picks up a ~6% scale-normalised
     excess (soft_max(0, C, t=0.5) = C*1.0635 != C). The exact fold has no
     sentinel and no smoothing -- at p=0 the only partition with nonzero
@@ -820,7 +815,7 @@ def test_gradients_are_location_aware_not_shared_across_boundaries():
     """Two boundaries with the SAME marginal p but structurally different
     surrounding noise must get numerically DISTINCT gradients w.r.t. their
     own p. This is exactly the property round 2's shared-temperature fold
-    destroyed (docs/investigations/regen_over_provisioning.md and the module
+    destroyed (see the module
     docstring: probability entered a shared exponential and collapsed
     location information); the exact DP has no shared knob, so distinct
     boundaries with equal p should not get equal gradients here.

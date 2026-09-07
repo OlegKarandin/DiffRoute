@@ -2,7 +2,7 @@
 
 ## What this project is
 
-Differentiable optical network design: jointly optimize **routing** and **regenerator placement** for WDM networks using surrogate gradients (Vlastelica et al. ICLR 2020). Phase 1a builds the standalone QoT estimator that will serve as the differentiable surrogate in later phases.
+Differentiable optical network design: jointly optimize **routing** and **regenerator placement** for WDM networks using surrogate gradients (Vlastelica et al. ICLR 2020). A transformer QoT estimator (`SpanAttentionQoT`) is trained standalone on real-GNPy labels, then frozen and used as the differentiable physics surrogate inside the end-to-end pipeline.
 
 ## Environment
 
@@ -34,10 +34,8 @@ pytest tests/test_segment_combiner.py tests/test_surrogate_grad.py -v
 # Run tests — Phase 1c
 pytest tests/test_pipeline.py -v
 
-# Run full test suite (includes tests/test_optical_bridge.py,
-# tests/test_generate_qot_dataset.py, tests/test_edge_noise.py added during the GNPy migration,
-# and tests/test_train.py, tests/test_loss.py, tests/test_shortest_path.py,
-# tests/test_span_features.py, tests/test_scripts_common.py, tests/conftest.py added since)
+# Run the full test suite (everything under tests/, not just the
+# phase-grouped subsets above)
 pytest tests/ -v
 
 # Diagnostics (scripts/diagnose_*.py) — all take --config, default small_test_ind132.yaml.
@@ -53,21 +51,54 @@ python -m diffopt.qot.train_qot --config configs/experiment/base.yaml
 # — run train_qot for that config first)
 python -m diffopt.train --config configs/experiment/small_test.yaml
 python -m diffopt.train --config configs/experiment/base.yaml
+
+# Train with a per-epoch training-trajectory frame dump (Phase 1d viz;
+# requires the config's `viz.dump_frames: true` — already set in
+# configs/experiment/constrained_stress.yaml). Streams
+# logs/<run>/frames.jsonl during training and assembles logs/<run>/frames.json
+# at the end.
+python -m diffopt.train --config configs/experiment/constrained_stress.yaml
+
+# Build the self-contained trajectory viewer page from a frame dump
+python scripts/build_viewer.py \
+  --frames logs/constrained_stress/frames.json \
+  --out build/trajectory_viewer.html
 ```
 
 ## Current status
 
-Phases 1a-1c complete; Phase 1d (evaluation, baselines, visualization) not
-started. See `docs/investigations/CHANGELOG.md` for the phase milestone
-write-ups (measured RMSE, test-pass counts) and `docs/investigations/open_followups.md`
-for what's still open.
+Phases 1a-1c complete. Phase 1d (evaluation, baselines, visualization) is
+started: the training-trajectory visualization strand (frame dump behind
+`viz.dump_frames`, `scripts/build_viewer.py`, `diffopt/viz/viewer.html`) is
+done; evaluation and baselines are not.
 
 ## Where to look
 
+Two tiers. `docs/architecture/` ships with the repo; `docs/investigations/`
+is a **local-only lab notebook** — gitignored, deliberately absent from the
+published history, and present only in a working copy that has it. A fresh
+clone has the first tier and not the second, so the local-only rows below
+simply won't resolve there.
+
+Published (`docs/architecture/`):
+
 | I need… | Read |
 |---|---|
-| the rules I must not break | `docs/architecture/invariants.md` |
-| why a rule exists | `docs/investigations/CHANGELOG.md` |
-| component contracts and config keys | `docs/architecture/interfaces.md` |
-| what is still open | `docs/investigations/open_followups.md` |
-| what past investigations found | `docs/investigations/README.md` |
+| the rules I must not break | `invariants.md` |
+| the full pipeline walkthrough | `pipeline.md` — Part 2 |
+| how the QoT surrogate is designed and trained | `pipeline.md` — Part 1 |
+| the surrogate gradient explained from scratch | `pipeline.md` — Part 3 |
+| every tuneable and what it does | `pipeline.md` — Hyperparameters |
+| component contracts and config keys | `interfaces.md` |
+
+Local-only (`docs/investigations/`, not in the repo):
+
+| I need… | Read |
+|---|---|
+| why a rule exists | `CHANGELOG.md` |
+| what is still open | `open_followups.md` |
+| what past investigations found | `README.md` |
+
+When a change is driven by something recorded only in the local notebook,
+carry the reasoning into the published docs (usually `invariants.md`) rather
+than citing a file a reader cannot open.

@@ -6,8 +6,8 @@ produces). Regen "helps" only if the combined noise of a cut path is below
 that of an uncut one; for two equal segments of noise n that means the fold
 must return something strictly below 2n.
 
-The historical bug (see docs/investigations/regen_placement_not_concentrating.md)
-was that the fold approximated the max with `t * logsumexp([a/t, b/t])`, which
+The historical bug was that the fold approximated the max with
+`t * logsumexp([a/t, b/t])`, which
 overshoots by `t*ln2` — ABSOLUTE, so it does not shrink with the operands. At
 the schedule's sharpest temperature (0.01) that floor is 0.0069, larger than
 the segment noise itself, which inverted the sign of every gradient reaching

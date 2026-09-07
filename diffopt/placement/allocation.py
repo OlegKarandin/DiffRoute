@@ -28,8 +28,8 @@ Three properties are load-bearing and each has a test:
 
               A `greedy_residual` carve-out (spec 5.2) used to make the
               closed point coincide with the oracle's own greedy cut at
-              init. Removed 2026-09 (open_followups.md item #8): it hard-
-              codes the `|S| = 1` optimal rule into the score, so a result
+              init. Removed 2026-09: it hard-codes the `|S| = 1`
+              optimal rule into the score, so a result
               obtained with it on would be "the relaxation recovering the
               optimum because we told it the answer." Recoverable from git
               history if Stage IV restoration needs it back.
@@ -113,7 +113,6 @@ class AllocationHead(nn.Module):
         # diagnostic needs. Measured on the augmented-Lagrangian gate runs:
         # all three al_ste_greedy seeds logged those two constants for 60/60
         # epochs while the true scores ran to -47.
-        # See docs/investigations/augmented_lagrangian_gate.md.
         #
         # Rebound rather than mutated in place (like last_max_chunk_noise),
         # so a caller that kept a reference to an earlier rollout's scores

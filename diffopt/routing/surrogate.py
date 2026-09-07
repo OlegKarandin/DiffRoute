@@ -18,11 +18,9 @@ class DijkstraSurrogate(torch.autograd.Function):
     Autograd Function wrapping Dijkstra with Vlastelica surrogate gradients.
 
     Forward: run exact Dijkstra, return binary path indicator AND the
-             traversal-ordered edge list (Finding 1,
-             docs/investigations/pipeline_profile_and_restoration_scaling.md
-             — Dijkstra already has this from its own prev-chain; a caller
-             re-deriving it from the unordered indicator pays for a second
-             graph walk).
+             traversal-ordered edge list (Dijkstra already has this from its
+             own prev-chain; a caller re-deriving it from the unordered
+             indicator pays for a second graph walk).
     Backward: perturb edge weights by +lambda * grad_output, re-run Dijkstra,
               compute finite-difference surrogate gradient.
     """
@@ -138,6 +136,6 @@ def surrogate_shortest_path(
     indicator (differentiable via surrogate); `ordered_edges` is a
     List[int] of edge IDs from src to dst — the same traversal order a
     caller previously had to re-derive from `path` with a second graph
-    walk (docs/investigations/open_followups.md #7b).
+    walk.
     """
     return DijkstraSurrogate.apply(edge_weights, edge_index, src, dst, num_nodes, lambda_)

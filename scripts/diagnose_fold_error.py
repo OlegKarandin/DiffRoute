@@ -1,8 +1,8 @@
 """Diagnostic: quantify SegmentCombiner's fold error on the real network.
 
-Permanent guard against the fold-correctness bug class investigated in
-docs/investigations/regen_over_provisioning.md, and the script that
-reproduces that write-up's headline table. Loads a trained e2e checkpoint
+Permanent guard against the fold-correctness bug class behind the
+regenerator over-provisioning, and the script that reproduces that
+investigation's headline table. Loads a trained e2e checkpoint
 and runs ONE forward pass over that checkpoint's own fixed traffic matrix
 (scripts/_common.py's fixed_traffic_demands, at
 schedule_at(cfg, cfg["training"]["epochs_e2e"])), then re-folds every
@@ -140,7 +140,7 @@ assert alloc.demand_ids == [d.id for d in demands], (
 # ---------------------------------------------------------------------------
 
 def _legacy_single_accumulator_fold(segment_gsnrs_db, regen_probs_at_boundaries, temperature):
-    """Historical form, pre-fix (docs/investigations/regen_over_provisioning.md):
+    """Historical form, pre-fix:
     a single accumulator takes a soft_max at a regenerated boundary, then
     keeps ADDING subsequent segments to that max instead of starting a
     fresh chunk. Correct only when every post-regenerator chunk happens to

@@ -79,9 +79,9 @@ def cosine_anneal(
     """Cosine-decay a scalar from `start` to `end` over [anneal_start, anneal_end].
 
     Same interface as `linear_anneal`. Drives `training.lr_alloc` when
-    `lr_alloc_schedule: cosine` (open_followups.md #7a): the binding
-    constraint per optimizer_normalization_and_the_score_runaway.md's
-    Finding 8 is the feasible-EPOCH rate under checkpoint selection, not the
+    `lr_alloc_schedule: cosine`. The binding constraint measured on
+    `constrained_stress` is the feasible-EPOCH rate under checkpoint
+    selection, not the
     trajectory mean, and decaying lr is the standard way to turn an
     oscillating SGD trajectory into a converging one — which is what would
     make that rate stop mattering. Cosine (not linear) spends more of the
@@ -129,7 +129,6 @@ def alloc_score_stats(alloc) -> Tuple[float, float, float]:
     clamp, a pinned column TRACKED THE TAU ANNEAL: `al_baseline`'s logged
     "recovery" from -60.165 to -26.201 over epochs 30-55 is
     `-87.336545 * tau` at tau = 0.6889 and 0.3000, not the head moving.
-    See docs/investigations/augmented_lagrangian_gate.md.
 
     Takes no `tau`: a raw score does not depend on one.
 
@@ -176,7 +175,7 @@ def alloc_dead_fraction(alloc, tau: float, threshold: float = ALLOC_DEAD_SLOPE) 
     while `al_baseline` at its selected epoch had 0% dead. What separates
     them is where the s=0 crossing sits relative to the dead mass, which is
     what `greedy_residual` pins and what a run without it has to find on its
-    own. See docs/investigations/augmented_lagrangian_gate.md.
+    own.
 
     Returns nan when the routing produced no boundary at all, matching
     `alloc_score_stats`.
@@ -217,9 +216,8 @@ def hard_rollout(
     Reuses its routes/segments/GSNRs via
     `DiffONetPipeline.hard_rollout_from_soft` instead of running a second
     full forward pass: routing, segmentation and QoT never depend on
-    hard_alloc, so this is exact, not approximate (open_followups.md #7b /
-    docs/investigations/pipeline_profile_and_restoration_scaling.md,
-    Finding 2).
+    hard_alloc, so this is exact, not approximate — verified bit-identical
+    against a fresh `forward(hard_alloc=True)` on all 346 real demands.
 
     Also computes the oracle's minimum on the SAME routes and segment GSNRs,
     so `oracle_gap` costs no extra forward pass. The gap is the acceptance
@@ -464,12 +462,11 @@ def main() -> None:
     # alloc_dead_frac == 1.0000 for the last 50 of 150 epochs on all three
     # seeds. Raising alloc_tau only moves the wall — the score range scales
     # with tau, so |s|/tau lands at 71-110 whatever tau is.
-    # See docs/investigations/augmented_lagrangian_gate.md.
     #
     # SGD, not Adam: Adam's step is a RATIO, m/(sqrt(v)+eps), so a
     # consistently-signed gradient gives m ~ sqrt(v) and therefore a step of
     # ~lr HOWEVER SMALL that gradient has become. Two measured consequences,
-    # both in docs/investigations/score_runaway_and_dual_windup.md:
+    # both on constrained_stress:
     #
     #   1. It removes the brake the objective already has. The device force
     #      per boundary is lambda_dev * sigmoid'(s/tau)/tau, which decays
@@ -480,16 +477,17 @@ def main() -> None:
     #   2. It strips the dual of authority over the head. A dual enters only
     #      as a gradient SCALE, and Adam divides scale back out, so a dual
     #      winding 0 -> 21.2 moves the head no faster than a dual of 0. That
-    #      is a rate-limited actuator driven by an integral controller, the
-    #      textbook wind-up setup this file's Finding 7 records.
+    #      is a rate-limited actuator driven by an integral controller — the
+    #      textbook wind-up setup, and it was measured winding up exactly
+    #      that way.
     #
-    # No weight decay: Finding 9 found no viable sizing under SGD (acting
+    # No weight decay: no viable sizing was found under SGD (acting
     # within a 300-step run needs wd ~ 6.7, but by wd = 3 the decay force is
     # already 103% of the loss gradient). No momentum: Adam's beta1 = 0.9 is
     # a momentum term, and it is what makes the plant second-order — a
     # second-order plant under the augmented dual's PI-shaped force is what
-    # oscillates in the first place. Removed 2026-09 (open_followups.md
-    # item #8); recoverable from git history if Adam is needed again.
+    # oscillates in the first place. Removed 2026-09; recoverable from git
+    # history if Adam is needed again.
     opt_alloc = optim.SGD(
         allocation_head.parameters(),
         lr=cfg["training"]["lr_alloc"],
@@ -517,7 +515,7 @@ def main() -> None:
     lambda_decay: float = t_cfg["vlastelica_lambda_decay"]
     epochs: int = t_cfg["epochs_e2e"]
 
-    # lr_alloc schedule (open_followups.md #7a). "none" (default) reproduces
+    # lr_alloc schedule. "none" (default) reproduces
     # today's flat lr exactly — opt_alloc's own constructor lr, never
     # touched again — so every existing config's trajectory is unchanged
     # unless it opts in.
@@ -544,8 +542,8 @@ def main() -> None:
     # sample of a process that may not be converging at all; this is the
     # process. Two things it makes measurable that no snapshot can:
     # churn (mean Hamming distance between consecutive epochs' sets over the
-    # last N epochs — a direct read on the limit cycle described in
-    # open_followups.md item #6) and whether the final epoch agrees with the
+    # last N epochs — a direct read on the deployed-set limit cycle the
+    # allocation head is prone to) and whether the final epoch agrees with the
     # selected one. It also allows re-running selection under a different
     # key without retraining.
     trajectory_path = log_dir / "placement_trajectory.csv"
@@ -668,8 +666,8 @@ def main() -> None:
             # epochs, so the checkpoint must save the parameters those
             # metrics were measured on, not next epoch's already-updated
             # ones. Confirmed as a real (if usually small) discrepancy on
-            # the dual_decay hypothesis-test run in open_followups.md item
-            # #3: the log recorded 9 regens for the saved epoch, but the
+            # a dual_decay hypothesis-test run: the log recorded 9 regens
+            # for the saved epoch, but the
             # previously-saved (post-step) regen_logits had 10 nodes above
             # threshold once reloaded.
             edge_log_weight_pre_step = pipeline.edge_log_weight.detach().clone()

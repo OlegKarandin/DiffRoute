@@ -6,8 +6,7 @@ Two groups:
   AllocationHead's `tau`. It stays generic — nothing in it is tau-specific —
   because it also used to drive SegmentCombiner's `soft_max_temperature`,
   before that fold became exact and lost its temperature entirely (see
-  docs/investigations/CHANGELOG.md's Phase 1c corrections, and
-  diffopt/qot/segment_combiner.py's docstring, for that history).
+  diffopt/qot/segment_combiner.py's docstring for that history).
 
   `hard_rollout` and the checkpoint-selection loop it feeds. Selection is
   lexicographic on (hard_num_violated, hard_num_devices,
@@ -84,7 +83,7 @@ def test_generic_across_different_schedules():
 
 
 # ---------------------------------------------------------------------------
-# cosine_anneal / step_decay — open_followups.md #7a's lr_alloc schedule
+# cosine_anneal / step_decay — the lr_alloc schedule
 # ---------------------------------------------------------------------------
 
 from diffopt.train import cosine_anneal, step_decay  # noqa: E402
@@ -396,7 +395,7 @@ class _DummyPipeline:
     (path_noise_costs, gsnr_preds, path_indicators, AllocationOutputs), plus
     `hard_rollout_from_soft(demands, alloc, ...)` -> (gsnr_preds,
     AllocationOutputs), the reuse path `train.hard_rollout` now calls
-    instead of a second `hard_alloc=True` forward (open_followups.md #7b).
+    instead of a second `hard_alloc=True` forward.
 
     `gsnr_value` is a class attribute rather than a constructor argument
     because main() constructs the pipeline itself — the test has no handle
@@ -1005,7 +1004,7 @@ def test_main_raises_when_preflight_excludes_every_demand(tmp_path, monkeypatch)
 
 # ---------------------------------------------------------------------------
 # Augmented-Lagrangian wiring (spec 2026-08-31 sections 2.2 and 3; the only
-# penalty since open_followups.md item #8 removed the hinge)
+# penalty since the hinge was removed 2026-09)
 # ---------------------------------------------------------------------------
 
 
@@ -1046,7 +1045,7 @@ def test_augmented_dual_step_uses_signed_g_at_step_rho(tmp_path, monkeypatch):
 # sigmoid, `score = tau * logit(a)`, cannot do that under `alloc_ste`, where
 # the forward value `a` is EXACTLY 0 or 1 and the logit therefore pins to
 # float32's clamps on every boundary at every epoch. Measured on the shipped
-# augmented-Lagrangian gate runs (docs/investigations/augmented_lagrangian_gate.md):
+# augmented-Lagrangian gate runs:
 # all three `al_ste_greedy` seeds logged alloc_score_min == -87.336545 and
 # alloc_score_max == +15.942385 for 60/60 epochs, while the true scores ran to
 # -47 with 71% of boundaries below a 1e-6 backward slope. The score has to
@@ -1137,7 +1136,7 @@ def test_dead_fraction_sharpens_as_tau_anneals():
 #
 # Adam's step is a RATIO, m/(sqrt(v)+eps), so a consistently-signed gradient
 # gives ~lr HOWEVER SMALL that gradient has become. Two measured consequences
-# on the runs in docs/investigations/score_runaway_and_dual_windup.md:
+# measured on constrained_stress:
 #
 #   the objective's own brake is discarded -- lambda_dev * sigmoid'(s/tau)/tau
 #   falls 5.0e-3 (s=-3) -> 3.0e-11 (s=-22), and under SGD the step falls with
@@ -1148,9 +1147,9 @@ def test_dead_fraction_sharpens_as_tau_anneals():
 #   moves the head no faster. A rate-limited actuator under an integral
 #   controller is the textbook wind-up setup.
 #
-# SGD is now the only optimizer (open_followups.md item #8 removed Adam,
-# AdamW and the alloc_weight_decay knob along with it — Finding 9 found no
-# viable weight-decay sizing under SGD anyway).
+# SGD is now the only optimizer (Adam, AdamW and the alloc_weight_decay knob
+# were removed 2026-09 — no viable weight-decay sizing was found under SGD
+# anyway).
 
 
 def _spy_on_optimizers(monkeypatch):

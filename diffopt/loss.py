@@ -42,9 +42,8 @@ def compute_loss(
     allocation variable is `-lambda_dev`, and stationarity would require
     `lambda_dev = 0`. The augmented penalty's nonzero band inside the
     feasible region is what lets a satisfied demand defend the cut that
-    satisfies it. Removed 2026-09 (open_followups.md item #8, Finding 7):
-    recoverable from git history if a short-budget arm needs the hinge's
-    faster early convergence again.
+    satisfies it. Removed 2026-09: recoverable from git history if a
+    short-budget arm needs the hinge's faster early convergence again.
 
     This replaces a weighted sum of three soft penalties in which feasibility
     competed with regenerator count on a fixed exchange rate. `lambda_dev`
@@ -57,8 +56,7 @@ def compute_loss(
                       Accumulated ASE noise along the chosen route, in fixed
                       physical units. Denominating this in learned
                       edge_weights instead made the loss degree-1 in those
-                      weights and collapsed them to the Softplus floor — see
-                      docs/investigations/edge_weight_scale_collapse.md.
+                      weights and collapsed them to the Softplus floor.
         demands:      List of Demand namedtuples, from the FIXED traffic
                       matrix (diffopt/traffic.py). Their `id`s must be
                       contiguous 0..N-1 — they index `duals`.

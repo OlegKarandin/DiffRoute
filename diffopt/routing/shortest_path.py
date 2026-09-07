@@ -155,9 +155,8 @@ def dijkstra(
         relaxing; walking that chain here is the SAME data a caller would
         otherwise recover by re-deriving traversal order from the
         unordered indicator (see `diffopt.pipeline`'s former
-        `_reconstruct_path`, ~0.7 s/forward on `ind_132`/`constrained_stress`
-        — docs/investigations/open_followups.md #7b / Finding 1 of
-        pipeline_profile_and_restoration_scaling.md).
+        `_reconstruct_path`, ~0.7 s/forward on
+        `ind_132`/`constrained_stress`).
 
     Returns
     -------

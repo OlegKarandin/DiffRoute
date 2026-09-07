@@ -15,7 +15,7 @@ modulation_formats: configs/modulation_formats.yaml
 num_train_samples: 500
 num_val_samples: 100
 num_demands: 100
-# Narrowed to the top tiers (open_followups.md item 5): with the full
+# Narrowed to the top tiers: with the full
 # 300-800 range and scale=1.3e6, the volume floor (min(bitrate_options)-25)
 # is low enough that num_violated=0 from epoch 1 — the constraint never
 # binds and the dual-ascent path is never exercised. Raising the floor to
@@ -83,13 +83,14 @@ pipeline:
 
 placement:
   lookahead: true
+  route_context: true
   # STE: the training forward pass takes the DEPLOYED decision, so the
   # relaxation and hard_rollout cannot disagree about who is feasible.
   # Without it, measured at an allocation with oracle_gap == 0, the soft
   # pass called 10 of 346 demands violated that were feasible when
   # deployed, and those phantoms carried 100% of the feasibility force —
-  # score_runaway_and_dual_windup.md's saturated-open runaway (score to
-  # +229, dead_frac 1.0000) starts from exactly that phantom pressure.
+  # the saturated-open runaway (score to +229, dead_frac 1.0000) starts
+  # from exactly that phantom pressure.
   # Required for the `4 vs 24 over-buy` result below to reproduce; without
   # it this config saturates open (measured 2026-09-04: ~1560 devices vs
   # an oracle of ~33). See training.alloc_tau_end for its other half.
@@ -102,7 +103,7 @@ traffic:
   scenario: stress        # "stress" (alpha 0.0) | "realistic" (alpha 1.0)
   seed: 0                 # matrix identity
   # 2.5e6 at the 600-800 bitrate floor lands at 346 demands / 2.9% violated
-  # rate pre-training (open_followups.md item 5), close to the design
+  # rate pre-training, close to the design
   # spec's own ~2.3% reference point. 1.3e6 with the old full floor gave
   # 516 demands / 0% violated — never binding.
   scale: 2500000.0        # total offered load in Gbps
@@ -110,8 +111,8 @@ traffic:
 
 # Feasibility as a constraint, not a penalty, via the augmented Lagrangian
 # (method of multipliers) — the only penalty compute_loss implements as of
-# open_followups.md item #8 (2026-09), which removed the one-sided hinge:
-# Finding 7 measured augmented winning 4 vs 24 over-buy at the shipped
+# 2026-09, which removed the one-sided hinge: augmented was measured
+# winning 4 vs 24 over-buy at the shipped
 # 300-epoch budget. `lambda_dev` above stays fixed; the duals rise (and, on
 # a slack demand, fall) until feasibility is bought, so the device count is
 # whatever the constraint requires.
@@ -137,8 +138,7 @@ training:
   lr_edge_net: 1.0e-3
   # MEASURED, not the old lr_regen value: three SGD seeds (42/7/13) were
   # swept post-optimizer-swap and 0.0005 was the arm that actually reached
-  # the documented over-buy figures (open_followups.md item #7/#8,
-  # optimizer_normalization_and_the_score_runaway.md). The shipped value
+  # the documented over-buy figures. The shipped value
   # here sat at 2.0e-2 for a long time — 40x too high — which was calibrated
   # against Adam's normalised step, not SGD's proportional one; under SGD it
   # produces either a frozen-closed or saturated-open run. See
@@ -150,10 +150,10 @@ training:
   # step down for the rest of the run; clipping caps that transient so a
   # healthy lr survives the whole budget.
   alloc_grad_clip: 100.0
-  # 300, not 60: Finding 7 measured the augmented penalty overtaking the
+  # 300, not 60: the augmented penalty was measured overtaking the
   # (now-removed) hinge only past ~150 epochs — at 60 epochs hinge/Adam was
-  # still ahead. This was already the number open_followups.md called "the
-  # shipped budget", but no config actually carried it until now.
+  # still ahead. This has been the nominal shipped budget for a while, but
+  # no config actually carried it until now.
   epochs_e2e: 300
   vlastelica_lambda: 10.0
   vlastelica_lambda_min: 1.0

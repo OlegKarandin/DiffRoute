@@ -1,7 +1,6 @@
 """Compare the per-segment noise scale across topologies.
 
-The temperature was never the right lever
-(docs/investigations/CHANGELOG.md#correction-1c-8) — no
+The temperature was never the right lever — no
 fixed t makes the pre-fix absolute soft_max floor safe across topologies,
 because per-segment noise itself varies by topology. This script measures
 that per-topology noise scale directly, and reports what the old absolute

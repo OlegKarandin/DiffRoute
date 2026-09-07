@@ -54,5 +54,8 @@ docs/superpowers/
 .worktrees/
 .superpowers/
 
+# Private lab notebook — investigation write-ups, not distributed
+docs/investigations/
+
 # Build and extension outputs
 runs_ext/

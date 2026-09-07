@@ -482,7 +482,7 @@ def test_qot_model_called_once_per_forward(monkeypatch):
     """pipeline.forward() must invoke the QoT model exactly once per call,
     regardless of how many demands or segments it processes internally.
 
-    Profiling (docs/investigations/open_followups.md #1) found ~920 QoT
+    Profiling found ~920 QoT
     calls/epoch at batch size 1 accounting for 59% of pipeline.forward's
     wall-clock, almost entirely PyTorch per-op dispatch overhead rather than
     arithmetic. Two demands that each cross the hub topology's regen
@@ -567,9 +567,9 @@ def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
     """The batched QoT call must pad every segment only up to the widest
     real segment in the current batch, not the architectural max_spans=60
     — trimming the wasted padding columns is what eliminates the ~98%
-    masked-out attention compute profiled in
-    docs/investigations/open_followups.md #1 (real segments run <=12 spans,
-    median ~7, vs the 60-wide architectural ceiling). The hub topology's
+    masked-out attention compute measured on ind_132 (real segments run
+    <=12 spans, median ~7, vs the 60-wide architectural ceiling). The hub
+    topology's
     0->4 path crosses regen candidate node 3, splitting into a 2-edge/
     2-span segment (0-1, 1-3 or 0-2, 2-3) and a 1-edge/1-span segment
     (3-4) — batch max is 2, both segments share that one batched call."""
@@ -596,8 +596,7 @@ def test_qot_batch_trims_padding_to_true_max_spans(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 14/15: edge-weight scale degeneracy (docs/investigations/
-# edge_weight_scale_collapse.md). These tests verify the unit-mean
+# Test 14/15: edge-weight scale degeneracy. These tests verify the unit-mean
 # renormalisation specifically: once the raw softplus(edge_log_weight) output
 # is renormalised to unit mean with a live (non-detached) divisor, the loss is
 # homogeneous of degree 0 in that raw output for ANY downstream loss, so the
@@ -675,8 +674,7 @@ def test_total_loss_invariant_to_edge_weight_scale(monkeypatch):
     constant must leave the total loss and every chosen path bit-identical.
 
     Includes 1e-11 — the magnitude weights actually collapsed to in the
-    ind_132 run — applying the lesson from
-    docs/investigations/CHANGELOG.md#correction-1c-8, where the
+    ind_132 run — applying the lesson of correction #8, where the
     original segment-combiner tests passed only because they never covered
     the production scale.
     """
@@ -731,7 +729,7 @@ def test_total_loss_invariant_to_edge_weight_scale(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Test 16: the path-cost term is denominated in physical ASE noise, not in
-# learned edge weights (docs/investigations/edge_weight_scale_collapse.md).
+# learned edge weights.
 # ---------------------------------------------------------------------------
 
 def test_path_noise_cost_equals_ase_noise_along_route():
@@ -1042,8 +1040,7 @@ def test_segment_gsnr_cache_eviction_does_not_read_from_cleared_cache(monkeypatc
 # Equivalence oracle for the A3 vectorisation (perf task 8): the step-6 STE
 # proxy computation used to loop per segment, building a fresh
 # torch.tensor(seg_edge_ids) + gather + .sum() + log10 EACH iteration
-# (~2,400 tiny autograd nodes/forward on ind_132/constrained_stress — see
-# docs/investigations/pipeline_profile_and_restoration_scaling.md). The loop
+# (~2,400 tiny autograd nodes/forward on ind_132/constrained_stress). The loop
 # below is a verbatim copy of that OLD per-segment logic, kept here as a
 # manual reference oracle so `_ste_proxy_batched` can be checked against it
 # directly, rather than trusting that the padded-index/mask rewrite
@@ -1350,12 +1347,11 @@ def test_hard_alloc_is_not_a_threshold_on_the_soft_pass():
 
 
 def test_hard_rollout_from_soft_matches_a_fresh_hard_forward_pass():
-    """open_followups.md #7b / A2: hard_rollout_from_soft must reproduce a
+    """hard_rollout_from_soft must reproduce a
     fresh forward(hard_alloc=True) pass exactly, since routing, segmentation
     and QoT never depend on hard_alloc -- only AllocationHead.rollout's
-    decision rule does (pipeline_profile_and_restoration_scaling.md,
-    Finding 2). Bit-identical, not merely close, and checked at every field
-    a caller reads."""
+    decision rule does. Bit-identical, not merely close, and checked at
+    every field a caller reads."""
     topology = make_hub_topology()
     pipeline = make_pipeline(topology)
     torch.manual_seed(0)

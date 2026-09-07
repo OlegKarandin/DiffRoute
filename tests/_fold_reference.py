@@ -66,8 +66,8 @@ def exact_expectation_by_enumeration(
 
     Test-only: `2^(N-1)` configurations. Guarded to `len(probs) <= 12`
     (4096 configurations) so a test typo cannot silently enumerate a
-    production-scale path (real topology paths run 16-19 segments, see
-    docs/investigations/fold_formula_scalability.md) and hang a test run.
+    production-scale path (real topology paths run 16-19 segments) and hang
+    a test run.
     """
     assert len(probs) <= 12, (
         f"exact_expectation_by_enumeration is O(2^(N-1)); refusing to "

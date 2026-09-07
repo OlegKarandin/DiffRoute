@@ -12,8 +12,7 @@ which is why `oracle_devices` is the same number at every delta below: the
 oracle is a property of the routes and the per-segment GSNRs, neither of
 which this sweep changes.
 
-PLAN DEVIATION 5 (binding — see
-.superpowers/sdd/plan-docs-superpowers-specs-2026-08-25-a-cozy-whistle/task-3-brief.md):
+PLAN DEVIATION 5 (binding):
 a fixed literal delta grid is not comparable across arms whose score scale
 differs (e.g. arm 3's `-alpha*f4` vs a plain MLP head). The default grid is
 therefore derived from THIS checkpoint's own observed score range
@@ -183,7 +182,7 @@ def main() -> None:
             # soft_alloc's routes/segments/GSNRs don't depend on the bias
             # being swept (only AllocationHead.rollout's fresh `s = score(feats)`
             # does), so it's reused across every delta rather than re-routed
-            # per iteration -- open_followups.md #7b.
+            # per iteration.
             hard = hard_rollout(
                 ctx.pipeline, demands, soft_alloc, ctx.mod_cfg,
                 margin_db=margin_db,
