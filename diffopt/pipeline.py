@@ -502,6 +502,7 @@ class DiffONetPipeline(nn.Module):
         lambda_: float = 10.0,
         *,
         hard_alloc: bool = False,
+        edge_log_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Dict[int, torch.Tensor],   # path_noise_costs
         Dict[int, torch.Tensor],   # gsnr_preds
@@ -521,6 +522,29 @@ class DiffONetPipeline(nn.Module):
                       decisions the head's carry is the EXACT chunk noise, so
                       the rollout is self-consistent physics, and the two
                       passes are allowed to disagree. Spec 2.5.
+            edge_log_weight: Route on THIS (E,) tensor instead of the learned
+                      `self.edge_log_weight` parameter. `None` (the default)
+                      is the training path and is bit-identical to what this
+                      signature did before the argument existed.
+
+                      Exists for DEPLOYMENT-TIME routing smoothing: the
+                      deployed readout chatters because Dijkstra's argmin
+                      keeps crossing between near-tied candidates, and an EMA
+                      of the learned parameter damps that readout without
+                      touching what `opt_edge` trains. See
+                      docs/architecture/invariants.md, "Surrogate gradient /
+                      routing".
+
+                      An override tensor, not an in-place swap of
+                      `self.edge_log_weight.data`: `F.softplus` saves its
+                      input for backward, so mutating the parameter between a
+                      forward and its `backward()` either corrupts that
+                      gradient silently or trips autograd's version counter.
+                      Passing the tensor sidesteps both.
+
+                      A call that passes this delivers no gradient to
+                      `self.edge_log_weight` — routing is a function of the
+                      override instead — so it belongs under `no_grad`.
 
         Returns:
             path_noise_costs: demand_id → scalar accumulated-ASE-noise tensor, live in autograd graph.
@@ -556,7 +580,14 @@ class DiffONetPipeline(nn.Module):
         # purpose (there the goal is to rescale an error term without adding
         # a gradient path). The two lines look nearly identical and mean
         # opposite things. Do not "make them consistent".
-        raw_edge_weights = F.softplus(self.edge_log_weight)
+        # `edge_log_weight` (the argument) overrides the parameter of the same
+        # name when given — the deployment-smoothing seam documented above.
+        # The Softplus and the renormalisation are downstream of the choice,
+        # so an override routes on exactly the transform training routes on.
+        theta = (
+            self.edge_log_weight if edge_log_weight is None else edge_log_weight
+        )
+        raw_edge_weights = F.softplus(theta)
         edge_weights = raw_edge_weights / raw_edge_weights.mean().clamp_min(1e-12)
 
         # 4. Route and segment every demand first (no QoT calls yet), so all
