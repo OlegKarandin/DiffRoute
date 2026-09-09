@@ -1,0 +1,229 @@
+topology: configs/topology/ind_132.json
+modulation_formats: configs/modulation_formats.yaml
+
+# ===========================================================================
+# THE DEMO ARM. Derived from constrained_stress.yaml — identical in every
+# value that affects TRAINING — and differing only in
+# `training.edge_weight_ema`, which is a deployment-time readout smoother.
+# Keep the two in sync: constrained_stress.yaml is the arm every diagnostic,
+# calibration script and recorded measurement defaults to, and it must keep
+# `edge_weight_ema` at its 0.0 default so those baselines stay comparable.
+# This file exists so the published demo has a real, reproducible config
+# behind it rather than an ad hoc override.
+#
+# Why the demo smooths and the baseline does not: routing is a discrete
+# argmin (Dijkstra) behind a Vlastelica surrogate, so a demand whose top-2
+# candidate routes are near-tied flips on ordinary step noise — measured
+# here, 6,542 route flips over 300 epochs, every one decided by under 0.1%
+# of route cost. That makes `oracle_devices` chatter between two bands for
+# the whole run, which dominates the viewer's stats panel and reads as
+# instability rather than as the near-tie it is. At 0.9 the EMA removes 98%
+# of it (mean |delta| 2.12 -> 0.04) while training is left bit-identical:
+# nothing on the gradient path reads the average.
+#
+# The cost is real and is why this is NOT the shipped default: the deployed
+# allocation lands ~+0.5 devices farther from the oracle, and it adds one
+# forward pass per epoch.
+# ===========================================================================
+
+# Spec §6 step 4: the binding-constraint run. alpha=0.0 decouples bitrate from
+# distance, so the big pipes are NOT concentrated on short hops and the
+# constraint actually binds. Primary gate: num_violated reaches 0 and holds
+# for the final 10 epochs.
+
+# Ad hoc e2e-pipeline smoke test: small_test.yaml re-pointed at ind_132.json.
+# Reuses the existing checkpoints/best_qot.pt (trained on ind_132 via
+# base.yaml's 50k/10k run) as qot_checkpoint — QoT training was skipped for
+# this run, only the Phase 1c e2e pipeline (routing + regen placement) runs.
+
+# Dataset generation
+num_train_samples: 500
+num_val_samples: 100
+num_demands: 100
+# Narrowed to the top tiers: with the full
+# 300-800 range and scale=1.3e6, the volume floor (min(bitrate_options)-25)
+# is low enough that num_violated=0 from epoch 1 — the constraint never
+# binds and the dual-ascent path is never exercised. Raising the floor to
+# 600 makes every surviving demand start near its own threshold instead of
+# comfortably below it. Also feeds build_traffic_matrix's bitrate_options
+# (diffopt/train.py); QoT training is skipped for this run so the dataset-
+# generation use of this key is inert.
+bitrate_options: [600, 650, 700, 750, 800]
+k_paths: 5
+seed: 42
+
+min_regen_reach_km: 250.0
+max_regen_reach_km: 3700.0
+
+# WDM
+num_channels_cband: 48
+
+# Model
+max_spans_per_segment: 60
+feature_dim: 5
+model_dim: 64
+num_heads: 4
+num_layers: 2
+ff_dim: 128
+
+# Training
+epochs: 20
+batch_size: 32
+learning_rate: 1.0e-3
+checkpoint_dir: checkpoints/constrained_stress_ema
+log_dir: logs/constrained_stress_ema
+val_rmse_target: 0.75
+
+# Data
+dataset_dir: data/datasets/ind_132
+
+# Phase 1c: end-to-end pipeline
+qot_checkpoint: checkpoints/best_qot.pt
+
+pipeline:
+  lambda_dev: 0.11         # MEASURED 2026-08-24 by
+                           # scripts/calibrate_lambda_dev.py --config
+                           # configs/experiment/constrained_stress.yaml.
+                           # Measured, not swept and not inherited: the old
+                           # lambda_regen 1.0 priced ~1e1 SITES, this prices
+                           # ~1e2-1e3 DEVICES, so it is a different problem.
+                           #   feasibility push ||dL/dw||_1 = 3.24e+03
+                           #                    (at dual_init = 10.0)
+                           #   device push      ||dL/dw||_1 = 2.87e+03
+                           #                    (at lambda_dev = 1.0)
+                           # The two forces are already near parity at unit
+                           # lambda, so landing the device push at 10-20% of
+                           # feasibility gives the band [0.11, 0.23] — an
+                           # order of magnitude BELOW the old value, not
+                           # above it.
+                           # DECIDED BY check 1, the force-ratio band's lower
+                           # edge. Check 2 (flip time) AGREED rather than
+                           # overriding: at 0.11 the first device is
+                           # recruited at epoch 3 of a 20-epoch trial, inside
+                           # its epochs/4 budget, so no below-band override
+                           # was needed. Re-run the script if the physics,
+                           # the topology or dual_init changes.
+  lambda_cost: 0.01
+  channel_loading_fraction: 0.5
+
+placement:
+  lookahead: true
+  route_context: true
+  # STE: the training forward pass takes the DEPLOYED decision, so the
+  # relaxation and hard_rollout cannot disagree about who is feasible.
+  # Without it, measured at an allocation with oracle_gap == 0, the soft
+  # pass called 10 of 346 demands violated that were feasible when
+  # deployed, and those phantoms carried 100% of the feasibility force —
+  # the saturated-open runaway (score to +229, dead_frac 1.0000) starts
+  # from exactly that phantom pressure.
+  # Required for the `4 vs 24 over-buy` result below to reproduce; without
+  # it this config saturates open (measured 2026-09-04: ~1560 devices vs
+  # an oracle of ~33). See training.alloc_tau_end for its other half.
+  alloc_ste: true
+
+# Fixed traffic matrix. Regenerates deterministically from
+# (topology, seed, scale, alpha) — nothing is committed; the checksum is
+# pinned in tests/test_traffic.py instead.
+traffic:
+  scenario: stress        # "stress" (alpha 0.0) | "realistic" (alpha 1.0)
+  seed: 0                 # matrix identity
+  # 2.5e6 at the 600-800 bitrate floor lands at 346 demands / 2.9% violated
+  # rate pre-training, close to the design
+  # spec's own ~2.3% reference point. 1.3e6 with the old full floor gave
+  # 516 demands / 0% violated — never binding.
+  scale: 2500000.0        # total offered load in Gbps
+  holdout_seed: 1         # a different matrix, for the generalisation gap
+
+# Feasibility as a constraint, not a penalty, via the augmented Lagrangian
+# (method of multipliers) — the only penalty compute_loss implements as of
+# 2026-09, which removed the one-sided hinge: augmented was measured
+# winning 4 vs 24 over-buy at the shipped
+# 300-epoch budget. `lambda_dev` above stays fixed; the duals rise (and, on
+# a slack demand, fall) until feasibility is bought, so the device count is
+# whatever the constraint requires.
+constraint:
+  margin_db: 0.5          # delta, added to the bar
+  dual_init: 0.0          # lambda_0 — cold start (spec section 3): every
+                          # dual starts at 0, so a slack demand exerts
+                          # nothing until it is ever violated
+  # rho — the augmented penalty coefficient and the dual step —
+  # MEASURED 2026-09-04 by
+  #   python -m scripts.calibrate_rho --config configs/experiment/constrained_stress.yaml
+  # device push 7.9842e+01, unit (linear, un-relu'd) feasibility push
+  # 7.3507e+02 -> lambda* = lambda_dev / s = 0.108618 -> rho = lambda* /
+  # 0.35 dB = 0.310338 (ceiling 10*lambda* = 1.086182, not binding).
+  # Confirmatory trial (20 epochs, augmented): violated max=31 final=0,
+  # last-10 violated max=0 zero_in=10/10, gap min=0 final=0, devices
+  # final=31 oracle=31, lambda_max=0.019. Re-run the script if the physics,
+  # the topology, lambda_dev or margin_db changes.
+  rho: 0.310338
+  dual_max: 1000.0        # lambda_max — a diagnostic cap, not tuned
+
+training:
+  lr_edge_net: 1.0e-3
+  # MEASURED, not the old lr_regen value: three SGD seeds (42/7/13) were
+  # swept post-optimizer-swap and 0.0005 was the arm that actually reached
+  # the documented over-buy figures. The shipped value
+  # here sat at 2.0e-2 for a long time — 40x too high — which was calibrated
+  # against Adam's normalised step, not SGD's proportional one; under SGD it
+  # produces either a frozen-closed or saturated-open run. See
+  # scripts/calibrate_lambda_dev.py if this needs re-deriving from scratch.
+  lr_alloc: 0.0005
+  # Grad-norm cap on the allocation head, matching the arm the numbers below
+  # were measured on (runs/sgd/long300_dmin0_s42). With a proportional (SGD)
+  # step, one transient gradient early in training can force the effective
+  # step down for the rest of the run; clipping caps that transient so a
+  # healthy lr survives the whole budget.
+  alloc_grad_clip: 100.0
+  # 300, not 60: the augmented penalty was measured overtaking the
+  # (now-removed) hinge only past ~150 epochs — at 60 epochs hinge/Adam was
+  # still ahead. This has been the nominal shipped budget for a while, but
+  # no config actually carried it until now.
+  epochs_e2e: 300
+  # THE ONLY LINE THAT DIFFERS FROM constrained_stress.yaml (besides the two
+  # output directories above). An EMA of `edge_log_weight` decides what gets
+  # ROLLED OUT, MEASURED and CHECKPOINTED; `opt_edge` keeps training the raw
+  # parameter on the raw gradient, and nothing on the gradient path reads the
+  # average — verified byte-identical on every soft-pass column against the
+  # unsmoothed arm, seeds 42/7/13.
+  #
+  # 0.9, not higher: for a signal alternating +/-A each epoch an EMA's
+  # steady-state amplitude is A*(1-beta)/(1+beta), so 0.9 keeps 5.3% and 0.98
+  # keeps 1.0% — but 0.98's ~50-epoch time constant is a sixth of the run, so
+  # it stops attenuating chatter and starts lagging real learning (measured:
+  # it pins the deployed routing on one corridor for all 300 epochs and the
+  # settled device median goes 23 -> 31). The window has to be slow against
+  # the chatter (period ~2-4 epochs) and fast against learning (~300).
+  edge_weight_ema: 0.9
+  vlastelica_lambda: 10.0
+  vlastelica_lambda_min: 1.0
+  vlastelica_lambda_decay: 0.995
+  alloc_tau_start: 1.0
+  # Pinned to alloc_tau_start, not annealed: under alloc_ste tau has no
+  # forward job left (the forward decision is the deployed one), so
+  # annealing it only sharpens the backward surrogate and starves every
+  # boundary whose score isn't already near 0 — train.py warns if an
+  # alloc_ste config leaves these two different. The original tau_end=0.1
+  # (pre-STE) reasoning — a small tau's usable score band, |s| < 0.5,
+  # sitting far inside the head's actual score range — is why annealing
+  # was dangerous in the first place; pinning at 1.0 sidesteps the anneal
+  # entirely rather than picking a safer endpoint.
+  alloc_tau_end: 1.0
+  alloc_tau_anneal_start_epoch: 10
+  alloc_tau_anneal_end_epoch: 55   # inert while tau_start == tau_end; kept
+                                    # so a future un-pin has a starting point
+
+# Checkpoint selection always reads the DEPLOYED allocation (train.py's
+# hard_rollout), never the relaxation the gradient flows through. There is
+# no longer a switch: hard_rollout is also where oracle_gap — the stage's
+# acceptance metric, logged every epoch — is computed.
+
+# Phase 1d trajectory dump. OFF by default everywhere else; this is the
+# config the demo artifact is built from, so it opts in.
+# `every: 1` at 300 epochs measured ~5.4 MB of JSON (frames.json, demo run) —
+# comfortably inside the Artifact's 16 MB cap with the file inlined, so
+# subsampling is a fallback rather than a requirement.
+viz:
+  dump_frames: true
+  every: 1
+  keyframe_every: 50

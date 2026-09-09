@@ -15,6 +15,13 @@ self-contained, per-epoch replay of a full training run: which lightpaths
 get routed, where regenerators get placed, and how both evolve as the
 constrained loss (§ below) drives the allocation toward feasibility.
 
+Built from `configs/experiment/constrained_stress_ema.yaml`, which enables
+`training.edge_weight_ema`: an EMA of the learned edge weights used for the
+*deployed* rollout only. Training is untouched by it — nothing on the
+gradient path reads the average — but it stops the `oracle_devices` trace
+flickering between two bands every epoch as Dijkstra's argmin crosses
+between near-tied routes.
+
 ## How it works
 
 ```
