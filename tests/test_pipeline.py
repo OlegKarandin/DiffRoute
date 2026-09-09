@@ -1679,3 +1679,155 @@ def test_segment_edge_ids_is_empty_for_no_demands():
         _, hard = pipeline.hard_rollout_from_soft([], alloc)
     assert alloc.segment_edge_ids == {}
     assert hard.segment_edge_ids == {}
+
+
+# ---------------------------------------------------------------------------
+# forward(edge_log_weight=...) — the deployment-smoothing seam
+# ---------------------------------------------------------------------------
+
+def test_edge_log_weight_override_none_matches_the_parameter_path():
+    """The default must be bit-identical to routing on the parameter itself,
+    since every existing caller relies on that and the EMA arm's beta=0 case
+    is defined as "reproduces the un-smoothed run exactly"."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+
+    with torch.no_grad():
+        _, gsnr_default, ind_default, alloc_default = pipeline(demands, tau=1.0)
+        _, gsnr_explicit, ind_explicit, alloc_explicit = pipeline(
+            demands, tau=1.0, edge_log_weight=pipeline.edge_log_weight,
+        )
+
+    for d in demands:
+        assert torch.equal(gsnr_default[d.id], gsnr_explicit[d.id])
+        assert torch.equal(ind_default[d.id], ind_explicit[d.id])
+    assert alloc_default.segment_edge_ids == alloc_explicit.segment_edge_ids
+
+
+def test_edge_log_weight_override_actually_reroutes():
+    """The hub topology's two 0->4 routes (eids 0,2 via node 1 and eids 1,3
+    via node 2) are what makes this checkable: an override that prices the
+    default winner's edges up must hand the win to the other route.
+
+    Without this the override could silently be ignored and every other test
+    here would still pass.
+    """
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = [Demand(id=0, src=0, dst=4, bitrate_gbps=400.0)]
+
+    with torch.no_grad():
+        _, _, ind_default, _ = pipeline(demands, tau=1.0)
+    winner = set(ind_default[0].nonzero().flatten().tolist())
+    assert winner in ({0, 2, 4}, {1, 3, 4}), f"unexpected route {winner}"
+
+    # Price the winning route's two non-shared edges far up. eid 4 is shared
+    # by both routes, so it is deliberately left alone.
+    override = pipeline.edge_log_weight.detach().clone()
+    for eid in winner - {4}:
+        override[eid] += 5.0
+
+    with torch.no_grad():
+        _, _, ind_override, _ = pipeline(
+            demands, tau=1.0, edge_log_weight=override,
+        )
+    rerouted = set(ind_override[0].nonzero().flatten().tolist())
+    other = {1, 3, 4} if winner == {0, 2, 4} else {0, 2, 4}
+    assert rerouted == other, (
+        f"override did not hand the argmin to the rival route: "
+        f"{winner} -> {rerouted}, expected {other}"
+    )
+
+
+def test_edge_log_weight_override_leaves_the_parameter_untouched():
+    """A readout smoother must not be a training change. The override is
+    passed as a tensor precisely so the parameter is never swapped in place —
+    check both its value and that it is still the same object with its
+    gradient intact."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+
+    before = pipeline.edge_log_weight.detach().clone()
+    param_id = id(pipeline.edge_log_weight)
+
+    # A live training pass first, then the deployment pass on other weights,
+    # then backward — the exact ordering train.py uses, and the one an
+    # in-place `.data` swap would corrupt.
+    path_noise_costs, _, _, _ = pipeline(demands, tau=1.0)
+    override = before + 1.0
+    with torch.no_grad():
+        pipeline(demands, tau=1.0, edge_log_weight=override)
+    sum(path_noise_costs.values()).backward()
+
+    assert torch.equal(pipeline.edge_log_weight.detach(), before)
+    assert id(pipeline.edge_log_weight) == param_id
+    assert pipeline.edge_log_weight.grad is not None
+
+
+def test_edge_log_weight_override_gives_the_parameter_no_gradient():
+    """Routing under an override is a function of the override, so the
+    parameter must come back with NO gradient — not a small one. Checked from
+    both ends, because the two overrides a caller can realistically pass
+    behave differently and only one of them is train.py's:
+
+      detached (train.py's EMA)   the routing term has no grad_fn at all, so
+                                  the graph is severed rather than merely
+                                  redirected.
+      grad-carrying              the gradient exists but lands on the
+                                  override, and the parameter still gets
+                                  nothing.
+    """
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    demands = make_demands()
+    base = pipeline.edge_log_weight.detach().clone()
+
+    detached_costs, _, _, _ = pipeline(
+        demands, tau=1.0, edge_log_weight=base + 0.25,
+    )
+    assert not sum(detached_costs.values()).requires_grad
+
+    live = (base + 0.25).requires_grad_(True)
+    live_costs, _, _, _ = pipeline(demands, tau=1.0, edge_log_weight=live)
+    total = sum(live_costs.values())
+    param_grad, live_grad = torch.autograd.grad(
+        total, [pipeline.edge_log_weight, live], allow_unused=True,
+    )
+    assert param_grad is None or param_grad.abs().sum().item() == 0.0
+    assert live_grad is not None, (
+        "the override received no gradient either — routing is not reading it"
+    )
+
+
+def test_hard_rollout_from_soft_is_exact_on_an_overridden_pass():
+    """train.py hands `hard_rollout` the OVERRIDDEN forward's output when
+    smoothing is on. That reuse is exact only if it stays bit-identical to a
+    fresh hard pass at the same weights — the same guarantee the un-smoothed
+    path already carries, re-checked on the override."""
+    topology = make_hub_topology()
+    pipeline = make_pipeline(topology)
+    # Same non-degenerate head init as
+    # test_hard_rollout_from_soft_matches_a_fresh_hard_forward_pass: at the
+    # default init every score is identical, so every hard decision agrees
+    # trivially and the comparison proves nothing.
+    torch.manual_seed(0)
+    with torch.no_grad():
+        pipeline.allocation_head.net[-1].weight.normal_(std=0.5)
+        pipeline.allocation_head.net[-1].bias.zero_()
+    demands = make_demands()
+    override = pipeline.edge_log_weight.detach().clone() + 0.75
+
+    with torch.no_grad():
+        _, _, _, soft = pipeline(demands, tau=1.0, edge_log_weight=override)
+        gsnr_reused, hard_reused = pipeline.hard_rollout_from_soft(demands, soft)
+        _, gsnr_fresh, _, hard_fresh = pipeline(
+            demands, tau=1.0, hard_alloc=True, edge_log_weight=override,
+        )
+
+    for d in demands:
+        assert torch.equal(gsnr_reused[d.id], gsnr_fresh[d.id])
+    assert torch.equal(hard_reused.a, hard_fresh.a)
+    assert torch.equal(hard_reused.seg_gsnr_db, hard_fresh.seg_gsnr_db)
+    assert hard_reused.segment_edge_ids == hard_fresh.segment_edge_ids

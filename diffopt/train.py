@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 
@@ -448,6 +449,38 @@ def main() -> None:
         [pipeline.edge_log_weight],
         lr=cfg["training"]["lr_edge_net"],
     )
+
+    # Deployment-time routing smoothing. beta = 0.0 (the default) is OFF and
+    # reproduces the previous behaviour exactly, including the
+    # `hard_rollout_from_soft` reuse path below.
+    #
+    # This is a READOUT smoother, not a training change: `opt_edge` keeps
+    # training the raw parameter on the raw gradient, and the EMA only decides
+    # what gets ROLLED OUT, MEASURED and CHECKPOINTED. Routing is a discrete
+    # argmin (Dijkstra) behind a Vlastelica surrogate, so a demand whose top-2
+    # candidate routes are near-tied flips on ordinary step noise; measured on
+    # constrained_stress, 6,542 route flips over 300 epochs with a median
+    # length gap of 1.7% between the two routes, 64% of them on demands that
+    # are comfortably feasible. Averaging the weights the DEPLOYED route is
+    # read off makes that argmin cross far less often without pretending the
+    # underlying near-tie is resolved.
+    #
+    # Deliberately NOT a fix for the dual: invariants.md's own kd measurement
+    # already showed retuning the feasibility dual outcome-neutral, and 64% of
+    # the flips happen where the dual contributes no meaningful gradient at
+    # all. Smoothing the readout and retuning the controller are different
+    # claims; this is only the first.
+    edge_weight_ema: float = float(cfg["training"].get("edge_weight_ema", 0.0))
+    if not 0.0 <= edge_weight_ema < 1.0:
+        raise ValueError(
+            f"training.edge_weight_ema must be in [0, 1) (0.0 disables it), "
+            f"got {edge_weight_ema}"
+        )
+    # Seeded at the parameter's own init, not at zero, so no bias correction
+    # is needed: at epoch 1 the EMA and the parameter are equal by
+    # construction (b*x + (1-b)*x == x) and the first deployed rollout is
+    # bit-identical to the un-smoothed one.
+    ema_theta = pipeline.edge_log_weight.detach().clone()
     # `lambda_dev * device_count` is the only loss term that touches every
     # boundary unconditionally, and d/ds of it is `lambda_dev *
     # sigmoid'(s/tau)/tau` — strictly positive, so it pushes every score down
@@ -552,6 +585,30 @@ def main() -> None:
     # not opt in must produce a byte-identical e2e_train_log.csv to one built
     # before this existed.
     v_cfg = cfg.get("viz", {})
+
+    # Per-epoch routing-weight dump. Separate flag from `dump_frames` because
+    # it answers a different question: frames record what routing DECIDED,
+    # this records the weights it decided FROM. Without it, a contested edge
+    # pair can only be inferred from the decisions it produced; with it, the
+    # two candidates' cost gap can be watched crossing zero directly. On
+    # constrained_stress that gap was measured at a median of 0.004% of route
+    # cost across all 6,542 route flips — a tie roughly 400x tighter than the
+    # 1.7% the routes' KM difference suggests, km being a proxy the router
+    # does not optimise. `scripts/diagnose_route_flip_chatter.py
+    # --edge-weights` is the consumer.
+    #
+    # Off by default, like dump_frames: a run that does not opt in must
+    # produce a byte-identical e2e_train_log.csv to one built before this
+    # existed.
+    edge_w_fh = None
+    edge_w_writer = None
+    if v_cfg.get("dump_edge_weights", False):
+        edge_w_fh = open(log_dir / "edge_weights.csv", "w", newline="")
+        edge_w_writer = csv.writer(edge_w_fh)
+        edge_w_writer.writerow(
+            ["epoch"] + [f"w{i}" for i in range(pipeline.edge_log_weight.numel())]
+        )
+
     frame_writer = None
     if v_cfg.get("dump_frames", False):
         from diffopt.viz import FrameWriter
@@ -674,12 +731,41 @@ def main() -> None:
             alloc_head_state_pre_step = {
                 k: v.clone() for k, v in allocation_head.state_dict().items()
             }
+            # Deployment-time routing smoothing (see `edge_weight_ema`). The
+            # EMA is advanced on the PRE-STEP parameter, so the smoothed
+            # weights this epoch deploys are an average over exactly the
+            # epochs 1..epoch this row reports on.
+            if edge_weight_ema > 0.0:
+                ema_theta.mul_(edge_weight_ema).add_(
+                    edge_log_weight_pre_step, alpha=1.0 - edge_weight_ema
+                )
+                deployed_theta = ema_theta
+            else:
+                deployed_theta = edge_log_weight_pre_step
+
             # Selection metrics, measured on the deployed allocation rather
             # than on the relaxation the gradient step is taken through.
             # Pre-step, like the two snapshots above: the checkpoint must
             # save the parameters its own key describes.
+            if edge_weight_ema > 0.0:
+                # Smoothed weights route differently from the trained ones, so
+                # `alloc`'s routes are the wrong ones to hand
+                # `hard_rollout_from_soft` — its reuse is exact only because
+                # routing/segmentation/QoT are identical between the soft and
+                # hard passes it bridges. Re-route on the EMA weights instead
+                # and hand it THAT pass, which restores the same guarantee at
+                # the cost of one extra forward per epoch. The per-segment QoT
+                # memo absorbs most of it: the smoothed route usually shares
+                # most of its segments with the trained one.
+                with torch.no_grad():
+                    _, _, _, deployed_alloc = pipeline(
+                        demands, tau=tau, lambda_=vlastelica_lambda,
+                        edge_log_weight=ema_theta,
+                    )
+            else:
+                deployed_alloc = alloc
             hard = hard_rollout(
-                pipeline, demands, alloc, mod_cfg,
+                pipeline, demands, deployed_alloc, mod_cfg,
                 margin_db=c_cfg["margin_db"],
             )
 
@@ -760,6 +846,29 @@ def main() -> None:
             ])
             tf.flush()
 
+            if edge_w_writer is not None:
+                # `deployed_theta`, not the live parameter: this row must be
+                # the weights THIS epoch's routes were computed from, so it
+                # lines up with this epoch's frame — which is written from the
+                # deployed rollout. Same pre-step discipline as the checkpoint
+                # above, and identical to the raw pre-step parameter whenever
+                # smoothing is off.
+                #
+                # Softplus then unit-mean renormalisation, reproducing
+                # pipeline.forward's step 3 (pipeline.py, `raw_edge_weights`)
+                # exactly — the normalised tensor is what Dijkstra actually
+                # ran on. Writing the raw Softplus output instead would
+                # describe a tensor the pipeline never uses; see
+                # scripts/_common.py's `edge_weights_of` for the same
+                # guarantee on the diagnostic side.
+                with torch.no_grad():
+                    raw_w = F.softplus(deployed_theta)
+                    w = raw_w / raw_w.mean().clamp_min(1e-12)
+                edge_w_writer.writerow(
+                    [epoch] + [f"{v:.8e}" for v in w.tolist()]
+                )
+                edge_w_fh.flush()
+
             if frame_writer is not None:
                 # `hard` only — routes and cuts from hard["alloc"], margins
                 # from hard["gsnr_preds"], so every number in a frame is
@@ -799,7 +908,23 @@ def main() -> None:
                 torch.save(
                     {
                         "epoch": epoch,
-                        "edge_log_weight": edge_log_weight_pre_step.cpu(),
+                        # The DEPLOYED routing — the EMA when smoothing is on,
+                        # the raw pre-step parameter when it is off. Same rule
+                        # the pre-step snapshots already follow: a checkpoint
+                        # must carry the weights its own selection key was
+                        # measured on, and under smoothing that key came from
+                        # a rollout routed on the EMA. Saving the raw
+                        # parameter here would ship a checkpoint whose routing
+                        # reproduces none of the numbers stored beside it.
+                        "edge_log_weight": deployed_theta.detach().clone().cpu(),
+                        # Only under smoothing, and only so a run can be
+                        # resumed: `opt_edge`'s Adam state belongs to the raw
+                        # parameter, not to the average of it.
+                        **(
+                            {"edge_log_weight_train":
+                                edge_log_weight_pre_step.cpu()}
+                            if edge_weight_ema > 0.0 else {}
+                        ),
                         "alloc_head_state": alloc_head_state_pre_step,
                         "opt_edge_state": opt_edge.state_dict(),
                         "opt_alloc_state": opt_alloc.state_dict(),
@@ -822,6 +947,10 @@ def main() -> None:
                     f"devices={selection_key[1]}, "
                     f"worst_margin={-selection_key[2]:+.4f}dB)"
                 )
+
+    if edge_w_fh is not None:
+        edge_w_fh.close()
+        print(f"Edge weights: {log_dir / 'edge_weights.csv'}")
 
     if frame_writer is not None:
         frame_writer.close(best_epoch, log_path)

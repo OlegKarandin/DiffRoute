@@ -201,10 +201,14 @@ def build_context(
             )
 
         allocation_head.load_state_dict(ckpt["alloc_head_state"])
-        # `ckpt["edge_log_weight"]` is a RAW (E,) tensor, not a state_dict:
-        # train.py saves `pipeline.edge_log_weight.detach().clone().cpu()`
+        # `ckpt["edge_log_weight"]` is a RAW (E,) tensor, not a state_dict,
         # because the routing parameter is a bare nn.Parameter now, not a
-        # submodule. Copy it in place so `pipeline` keeps the same Parameter
+        # submodule. It holds the DEPLOYED routing — identical to the trained
+        # parameter unless the run set `training.edge_weight_ema`, in which
+        # case it is the smoothed weights the checkpoint's own metrics were
+        # measured on (the raw parameter is kept beside it as
+        # `edge_log_weight_train`, for resuming training rather than for
+        # reproducing numbers). Copy it in place so `pipeline` keeps the same Parameter
         # object (anything already holding a reference to it — an optimizer,
         # a diagnostic's autograd target — stays valid).
         with torch.no_grad():
