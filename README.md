@@ -10,8 +10,6 @@ Combinatorial Solvers* (ICLR 2020).
 
 ## Demo
 
-[![Lightpath trajectory viewer preview](docs/demo/preview.png)](https://olegkarandin.github.io/DiffRoute/demo/)
-
 **[Live demo →](https://olegkarandin.github.io/DiffRoute/demo/)** — a
 self-contained, per-epoch replay of a full training run: which lightpaths
 get routed, where regenerators get placed, and how both evolve as the
