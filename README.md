@@ -41,8 +41,9 @@ hyperparameter's role.
 | Metric | Value |
 |---|---|
 | QoT surrogate val RMSE (`ind_132`, 50k/10k, 100 ep) | 0.1909 dB vs 0.25 dB target (~1.4% of the 6.5-20 dB range) |
-| Regenerator over-buy vs oracle-optimal, 300 ep, seed 42 | 4 devices |
-| Test suite | 424 tests, `pytest tests/` |
+| Regenerator over-buy vs oracle-optimal, 300 ep | 4 / 5 / 15 devices (model-init seeds 42 / 7 / 13) |
+| What that gap is | a decision-threshold offset of 0.15-0.36 dB: **zero missed cuts** on all three seeds, and every over-buying demand over-buys **exactly +1** |
+| Test suite | 429 tests, `pytest tests/` |
 
 ## Install
 
