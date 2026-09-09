@@ -161,26 +161,39 @@
   }
 
   /* ---- panels ------------------------------------------------------------
-   * A grid, not a stacked column: the map gets its own full-width row (the
-   * majority of the height) so it reads at a useful size, and strip/stats
-   * share the row below it side by side. Row heights are `minmax(0, Nfr)`
-   * against the fixed space #panels actually has (flex:1 1 auto inside a
-   * 100vh column), so all three panels are visible at once on an ordinary
-   * viewport with no page-level scrollbar; .panel-body's own overflow is
-   * the fallback for a window too small to fit even that.
+   * A single-column grid: map, strip and stats each get their own
+   * full-width row rather than strip/stats sharing a row side by side --
+   * every plot reads at the window's full width. Row heights are
+   * `minmax(0, Nfr)` against the fixed space #panels actually has (flex:1 1
+   * auto inside a 100vh column), so all panels are visible at once on an
+   * ordinary viewport with no page-level scrollbar; .panel-body's own
+   * overflow is the fallback for a window too small to fit even that.
+   * The strip row (per-lightpath physics) only exists while a lightpath is
+   * focused -- render() toggles the `no-strip` modifier below, rather than
+   * leaving an empty row reserved, whenever state.focus is null.
    * ------------------------------------------------------------------- */
   #panels {
     flex: 1 1 auto;
     min-height: 0;
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    grid-template-rows: minmax(0, 1.5fr) minmax(0, 1fr);
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr);
     grid-template-areas:
-      "map map"
-      "strip stats";
+      "map"
+      "strip"
+      "stats";
     gap: var(--space-4);
     padding: var(--space-4) var(--space-5);
   }
+
+  #panels.no-strip {
+    grid-template-rows: minmax(0, 1.4fr) minmax(0, 1fr);
+    grid-template-areas:
+      "map"
+      "stats";
+  }
+
+  #strip-panel[hidden] { display: none; }
 
   .panel {
     display: flex;
@@ -728,7 +741,16 @@
       mapDragging = true;
       mapDragMoved = false;
       mapDragStart = { clientX: e.clientX, clientY: e.clientY, view: mapViewOrDefault() };
-      svgEl.setPointerCapture(e.pointerId);
+      // Pointer capture is deliberately NOT grabbed here. Capturing on
+      // pointerdown -- before it's known whether this is a click or a drag
+      // -- retargets the click a plain tap synthesizes from this same
+      // pointerdown/pointerup pair to svgEl itself, so a ribbon element
+      // under the cursor never receives its own onclick (focusLightpath
+      // never fires; only the SVG's background handleMapBackgroundClick
+      // does). Capture is grabbed instead in pointermove, the first time
+      // movement actually crosses the click threshold below -- by then a
+      // genuine drag is confirmed and a plain click has already been ruled
+      // out.
     });
 
     mapBody.addEventListener('pointermove', (e) => {
@@ -737,7 +759,10 @@
       if (!svgEl) return;
       const dxClient = e.clientX - mapDragStart.clientX;
       const dyClient = e.clientY - mapDragStart.clientY;
-      if (!mapDragMoved && Math.hypot(dxClient, dyClient) > 3) mapDragMoved = true;
+      if (!mapDragMoved && Math.hypot(dxClient, dyClient) > 3) {
+        mapDragMoved = true;
+        svgEl.setPointerCapture(e.pointerId);
+      }
       if (!mapDragMoved) return;
       const rect = svgEl.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
@@ -1137,7 +1162,11 @@
   // colour-coded stroke on top -- z-axis separation, not an xy offset.
   // Widths come straight from markScale()'s ribbonW/casingW (Task 8
   // provisioned them for exactly this). Each ribbon is clickable to enter
-  // focus mode for that lightpath.
+  // focus mode for that lightpath. Feasible (green) lightpaths deliberately
+  // get no ribbon at all here -- Step 3's point is to keep them implicit in
+  // the edge-load encoding rather than cluttering the map with hundreds of
+  // healthy strands, and that includes not making them selectable from the
+  // map; use the focus dropdown above the map for those.
   function renderBaseRibbons(frame, scale) {
     let svg = '';
     for (const lp of nonGreenDrawSet(frame)) {
@@ -1400,6 +1429,35 @@
     return points;
   }
 
+  // The strip chart's y-domain, fixed for a given focused demand across
+  // EVERY dumped epoch (not just the current + baseline ones) -- so
+  // scrubbing moves the staircase without also rescaling the axis under
+  // it, which previously made a data change and an axis change look like
+  // the same jump. Cached per demand: DOC never changes at runtime, so
+  // this is a pure function of demandId, computed once on first focus.
+  const _stripYDomainCache = new Map();
+  function stripYDomain(demandId, demand) {
+    if (_stripYDomainCache.has(demandId)) return _stripYDomainCache.get(demandId);
+    let yMin = Infinity, yMax = -Infinity;
+    for (const ep of EPOCHS) {
+      const lp = frameAt(ep).lightpaths.get(demandId);
+      if (!lp) continue;
+      for (const p of chunkLevels(lp)) {
+        if (p.y < yMin) yMin = p.y;
+        if (p.y > yMax) yMax = p.y;
+      }
+    }
+    if (yMin > yMax) { yMin = demand.threshold_db; yMax = demand.threshold_db; }
+    yMin = Math.min(yMin, demand.threshold_db, demand.bar_db);
+    yMax = Math.max(yMax, demand.threshold_db, demand.bar_db);
+    const pad = Math.max(0.5, (yMax - yMin) * 0.12);
+    yMin -= pad; yMax += pad;
+    if (yMax - yMin < 1e-6) { yMin -= 1; yMax += 1; }
+    const domain = { yMin, yMax };
+    _stripYDomainCache.set(demandId, domain);
+    return domain;
+  }
+
   function stairPathD(points, xOf, yOf) {
     if (!points.length) return '';
     let d = `M ${xOf(points[0].x).toFixed(2)} ${yOf(points[0].y).toFixed(2)}`;
@@ -1471,12 +1529,7 @@
     const curPoints = chunkLevels(lp);
     const basePoints = baseLp ? chunkLevels(baseLp) : [];
 
-    const allY = curPoints.map(p => p.y).concat(basePoints.map(p => p.y));
-    allY.push(demand.threshold_db, demand.bar_db);
-    let yMin = Math.min(...allY), yMax = Math.max(...allY);
-    const yPad = Math.max(0.5, (yMax - yMin) * 0.12);
-    yMin -= yPad; yMax += yPad;
-    if (yMax - yMin < 1e-6) { yMin -= 1; yMax += 1; }
+    const { yMin, yMax } = stripYDomain(demandId, demand);
 
     const xMax = Math.max(
       curPoints.length ? curPoints[curPoints.length - 1].x : 0,
@@ -1662,42 +1715,23 @@
     return best;
   }
 
-  // Step 4: mean-Hamming-distance-flavoured churn between consecutive
-  // DUMPED frames' SITE SETS -- there is no per-epoch site-set column in
-  // DOC.stats, only frameAt's delta-reconstruction, so this walks EPOCHS
-  // (not the stats CSV's own epoch column) and calls frameAt for each
-  // adjacent pair, exactly as the brief specifies. One entry per adjacent
-  // EPOCHS pair (the first epoch has no predecessor and is skipped),
-  // normalized by candidate count into a [0, 1] fraction so it reads the
-  // same way regardless of topology size. This is the explicit-number
-  // counterpart to Task 9's halo-decay glow -- same underlying churn,
-  // different evidence.
-  function computeChurn() {
-    const candidateCount = Math.max(1, TOPO.regen_candidates.length);
-    const out = [];
-    for (let i = 1; i < EPOCHS.length; i++) {
-      const prevSites = frameAt(EPOCHS[i - 1]).sites;
-      const curSites = frameAt(EPOCHS[i]).sites;
-      const curKeys = Object.keys(curSites);
-      const curKeySet = new Set(curKeys);
-      let diff = 0;
-      for (const k of Object.keys(prevSites)) if (!curKeySet.has(k)) diff++;
-      for (const k of curKeys) if (!Object.prototype.hasOwnProperty.call(prevSites, k)) diff++;
-      out.push({ epoch: EPOCHS[i], raw: diff, frac: diff / candidateCount });
-    }
-    return out;
-  }
 
   const STATS_VB_W = 760;
-  const STATS_PAD = { l: 42, r: 14, t: 26, b: 26 };
+  // l widened from 42 to fit a rotated y-axis title to the left of each
+  // rail's own tick numbers (STATS_TITLE_X sits inside that extra room).
+  // r widened from 14 to fit oracle_devices' own right-hand axis -- ticks
+  // and a rotated title -- on the device rail only.
+  const STATS_PAD = { l: 54, r: 34, t: 26, b: 26 };
   const STATS_PLOT_W = STATS_VB_W - STATS_PAD.l - STATS_PAD.r;
+  const STATS_TICK_X = 16;     // tick-number column, right of the axis title
+  const STATS_TITLE_X = 9;     // rotated axis-title column (left edge)
+  const STATS_TICK_X_R = STATS_PAD.l + STATS_PLOT_W + 4;   // right-axis tick numbers
+  const STATS_TITLE_X_R = STATS_VB_W - 9;                  // right-axis rotated title
   const STATS_RAIL_V_H = 58;   // upper rail: hard_num_violated, linear
   const STATS_RAIL_GAP = 10;
   const STATS_RAIL_D_H = 92;   // lower rail: hard_num_devices, log(1+x)
   const STATS_TICK_GAP = 10;
   const STATS_TICK_H = 10;     // quiet tick rail: every zero-violated epoch
-  const STATS_CHURN_GAP = 10;
-  const STATS_CHURN_H = 26;    // site-set churn sparkline
 
   const STATS_Y_V_TOP = STATS_PAD.t;
   const STATS_Y_V_BOT = STATS_Y_V_TOP + STATS_RAIL_V_H;
@@ -1705,10 +1739,19 @@
   const STATS_Y_D_BOT = STATS_Y_D_TOP + STATS_RAIL_D_H;
   const STATS_Y_TICK_TOP = STATS_Y_D_BOT + STATS_TICK_GAP;
   const STATS_Y_TICK_BOT = STATS_Y_TICK_TOP + STATS_TICK_H;
-  const STATS_Y_CHURN_TOP = STATS_Y_TICK_BOT + STATS_CHURN_GAP;
-  const STATS_Y_CHURN_BOT = STATS_Y_CHURN_TOP + STATS_CHURN_H;
-  const STATS_PLOT_BOTTOM = STATS_Y_CHURN_BOT;
+  const STATS_PLOT_BOTTOM = STATS_Y_TICK_BOT;
   const STATS_VB_H = STATS_PLOT_BOTTOM + STATS_PAD.b;
+
+  // Rotated y-axis title, vertically centered on a rail's own [top, bot]
+  // span -- shared by the violated and device rails (left, default x) and
+  // reused for the device rail's right-hand oracle axis (pass STATS_TITLE_X_R)
+  // so all titles line up in their own column regardless of rail height.
+  function statsAxisTitleSvg(top, bot, label, x) {
+    if (x === undefined) x = STATS_TITLE_X;
+    const cy = (top + bot) / 2;
+    return `<text x="${x}" y="${cy.toFixed(2)}" text-anchor="middle" ` +
+      `transform="rotate(-90, ${x}, ${cy.toFixed(2)})" font-size="8" fill="var(--muted)">${escHtml(label)}</text>`;
+  }
 
   function makeXOf(epochs) {
     if (!epochs.length) return () => STATS_PAD.l;
@@ -1732,20 +1775,6 @@
     if (!xs.length) return '';
     let d = `M ${xs[0].toFixed(2)} ${ys[0].toFixed(2)}`;
     for (let i = 1; i < xs.length; i++) d += ` L ${xs[i].toFixed(2)} ${ys[i].toFixed(2)}`;
-    return d;
-  }
-
-  // Step 2: the oracle minimum as an AREA -- filled from the rail's own
-  // 0-devices baseline up to oracle_devices at each epoch -- rather than a
-  // bare line, so "how close to optimal" reads as the vertical gap between
-  // this band's top edge and the actual device curve: a spatial
-  // relationship that is UNCONDITIONAL (always meaningful), unlike a
-  // derived oracle_gap number (see the reporting-rule note above).
-  function statsAreaPath(xs, topYs, bottomY) {
-    if (!xs.length) return '';
-    let d = `M ${xs[0].toFixed(2)} ${bottomY.toFixed(2)}`;
-    for (let i = 0; i < xs.length; i++) d += ` L ${xs[i].toFixed(2)} ${topYs[i].toFixed(2)}`;
-    d += ` L ${xs[xs.length - 1].toFixed(2)} ${bottomY.toFixed(2)} Z`;
     return d;
   }
 
@@ -1812,12 +1841,16 @@
 
     const line1 = `epoch ${ep}`;
     const line2 = `${vVal} violated, ${dVal} devices (oracle ${oVal == null ? '—' : oVal})`;
+    const oracleDotSvg = (oVal != null && ctx.yOfOracle)
+      ? `<circle cx="${xPix.toFixed(2)}" cy="${ctx.yOfOracle(oVal).toFixed(2)}" r="3.2" fill="none" stroke="var(--muted)" stroke-width="1.6"/>`
+      : '';
 
     ctx.hoverGroup.innerHTML =
       `<line x1="${xPix.toFixed(2)}" y1="${STATS_PAD.t}" x2="${xPix.toFixed(2)}" y2="${STATS_PLOT_BOTTOM}" ` +
       `stroke="var(--ink)" stroke-opacity="0.4" stroke-width="1"/>` +
       `<circle cx="${xPix.toFixed(2)}" cy="${vY.toFixed(2)}" r="3.2" fill="var(--ink)"/>` +
       `<circle cx="${xPix.toFixed(2)}" cy="${dY.toFixed(2)}" r="3.2" fill="var(--load)"/>` +
+      oracleDotSvg +
       `<g transform="translate(${boxX.toFixed(2)},${boxY.toFixed(2)})">` +
         `<rect width="${boxW}" height="${boxH}" rx="4" fill="var(--panel)" stroke="var(--line)"/>` +
         `<text x="7" y="14" font-size="9.5" fill="var(--ink)">${escHtml(line1)}</text>` +
@@ -1848,15 +1881,38 @@
     // ---- Step 1, lower rail: devices, log(1+x). The domain always covers
     // at least 0-1000 so the brief's fixed 0/10/100/1000 ticks stay
     // meaningful even on a short/small fixture, not just a full 300-epoch run.
-    const deviceDomainMax = Math.max(1000, arrMax(devices, 0), arrMax(oracle, 0));
+    const deviceDomainMax = Math.max(1000, arrMax(devices, 0));
     const toFrac = log1pFrac(deviceDomainMax);
     const yOfD = v => STATS_Y_D_BOT - toFrac(v) * STATS_RAIL_D_H;
 
     const xs = epochs.map(xOf);
     const violatedPath = statsLinePath(xs, violated.map(v => yOfV(v)));
     const devicePath = statsLinePath(xs, devices.map(v => yOfD(v)));
-    const oracleTopYs = oracle.map(v => yOfD(v == null ? 0 : v));
-    const oracleBand = statsAreaPath(xs, oracleTopYs, STATS_Y_D_BOT);
+
+    // oracle_devices gets its OWN linear axis on the right of the device
+    // rail, scaled to its own min/max across the run -- sharing yOfD (as a
+    // filled band, the previous encoding) flattened its real routing-driven
+    // variation to invisibility next to the device curve's much larger
+    // range. Padded 10% of its own span so the line never touches the rail
+    // edge; falls back to a flat [0, 1] domain when every value is missing.
+    let oracleMin = Infinity, oracleMax = -Infinity;
+    for (const v of oracle) {
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        if (v < oracleMin) oracleMin = v;
+        if (v > oracleMax) oracleMax = v;
+      }
+    }
+    const hasOracle = oracleMin <= oracleMax;
+    const oraclePad = (hasOracle ? Math.max(1, oracleMax - oracleMin) : 1) * 0.1;
+    const oracleDomainMin = hasOracle ? oracleMin - oraclePad : 0;
+    const oracleDomainMax = hasOracle ? oracleMax + oraclePad : 1;
+    const yOfOracle = v => STATS_Y_D_BOT - ((v - oracleDomainMin) / (oracleDomainMax - oracleDomainMin)) * STATS_RAIL_D_H;
+
+    const oracleIdxs = [];
+    for (let i = 0; i < oracle.length; i++) {
+      if (typeof oracle[i] === 'number' && Number.isFinite(oracle[i])) oracleIdxs.push(i);
+    }
+    const oraclePath = statsLinePath(oracleIdxs.map(i => xs[i]), oracleIdxs.map(i => yOfOracle(oracle[i])));
 
     // Fixed ticks at 0/10/100/1000 -- not derived from the data, so the
     // rail reads the same way across every run (Step 1's binding rule).
@@ -1867,12 +1923,28 @@
       deviceTickSvg +=
         `<line x1="${STATS_PAD.l}" y1="${ty.toFixed(2)}" x2="${(STATS_PAD.l + STATS_PLOT_W).toFixed(2)}" y2="${ty.toFixed(2)}" ` +
         `stroke="var(--line)" stroke-width="1"/>` +
-        `<text x="2" y="${(ty + 3).toFixed(2)}" font-size="8" fill="var(--muted)">${t}</text>`;
+        `<text x="${STATS_TICK_X}" y="${(ty + 3).toFixed(2)}" font-size="8" fill="var(--muted)">${t}</text>`;
+    }
+
+    // Right-axis ticks for oracle's own scale: short perpendicular marks
+    // (not full gridlines, which would double up with the device rail's
+    // own) at its actual min/mid/max -- always exact, never a nice round
+    // number the data may not hit.
+    let oracleTickSvg = '';
+    if (hasOracle) {
+      const rightX = STATS_PAD.l + STATS_PLOT_W;
+      for (const v of [oracleMin, (oracleMin + oracleMax) / 2, oracleMax]) {
+        const ty = yOfOracle(v);
+        oracleTickSvg +=
+          `<line x1="${rightX.toFixed(2)}" y1="${ty.toFixed(2)}" x2="${(rightX + 4).toFixed(2)}" y2="${ty.toFixed(2)}" ` +
+          `stroke="var(--muted)" stroke-width="1"/>` +
+          `<text x="${STATS_TICK_X_R}" y="${(ty + 3).toFixed(2)}" font-size="8" fill="var(--muted)">${Math.round(v)}</text>`;
+      }
     }
     const violatedTickSvg =
       `<line x1="${STATS_PAD.l}" y1="${STATS_Y_V_BOT.toFixed(2)}" x2="${(STATS_PAD.l + STATS_PLOT_W).toFixed(2)}" y2="${STATS_Y_V_BOT.toFixed(2)}" stroke="var(--line)" stroke-width="1"/>` +
-      `<text x="2" y="${(STATS_Y_V_TOP + 7).toFixed(2)}" font-size="8" fill="var(--muted)">${(maxViolated / 1.08).toFixed(0)}</text>` +
-      `<text x="2" y="${(STATS_Y_V_BOT + 3).toFixed(2)}" font-size="8" fill="var(--muted)">0</text>`;
+      `<text x="${STATS_TICK_X}" y="${(STATS_Y_V_TOP + 7).toFixed(2)}" font-size="8" fill="var(--muted)">${(maxViolated / 1.08).toFixed(0)}</text>` +
+      `<text x="${STATS_TICK_X}" y="${(STATS_Y_V_BOT + 3).toFixed(2)}" font-size="8" fill="var(--muted)">0</text>`;
 
     // ---- Step 6: three DISTINCT epoch marks. Never merged into one
     // "best epoch" marker -- they answer three different questions and
@@ -1919,23 +1991,13 @@
         `<title>${escHtml(`epoch ${epochs[i]}: 0 violated`)}</title></line>`;
     }
 
-    // ---- Step 4: churn sparkline, from frameAt/EPOCHS (NOT the stats CSV).
-    const churn = computeChurn();
-    const churnXs = churn.map(c => xOf(c.epoch));
-    const churnYs = churn.map(c => STATS_Y_CHURN_BOT - Math.min(1, c.frac) * STATS_CHURN_H);
-    const churnPath = statsLinePath(churnXs, churnYs);
-    let churnDots = '';
-    for (let i = 0; i < churn.length; i++) {
-      churnDots +=
-        `<circle cx="${churnXs[i].toFixed(2)}" cy="${churnYs[i].toFixed(2)}" r="1.6" fill="var(--load)">` +
-        `<title>${escHtml(`epoch ${churn[i].epoch}: ${churn[i].raw} site${churn[i].raw === 1 ? '' : 's'} changed vs the previous dumped frame`)}</title></circle>`;
-    }
-
     const axisLabelsSvg =
       `<text x="${STATS_PAD.l}" y="${(STATS_VB_H - 6).toFixed(2)}" font-size="8" fill="var(--muted)">epoch ${epochs[0]}</text>` +
       `<text x="${(STATS_PAD.l + STATS_PLOT_W).toFixed(2)}" y="${(STATS_VB_H - 6).toFixed(2)}" text-anchor="end" font-size="8" fill="var(--muted)">epoch ${epochs[epochs.length - 1]}</text>` +
-      `<text x="2" y="${(STATS_Y_TICK_TOP - 1).toFixed(2)}" font-size="7.5" fill="var(--muted)">0-viol.</text>` +
-      `<text x="2" y="${(STATS_Y_CHURN_TOP + 8).toFixed(2)}" font-size="7.5" fill="var(--muted)">churn</text>`;
+      `<text x="${STATS_TICK_X}" y="${(STATS_Y_TICK_TOP - 1).toFixed(2)}" font-size="7.5" fill="var(--muted)">0-viol.</text>` +
+      statsAxisTitleSvg(STATS_Y_V_TOP, STATS_Y_V_BOT, 'violated demands') +
+      statsAxisTitleSvg(STATS_Y_D_TOP, STATS_Y_D_BOT, 'devices (log)') +
+      (hasOracle ? statsAxisTitleSvg(STATS_Y_D_TOP, STATS_Y_D_BOT, 'oracle devices', STATS_TITLE_X_R) : '');
 
     const hoverGroupSvg = `<g id="stats-hover"></g>`;
     const overlayRectSvg =
@@ -1951,16 +2013,14 @@
         `${zeroViolatedIdx.length} zero-violated epoch${zeroViolatedIdx.length === 1 ? '' : 's'}` +
       `</div>` +
       `<svg class="stats-chart" viewBox="0 0 ${STATS_VB_W} ${STATS_VB_H}" preserveAspectRatio="xMidYMid meet" ` +
-      `role="img" aria-label="Training statistics: violations, device count and churn across ${epochs.length} epochs">` +
-      violatedTickSvg + deviceTickSvg +
-      `<path d="${oracleBand}" fill="var(--muted)" fill-opacity="0.16" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3,2" stroke-opacity="0.6">` +
-        `<title>oracle minimum device count (band) -- the vertical gap to the device curve is what "how close to optimal" means here</title>` +
-      `</path>` +
+      `role="img" aria-label="Training statistics: violations, device count and oracle minimum across ${epochs.length} epochs">` +
+      violatedTickSvg + deviceTickSvg + oracleTickSvg +
       `<path d="${violatedPath}" fill="none" stroke="var(--ink)" stroke-width="1.8"/>` +
       `<path d="${devicePath}" fill="none" stroke="var(--load)" stroke-width="1.8"/>` +
+      `<path d="${oraclePath}" fill="none" stroke="var(--muted)" stroke-width="1.3" stroke-dasharray="3,2">` +
+        `<title>oracle minimum device count -- own right-hand axis, NOT the device rail's log scale, because its routing-driven variation is small next to the device curve's own range</title>` +
+      `</path>` +
       tickRailSvg +
-      `<path d="${churnPath}" fill="none" stroke="var(--load)" stroke-width="1.1" stroke-opacity="0.55"/>` +
-      churnDots +
       pinsSvg +
       axisLabelsSvg +
       overlayRectSvg +
@@ -1971,15 +2031,15 @@
         `<strong>&#9675;</strong> min-loss epoch &middot; ` +
         `<strong>&#8739;</strong> 0-violated epochs &middot; ` +
         `top rail = violated demands &middot; ` +
-        `bottom rail = devices (log scale), shaded band = oracle minimum &middot; ` +
-        `bottom line = site-set churn vs previous dumped frame` +
+        `bottom rail = devices (log scale) &middot; ` +
+        `dashed line = oracle minimum (own right-hand axis, not to device scale)` +
       `</div>`;
 
     const svgEl = statsBody.querySelector('.stats-chart');
     const hoverGroup = statsBody.querySelector('#stats-hover');
     const overlayRect = statsBody.querySelector('#stats-hover-target');
     if (svgEl && hoverGroup && overlayRect) {
-      const ctx = { svgEl, hoverGroup, epochs, xOf, yOfV, yOfD, violated, devices, oracle };
+      const ctx = { svgEl, hoverGroup, epochs, xOf, yOfV, yOfD, yOfOracle: hasOracle ? yOfOracle : null, violated, devices, oracle };
       overlayRect.addEventListener('pointermove', ev => onStatsHover(ev, ctx));
       overlayRect.addEventListener('pointerleave', () => { hoverGroup.innerHTML = ''; });
     }
@@ -2012,6 +2072,8 @@
   const epochLabel = document.getElementById('epoch-label');
   const runMetaEl = document.getElementById('run-meta');
   const selfCheckEl = document.getElementById('self-check-status');
+  const panelsEl = document.getElementById('panels');
+  const stripPanelEl = document.getElementById('strip-panel');
 
   function epochIndex(epoch) { return EPOCHS.indexOf(epoch); }
 
@@ -2081,9 +2143,15 @@
     epochLabel.innerHTML = EPOCHS.length
       ? `epoch <strong>${state.epoch}</strong> &middot; frame ${idx + 1}/${EPOCHS.length}`
       : 'no frames';
+    // The strip panel only exists in the grid while a lightpath is
+    // focused -- otherwise it's just an empty "focus something" placeholder
+    // eating a full-width row. `no-strip` collapses that row entirely.
+    const hasFocus = !!state.focus;
+    stripPanelEl.hidden = !hasFocus;
+    panelsEl.classList.toggle('no-strip', !hasFocus);
     renderMap();
     renderRibbons();
-    renderStrip();
+    if (hasFocus) renderStrip();
     renderStats();
   }
 
